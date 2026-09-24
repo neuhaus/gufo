@@ -49,7 +49,13 @@ comparisons.
   embedding, and LM-head weights.
 - Rank 0 owns the shared expert; the routed layer output is reduced with the
   ordered communicator.
-- Host-staged synchronous RDMA is used first; HIP graph capture is disabled.
+- Host-staged synchronous RDMA is used first with identical fixed IOVA windows
+  and a small ordered TCP control/ack channel; HIP graph capture is disabled.
+  The probe fails safely if its fixed staging address is already occupied.
+- The initial host sum changes reduction order, so distributed logits are
+  compared with an explicit tolerance rather than claimed bit-identical.
+- A rank with no locally selected experts emits a zero routed contribution
+  and still participates in the collective.
 - Distributed snapshots, disk continuation, and vision are rejected for now.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; its larger target must pass a

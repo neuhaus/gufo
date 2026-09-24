@@ -91,6 +91,14 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     AssignError(error_msg, "TP=2 Flash-Next requires a communicator");
     return nullptr;
   }
+  if (options.tp_world_size > 1 &&
+      (options.communicator->world_size() != options.tp_world_size ||
+       options.communicator->rank() != options.tp_rank ||
+       options.communicator->device_index() != options.hip_device)) {
+    AssignError(error_msg,
+                "TP communicator identity does not match model rank/device");
+    return nullptr;
+  }
   if (options.tp_world_size > 1 && !options.vision_model_path.empty()) {
     AssignError(error_msg,
                 "vision is not supported by the initial TP=2 Flash-Next path");

@@ -318,6 +318,44 @@ void CheckRouter(int tokens, int experts, int used, int pattern) {
   (void)hipFree(d_ids);
 }
 
+void CheckEmptyLocalPartition() {
+  constexpr int kExperts = 512;
+  constexpr int kUsed = 10;
+  const std::size_t count = kUsed;
+  std::vector<float> logits(kExperts + 1, -INFINITY);
+  for (int expert = kExperts / 2; expert < kExperts; ++expert) {
+    logits[expert] = static_cast<float>(expert - kExperts / 2);
+  }
+  float* d_logits = nullptr;
+  std::int32_t* d_ids = nullptr;
+  float* d_weights = nullptr;
+  CheckHip(hipMalloc(&d_logits, logits.size() * sizeof(float)), "empty logits");
+  CheckHip(hipMalloc(&d_ids, count * sizeof(std::int32_t)), "empty ids");
+  CheckHip(hipMalloc(&d_weights, count * sizeof(float)), "empty weights");
+  CheckHip(hipMemcpy(d_logits, logits.data(), logits.size() * sizeof(float),
+                     hipMemcpyHostToDevice),
+           "empty logits upload");
+  q::RouterTopK(d_logits, kExperts + 1, d_ids, d_weights, 1, kExperts, kUsed,
+                0, kExperts / 2, nullptr);
+  CheckHip(hipDeviceSynchronize(), "empty partition router");
+  std::vector<std::int32_t> ids(count);
+  std::vector<float> weights(count);
+  CheckHip(hipMemcpy(ids.data(), d_ids, count * sizeof(std::int32_t),
+                     hipMemcpyDeviceToHost),
+           "empty ids download");
+  CheckHip(hipMemcpy(weights.data(), d_weights, count * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "empty weights download");
+  for (std::size_t i = 0; i < count; ++i) {
+    if (ids[i] != -1 || weights[i] != 0.0F) {
+      throw std::runtime_error("empty local partition produced active IDs");
+    }
+  }
+  (void)hipFree(d_logits);
+  (void)hipFree(d_ids);
+  (void)hipFree(d_weights);
+}
+
 }  // namespace
 
 int main() {
@@ -331,7 +369,9 @@ int main() {
     CheckRouter(17, 513, 32, 0);
     CheckRouter(17, 1024, 32, 1);
     CheckRouter(17, 1024, 1, 3);
-    std::cout << "Router softmax, ties, guards and replay: passed\n";
+    CheckEmptyLocalPartition();
+    std::cout << "Router softmax, ties, guards, replay and empty partition: "
+                 "passed\n";
     bool ok = true;
     for (int n_tokens : {37, 512, 2048}) {
       const auto ids = MakeIds(n_tokens, 0x1234ABCDU + n_tokens);

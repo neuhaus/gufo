@@ -93,7 +93,7 @@ stdenv.mkDerivation {
     test -f $out/share/licenses/gufo/LICENSE
     test -f $out/share/licenses/gufo/third-party/LICENSE.ds4
     ${lib.optionalString enableTp2Rdma ''
-      test -e $out/lib/libibverbs.so
+      test -e ${rdma-core.dev}/lib/libibverbs.so
       test -f $out/share/licenses/gufo/third-party/rdma-core/COPYING.GPL2
     ''}
 

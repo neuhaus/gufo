@@ -51,6 +51,14 @@ struct Uploader {
     if (t.empty() || !ok) {
       return d;
     }
+    const std::size_t tensor_bytes = t.SizeBytes();
+    if (size > tensor_bytes || relative_offset > tensor_bytes - size ||
+        size > std::numeric_limits<std::size_t>::max() - kTailMargin ||
+        t.cols > std::numeric_limits<std::uint32_t>::max() ||
+        t.rows > std::numeric_limits<std::uint32_t>::max()) {
+      Fail("weight range geometry is invalid for " + std::string(t.name));
+      return d;
+    }
     if (relative_offset > std::numeric_limits<std::uint64_t>::max() -
                               t.file_offset) {
       Fail("weight range offset overflow for " + std::string(t.name));
@@ -328,7 +336,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     m->expert_begin_ = 0;
     m->local_experts_ = static_cast<std::uint32_t>(w.config.num_experts);
   } else {
-    if (!partition->Valid() || partition->num_experts != w.config.num_experts) {
+    if (!partition->Valid() || partition->world_size > 2 ||
+        partition->num_experts != w.config.num_experts) {
       if (error_msg != nullptr) {
         *error_msg = "TP partition expert count does not match the model";
       }

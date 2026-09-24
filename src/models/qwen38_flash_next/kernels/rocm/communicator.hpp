@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -14,6 +15,9 @@ namespace gufo::models::qwen38_flash_next::rocm {
 class Communicator {
 public:
   virtual ~Communicator() = default;
+  [[nodiscard]] virtual std::uint32_t rank() const noexcept { return 0; }
+  [[nodiscard]] virtual std::uint32_t world_size() const noexcept { return 1; }
+  [[nodiscard]] virtual int device_index() const noexcept { return 0; }
   virtual bool AllReduceSum(float* data, std::size_t bytes, hipStream_t stream,
                             std::string* error) = 0;
 };

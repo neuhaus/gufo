@@ -20,7 +20,9 @@ struct IbrverbsConfig {
 };
 
 /// Creates a two-rank synchronous RC communicator. Tensor data uses RDMA;
-/// this endpoint is used only to exchange QP and memory-registration metadata.
+/// the bootstrap endpoint remains as a small ordered control/ack channel.
+/// Both processes map identical fixed host IOVA windows for the initial
+/// correctness transport.
 [[nodiscard]] std::shared_ptr<Communicator> CreateIbrverbsCommunicator(
     const IbrverbsConfig& config, std::string* error_msg);
 

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -109,18 +110,18 @@ constexpr std::uint32_t kDenseF16MaxCols = 2560;
 constexpr std::uint32_t kRoutedTileRowsNarrow = 16;
 constexpr std::uint32_t kRoutedTileRowsWide = 48;
 
-std::uint32_t RoutedTileRows(std::size_t slots, const Config& c) {
-  return slots >= static_cast<std::size_t>(16) * c.num_experts
+std::uint32_t RoutedTileRows(std::size_t slots, std::uint32_t n_experts) {
+  return slots >= static_cast<std::size_t>(16) * n_experts
              ? kRoutedTileRowsWide
              : kRoutedTileRowsNarrow;
 }
 
 /// Upper bound on launched routed tiles: every 16-padded bucket contributes
 /// at most one partial tile beyond its rows.
-std::size_t RoutedTileCapacity(std::size_t slots, const Config& c) {
-  return (slots + static_cast<std::size_t>(c.num_experts) * 15) /
+std::size_t RoutedTileCapacity(std::size_t slots, std::uint32_t n_experts) {
+  return (slots + static_cast<std::size_t>(n_experts) * 15) /
              kRoutedTileRowsNarrow +
-         c.num_experts + 1;
+         n_experts + 1;
 }
 
 std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
@@ -420,7 +421,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
     s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
     s.routed_tiles =
-        Alloc<std::int32_t>(a, 3 * RoutedTileCapacity(slots, c), error_msg);
+        Alloc<std::int32_t>(a,
+                            3 * RoutedTileCapacity(
+                                   slots, model_->local_experts()),
+                            error_msg);
   }
   s.weights = f32(slots);
   s.gate_e = f32(slots * c.expert_ff);
@@ -454,8 +458,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
-    if (!Check(hipHostMalloc(&tiles, 3 * RoutedTileCapacity(slots, c) *
-                                         sizeof(std::int32_t)),
+    if (!Check(hipHostMalloc(
+                   &tiles,
+                   3 * RoutedTileCapacity(slots, model_->local_experts()) *
+                       sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -922,6 +928,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   routed_pair_tiles_ = 0;
   routed_pair_offset_ = 0;
   routed_pair_rows_ = 64;
+  routed_n_tiles_ = 0;
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
@@ -934,7 +941,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   std::uint32_t max_rows = 0;
   std::uint32_t n_tiles = 0;
   routed_tile_rows_ = RoutedTileRows(
-      static_cast<std::size_t>(n_tokens) * c.num_experts_used, c);
+      static_cast<std::size_t>(n_tokens) * c.num_experts_used, local_experts);
   for (std::uint32_t e = 0; e < local_experts; ++e) {
     const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
     max_rows = std::max(max_rows, counts_host_[e]);
@@ -1527,8 +1534,18 @@ bool Executor::AllReduce(float* data, std::size_t rows,
   if (model_->tp_world_size() == 1) {
     return true;
   }
+  const std::size_t hidden = config().hidden_size;
+  if (rows > std::numeric_limits<std::size_t>::max() / hidden ||
+      rows * hidden >
+          std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+    if (error_msg != nullptr) {
+      *error_msg = "Flash-Next all-reduce byte count overflows";
+    }
+    return false;
+  }
+  const std::size_t bytes = rows * hidden * sizeof(float);
   if (!options_.all_reduce ||
-      !options_.all_reduce(data, rows * sizeof(float), stream_, error_msg)) {
+      !options_.all_reduce(data, bytes, stream_, error_msg)) {
     if (error_msg != nullptr && error_msg->empty()) {
       *error_msg = "Flash-Next all-reduce failed";
     }
@@ -1639,7 +1656,14 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                             (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
                              l.ffn_down_exps.type == GgmlType::kQ8_0) &&
                             c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
-  if (wmma_experts) {
+  if (routed_n_tiles_ == 0) {
+    const std::size_t bytes =
+        static_cast<std::size_t>(slots) * c.hidden_size * sizeof(float);
+    if (!Check(hipMemsetAsync(s_.down_e, 0, bytes, stream_),
+               "empty local routed expert output", error_msg)) {
+      return false;
+    }
+  } else if (wmma_experts) {
     RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds, s_.routed_cursors,
                   s_.rows_token, s_.rows_slot, n_tokens, used,
                   model_->local_experts(), stream_);

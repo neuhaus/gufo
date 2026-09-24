@@ -1,8 +1,12 @@
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -40,6 +44,8 @@ int main(int argc, char** argv) {
   std::uint32_t device = 0;
   std::uint32_t gid = 0;
   std::uint16_t port = 18515;
+  float temperature = 0.0F;
+  std::int64_t seed = 7;
   std::string bootstrap_host;
 
   for (int i = 1; i < argc; ++i) {
@@ -47,7 +53,23 @@ int main(int argc, char** argv) {
     const auto next = [&]() -> std::string {
       return i + 1 < argc ? argv[++i] : std::string();
     };
-    if (arg == "--model") {
+    if (arg == "--temperature") {
+      const std::string value = next();
+      char* end = nullptr;
+      temperature = std::strtof(value.c_str(), &end);
+      if (end == value.c_str() || *end != '\0' ||
+          !std::isfinite(temperature) || temperature < 0.0F) {
+        Fail("--temperature requires a nonnegative number");
+        return 2;
+      }
+    } else if (arg == "--seed") {
+      std::uint32_t parsed = 0;
+      if (!ParseUint(next(), &parsed)) {
+        Fail("--seed requires an unsigned integer");
+        return 2;
+      }
+      seed = static_cast<std::int64_t>(parsed);
+    } else if (arg == "--model") {
       model_path = next();
     } else if (arg == "--mtp-model") {
       mtp_path = next();
@@ -100,6 +122,9 @@ int main(int argc, char** argv) {
   if (model_path.empty() || context == 0 || tokens == 0 ||
       (world_size != 1 && world_size != 2) || rank >= world_size ||
       (world_size == 1 && rank != 0) ||
+      device > static_cast<std::uint32_t>(
+                   std::numeric_limits<int>::max()) ||
+      gid > std::numeric_limits<std::uint8_t>::max() ||
       (world_size == 2 && rank == 1 && bootstrap_host.empty())) {
     Fail("invalid TP2 probe arguments");
     return 2;
@@ -179,6 +204,6 @@ int main(int argc, char** argv) {
     output.resize(tokens);
   }
   std::printf("rank=%u tokens=%zu text=%s\n", rank, output.size(),
-              model->Decode(output).c_str());
+              model->Decode(std::span<const std::int32_t>(output)).c_str());
   return 0;
 }

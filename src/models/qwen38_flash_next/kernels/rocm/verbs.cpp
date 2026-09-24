@@ -1,7 +1,10 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/verbs.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -11,6 +14,7 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -18,12 +22,24 @@
 
 #include <infiniband/verbs.h>
 
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 
 constexpr std::uint32_t kWireMagic = 0x47554654U;  // "GUFT"
-constexpr std::uint32_t kWireVersion = 1;
+constexpr std::uint32_t kWireVersion = 2;
+constexpr std::uint32_t kCollectiveMagic = 0x47554348U;  // "GUCH"
+constexpr std::uint32_t kCollectiveVersion = 1;
+constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
 constexpr std::size_t kBufferBytes = 64U << 20;
+constexpr std::uintptr_t kSendAddress = 0x0000700000000000ULL;
+constexpr std::uintptr_t kRecvAddress = kSendAddress + kBufferBytes;
 constexpr std::uint32_t kPort = 1;
 constexpr auto kCollectiveTimeout = std::chrono::seconds(30);
 
@@ -35,6 +51,40 @@ void SetError(std::string* error_msg, std::string message) {
 
 std::string SystemError(const char* operation) {
   return std::string(operation) + ": " + std::strerror(errno);
+}
+
+bool MapFixedBuffer(std::uintptr_t address, void** buffer,
+                    std::string* error) {
+  void* mapped = ::mmap(reinterpret_cast<void*>(address), kBufferBytes,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1,
+                        0);
+  if (mapped == MAP_FAILED) {
+    SetError(error, "fixed RDMA buffer mmap failed: " +
+                        std::string(std::strerror(errno)));
+    return false;
+  }
+  if (reinterpret_cast<std::uintptr_t>(mapped) != address) {
+    ::munmap(mapped, kBufferBytes);
+    SetError(error, "fixed RDMA buffer address mismatch");
+    return false;
+  }
+  if (hipHostRegister(mapped, kBufferBytes, hipHostRegisterMapped) !=
+      hipSuccess) {
+    ::munmap(mapped, kBufferBytes);
+    SetError(error, "hipHostRegister for fixed RDMA buffer failed");
+    return false;
+  }
+  *buffer = mapped;
+  return true;
+}
+
+void UnmapFixedBuffer(void* buffer) {
+  if (buffer == nullptr) {
+    return;
+  }
+  (void)hipHostUnregister(buffer);
+  (void)::munmap(buffer, kBufferBytes);
 }
 
 class Socket {
@@ -100,6 +150,14 @@ public:
       return {};
     }
     SetTimeouts(fd);
+    pollfd poll_fd{.fd = fd, .events = POLLIN, .revents = 0};
+    const int poll_result = ::poll(&poll_fd, 1, 30000);
+    if (poll_result <= 0) {
+      SetError(error, poll_result == 0 ? "bootstrap accept timed out"
+                                       : SystemError("bootstrap poll"));
+      ::close(fd);
+      return {};
+    }
     int peer = -1;
     do {
       peer = ::accept(fd, nullptr, nullptr);
@@ -142,7 +200,27 @@ public:
         if (fd < 0) {
           continue;
         }
-        if (::connect(fd, address->ai_addr, address->ai_addrlen) == 0) {
+        const int flags = ::fcntl(fd, F_GETFL, 0);
+        if (flags < 0 ||
+            ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+          ::close(fd);
+          fd = -1;
+          continue;
+        }
+        bool connected = ::connect(fd, address->ai_addr, address->ai_addrlen) ==
+                         0;
+        if (!connected && errno == EINPROGRESS) {
+          pollfd poll_fd{.fd = fd, .events = POLLOUT, .revents = 0};
+          const int poll_result = ::poll(&poll_fd, 1, 1000);
+          int socket_error = 0;
+          socklen_t error_size = sizeof(socket_error);
+          connected = poll_result > 0 &&
+                      ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                                   &error_size) == 0 &&
+                      socket_error == 0;
+        }
+        if (connected) {
+          (void)::fcntl(fd, F_SETFL, flags);
           break;
         }
         ::close(fd);
@@ -218,10 +296,18 @@ struct Wire {
   std::uint16_t lid{0};
   std::uint8_t mtu{0};
   std::uint8_t gid_index{0};
+  std::uint8_t link_layer{0};
   std::uint16_t port_num{kPort};
   ibv_gid sgid{};
   std::uint64_t remote_mr_address{0};
   std::uint32_t rkey{0};
+};
+
+struct CollectiveHeader {
+  std::uint32_t magic{kCollectiveMagic};
+  std::uint32_t version{kCollectiveVersion};
+  std::uint64_t sequence{0};
+  std::uint64_t bytes{0};
 };
 
 class Ibrverbs final : public Communicator {
@@ -235,6 +321,7 @@ public:
   [[nodiscard]] bool Initialize(std::string* error) {
     if (config_.world_size != 2 || config_.rank > 1 ||
         config_.bootstrap_port == 0 ||
+        config_.gid_index > std::numeric_limits<std::uint8_t>::max() ||
         config_.device_index > static_cast<std::uint32_t>(
                                   std::numeric_limits<int>::max())) {
       SetError(error,
@@ -273,8 +360,9 @@ public:
 
     ibv_port_attr port {};
     if (ibv_query_port(context_, kPort, &port) != 0 ||
-        port.state != IBV_PORT_ACTIVE) {
-      SetError(error, "InfiniBand port 1 is not active");
+        port.state != IBV_PORT_ACTIVE ||
+        port.link_layer != IBV_LINK_LAYER_INFINIBAND) {
+      SetError(error, "native InfiniBand port 1 is not active");
       return false;
     }
     if (ibv_query_gid(context_, kPort, config_.gid_index, &local_sgid_) != 0) {
@@ -282,15 +370,14 @@ public:
       return false;
     }
 
-    if (hipHostMalloc(&send_buffer_, kBufferBytes,
-                      hipHostMallocMapped | hipHostMallocPortable) !=
-            hipSuccess ||
-        hipHostMalloc(&recv_buffer_, kBufferBytes,
-                      hipHostMallocMapped | hipHostMallocPortable) !=
-            hipSuccess) {
-      SetError(error, "hipHostMalloc for verbs buffers failed");
+    if (!MapFixedBuffer(kSendAddress, &send_buffer_, error)) {
       return false;
     }
+    send_registered_ = true;
+    if (!MapFixedBuffer(kRecvAddress, &recv_buffer_, error)) {
+      return false;
+    }
+    recv_registered_ = true;
     send_mr_ = ibv_reg_mr(pd_, send_buffer_, kBufferBytes,
                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     recv_mr_ = ibv_reg_mr(pd_, recv_buffer_, kBufferBytes,
@@ -316,13 +403,11 @@ public:
     }
 
     struct ibv_qp_attr attr {};
-    attr.qp_state = IBV_QP_INIT;
+    attr.qp_state = IBV_QPS_INIT;
     attr.pkey_index = 0;
     attr.port_num = kPort;
-    attr.qp_access_flags = IBV_QP_ACCESS_LOCAL_WRITE |
-                           IBV_QP_ACCESS_REMOTE_WRITE;
-    if (ibv_modify_qp(qp_, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
-                                     IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
+    if (ibv_modify_qp(qp_, &attr,
+                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT) != 0) {
       SetError(error, "ibv_modify_qp INIT failed");
       return false;
     }
@@ -334,6 +419,7 @@ public:
     local.lid = port.lid;
     local.mtu = static_cast<std::uint8_t>(port.active_mtu);
     local.gid_index = static_cast<std::uint8_t>(config_.gid_index);
+    local.link_layer = static_cast<std::uint8_t>(port.link_layer);
     local.sgid = local_sgid_;
     local.remote_mr_address = reinterpret_cast<std::uint64_t>(recv_buffer_);
     local.rkey = recv_mr_->rkey;
@@ -356,8 +442,10 @@ public:
     if (remote.magic != kWireMagic || remote.version != kWireVersion ||
         remote.world_size != config_.world_size ||
         remote.rank != 1U - config_.rank || remote.qp_num == 0 ||
+        remote.port_num != kPort ||
+        remote.link_layer != IBV_LINK_LAYER_INFINIBAND ||
         remote.mtu < IBV_MTU_256 || remote.mtu > IBV_MTU_4096 ||
-        remote.remote_mr_address == 0 || remote.rkey == 0) {
+        remote.remote_mr_address != kRecvAddress || remote.rkey == 0) {
       SetError(error, "verbs bootstrap metadata is invalid");
       return false;
     }
@@ -366,14 +454,15 @@ public:
         std::min(static_cast<unsigned>(local.mtu),
                  static_cast<unsigned>(remote.mtu)));
     attr = {};
-    attr.qp_state = IBV_QP_RTR;
+    attr.qp_state = IBV_QPS_RTR;
     attr.path_mtu = mtu;
     attr.dest_qp_num = remote.qp_num;
     attr.rq_psn = 0;
     attr.max_dest_rd_atomic = 1;
     attr.min_rnr_timer = 12;
     attr.ah_attr.dlid = remote.lid;
-    attr.ah_attr.sgid_index = local.gid_index;
+    attr.ah_attr.grh.hop_limit = 1;
+    attr.ah_attr.grh.sgid_index = local.gid_index;
     attr.ah_attr.is_global = 1;
     attr.ah_attr.port_num = kPort;
     std::memcpy(&attr.ah_attr.grh.dgid, &remote.sgid, sizeof(remote.sgid));
@@ -385,7 +474,7 @@ public:
       return false;
     }
     attr = {};
-    attr.qp_state = IBV_QP_RTS;
+    attr.qp_state = IBV_QPS_RTS;
     attr.sq_psn = 0;
     attr.timeout = 14;
     attr.retry_cnt = 7;
@@ -400,7 +489,26 @@ public:
     }
     remote_address_ = remote.remote_mr_address;
     remote_rkey_ = remote.rkey;
+    const std::uint32_t ready = kReadyMagic;
+    std::uint32_t peer_ready = 0;
+    if (!control.SendAll(&ready, sizeof(ready), error) ||
+        !control.RecvAll(&peer_ready, sizeof(peer_ready), error) ||
+        peer_ready != kReadyMagic) {
+      SetError(error, "verbs post-RTS readiness exchange failed");
+      return false;
+    }
+    control_ = std::make_unique<Socket>(std::move(control));
     return true;
+  }
+
+  [[nodiscard]] std::uint32_t rank() const noexcept override {
+    return config_.rank;
+  }
+  [[nodiscard]] std::uint32_t world_size() const noexcept override {
+    return config_.world_size;
+  }
+  [[nodiscard]] int device_index() const noexcept override {
+    return static_cast<int>(config_.device_index);
   }
 
   [[nodiscard]] bool AllReduceSum(float* data, std::size_t bytes,
@@ -411,13 +519,36 @@ public:
       SetError(error, "verbs communicator is not initialized");
       return false;
     }
+    if (control_ == nullptr) {
+      SetError(error, "verbs control channel is not initialized");
+      return false;
+    }
     if (bytes > kBufferBytes || bytes % sizeof(float) != 0 ||
         (bytes != 0 && data == nullptr)) {
       SetError(error, "all-reduce buffer is invalid");
       return false;
     }
+    const CollectiveHeader outgoing{
+        .sequence = sequence_++,
+        .bytes = bytes,
+    };
+    CollectiveHeader incoming{};
+    if (!control_->SendAll(&outgoing, sizeof(outgoing), error) ||
+        !control_->RecvAll(&incoming, sizeof(incoming), error)) {
+      return false;
+    }
+    if (incoming.magic != kCollectiveMagic ||
+        incoming.version != kCollectiveVersion ||
+        incoming.sequence != outgoing.sequence || incoming.bytes != bytes) {
+      SetError(error, "verbs collective sequence or size mismatch");
+      return false;
+    }
     if (bytes == 0) {
-      return true;
+      const std::uint32_t ack = kReadyMagic;
+      std::uint32_t peer_ack = 0;
+      return control_->SendAll(&ack, sizeof(ack), error) &&
+             control_->RecvAll(&peer_ack, sizeof(peer_ack), error) &&
+             peer_ack == kReadyMagic;
     }
     if (hipStreamSynchronize(stream) != hipSuccess ||
         hipMemcpy(send_buffer_, data, bytes, hipMemcpyDeviceToHost) !=
@@ -441,7 +572,7 @@ public:
       wr.opcode = IBV_WR_RDMA_WRITE;
       wr.wr.rdma.remote_addr = remote_address_ + offset;
       wr.wr.rdma.rkey = remote_rkey_;
-      if (ibv_post_send(qp_, &wr, nullptr) != nullptr) {
+      if (ibv_post_send(qp_, &wr, nullptr) != 0) {
         SetError(error, "ibv_post_send failed");
         return false;
       }
@@ -454,6 +585,16 @@ public:
       for (std::size_t i = 0; i < values; ++i) {
         local[i] += peer[i];
       }
+    }
+    const std::uint32_t ack = kReadyMagic;
+    std::uint32_t peer_ack = 0;
+    if (!control_->SendAll(&ack, sizeof(ack), error) ||
+        !control_->RecvAll(&peer_ack, sizeof(peer_ack), error) ||
+        peer_ack != kReadyMagic) {
+      if (error != nullptr && error->empty()) {
+        *error = "verbs collective acknowledgement failed";
+      }
+      return false;
     }
     if (hipMemcpy(data, send_buffer_, bytes, hipMemcpyHostToDevice) !=
             hipSuccess ||
@@ -495,6 +636,7 @@ private:
   }
 
   void Cleanup() noexcept {
+    control_.reset();
     if (qp_ != nullptr) {
       ibv_destroy_qp(qp_);
       qp_ = nullptr;
@@ -507,14 +649,16 @@ private:
       (void)ibv_dereg_mr(recv_mr_);
       recv_mr_ = nullptr;
     }
-    if (send_buffer_ != nullptr) {
-      (void)hipHostFree(send_buffer_);
-      send_buffer_ = nullptr;
+    if (send_registered_) {
+      UnmapFixedBuffer(send_buffer_);
+      send_registered_ = false;
     }
-    if (recv_buffer_ != nullptr) {
-      (void)hipHostFree(recv_buffer_);
-      recv_buffer_ = nullptr;
+    send_buffer_ = nullptr;
+    if (recv_registered_) {
+      UnmapFixedBuffer(recv_buffer_);
+      recv_registered_ = false;
     }
+    recv_buffer_ = nullptr;
     if (cq_ != nullptr) {
       ibv_destroy_cq(cq_);
       cq_ = nullptr;
@@ -538,9 +682,13 @@ private:
   ibv_mr* recv_mr_{nullptr};
   void* send_buffer_{nullptr};
   void* recv_buffer_{nullptr};
+  bool send_registered_{false};
+  bool recv_registered_{false};
   ibv_gid local_sgid_{};
   std::uint64_t remote_address_{0};
   std::uint32_t remote_rkey_{0};
+  std::unique_ptr<Socket> control_;
+  std::uint64_t sequence_{0};
   mutable std::mutex mutex_;
 };
 
