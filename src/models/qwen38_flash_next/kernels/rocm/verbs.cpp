@@ -36,6 +36,7 @@ constexpr std::uint32_t kWireMagic = 0x47554654U;  // "GUFT"
 constexpr std::uint32_t kWireVersion = 2;
 constexpr std::uint32_t kCollectiveMagic = 0x47554348U;  // "GUCH"
 constexpr std::uint32_t kCollectiveVersion = 1;
+constexpr std::uint32_t kDataReadyMagic = 0x47554452U;  // "GUDR"
 constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
 constexpr std::size_t kBufferBytes = 64U << 20;
 constexpr std::uintptr_t kSendAddress = 0x0000700000000000ULL;
@@ -314,6 +315,13 @@ struct CollectiveHeader {
   std::uint64_t bytes{0};
 };
 
+struct DataReady {
+  std::uint32_t magic{kDataReadyMagic};
+  std::uint32_t reserved{0};
+  std::uint64_t sequence{0};
+  std::uint64_t offset{0};
+};
+
 class Ibrverbs final : public Communicator {
 public:
   explicit Ibrverbs(const IbrverbsConfig& config) : config_(config) {}
@@ -532,8 +540,9 @@ public:
       SetError(error, "all-reduce buffer is invalid");
       return false;
     }
+    const std::uint64_t sequence = sequence_++;
     const CollectiveHeader outgoing{
-        .sequence = sequence_++,
+        .sequence = sequence,
         .bytes = bytes,
     };
     CollectiveHeader incoming{};
@@ -581,6 +590,20 @@ public:
         return false;
       }
       if (!PollCompletion(offset, error)) {
+        return false;
+      }
+      const DataReady data_ready{
+          .sequence = sequence,
+          .offset = offset,
+      };
+      DataReady peer_ready{};
+      if (!control_->SendAll(&data_ready, sizeof(data_ready), error) ||
+          !control_->RecvAll(&peer_ready, sizeof(peer_ready), error)) {
+        return false;
+      }
+      if (peer_ready.magic != kDataReadyMagic ||
+          peer_ready.sequence != sequence || peer_ready.offset != offset) {
+        SetError(error, "verbs peer data-ready barrier mismatch");
         return false;
       }
       auto* local = reinterpret_cast<float*>(source);

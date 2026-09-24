@@ -1656,7 +1656,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                             (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
                              l.ffn_down_exps.type == GgmlType::kQ8_0) &&
                             c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
-  if (routed_n_tiles_ == 0) {
+  if (ExpertMatrixRows(n_tokens) && routed_n_tiles_ == 0) {
     const std::size_t bytes =
         static_cast<std::size_t>(slots) * c.hidden_size * sizeof(float);
     if (!Check(hipMemsetAsync(s_.down_e, 0, bytes, stream_),
