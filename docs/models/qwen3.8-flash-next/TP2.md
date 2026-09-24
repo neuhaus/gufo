@@ -56,6 +56,9 @@ comparisons.
   compared with an explicit tolerance rather than claimed bit-identical.
 - A rank with no locally selected experts emits a zero routed contribution
   and still participates in the collective.
+- The serving runner now marks distributed TP2 as serial-only and disables
+  snapshots, forks, prefix reuse, persistence, and batched decode; distributed
+  serving still requires the separate rank-1 worker control channel.
 - Distributed snapshots, disk continuation, and vision are rejected for now.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact

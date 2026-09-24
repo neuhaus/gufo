@@ -87,6 +87,13 @@ public:
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
+  [[nodiscard]] std::uint32_t TpRank() const noexcept {
+    return options_.tp_rank;
+  }
+  [[nodiscard]] std::uint32_t TpWorldSize() const noexcept {
+    return options_.tp_world_size;
+  }
+  [[nodiscard]] int HipDevice() const noexcept { return options_.hip_device; }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] const tokenization::QwenTokenizer& tokenizer() const noexcept {

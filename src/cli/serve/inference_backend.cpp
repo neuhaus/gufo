@@ -2277,8 +2277,9 @@ public:
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
-        max_draft_tokens_(max_draft_tokens) {
-    if (!artifact_fingerprint.empty()) {
+        max_draft_tokens_(max_draft_tokens),
+        distributed_(model_->TpWorldSize() > 1) {
+    if (!distributed_ && !artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
@@ -2298,14 +2299,15 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = true,
-                .fork = true,
+                .snapshot = !distributed_,
+                .fork = !distributed_,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
-                .batched_multi_token_decode = use_mtp_,
-                .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
-                .prefix_reuse = true,
+                .batched_multi_token_decode = !distributed_ && use_mtp_,
+                .batched_multi_token_decode_max_width =
+                    !distributed_ && use_mtp_ ? 8u : 0u,
+                .prefix_reuse = !distributed_,
             },
         .persistence = persistence_,
     };
@@ -2336,6 +2338,9 @@ public:
   }
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    if (distributed_) {
+      return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    }
     std::vector<TextExecutionPlan> plans{
         {.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
     for (std::size_t width = 2; width <= 8; ++width) {
@@ -2362,6 +2367,14 @@ public:
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
+    if (distributed_) {
+      for (const auto& message : request.messages) {
+        if (!message.images.empty()) {
+          throw std::invalid_argument(
+              "Qwen3.8-Flash-Next TP2 does not support image input");
+        }
+      }
+    }
     return PrepareQwenPrompt(request, model_->tokenizer(),
                              model_->VisionEncoder(), max_context_);
   }
@@ -2369,6 +2382,10 @@ public:
   void SetPromptContext(
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
+    if (distributed_ && context != nullptr) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support vision prompt context");
+    }
     RequireQwenFlashNextState(state).session().ConfigureVision(
         QwenPrompt(context));
   }
@@ -2516,6 +2533,10 @@ public:
 
   void AdvanceBatch(
       std::span<const TextRunnerAdvance> advances) const override {
+    if (distributed_ && advances.size() > 1) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support batched decode");
+    }
     if (advances.size() < 2) {
       return TextModelRunner::AdvanceBatch(advances);
     }
@@ -2550,6 +2571,10 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
+    if (distributed_ && decodes.size() > 1) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support batched decode");
+    }
     if (decodes.size() < 2 || !use_mtp_) {
       return TextModelRunner::DecodeBatch(decodes);
     }
@@ -2613,6 +2638,10 @@ public:
 
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       const TextRunnerState& state) const override {
+    if (distributed_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support snapshots");
+    }
     const std::uint64_t bytes =
         RequireQwenFlashNextState(state).session().SnapshotBytes();
     if (bytes == 0 || bytes > static_cast<std::uint64_t>(
@@ -2625,6 +2654,10 @@ public:
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
+    if (distributed_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support snapshots");
+    }
     const auto& qfn = RequireQwenFlashNextState(state);
     std::string error;
     auto snapshot = qfn.session().SaveSnapshot(&error);
@@ -2637,6 +2670,10 @@ public:
 
   void RestoreOrFork(TextRunnerState& state,
                      const TextRunnerSnapshot& snapshot) const override {
+    if (distributed_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support snapshots");
+    }
     const auto* qfn_snapshot =
         dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
     if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
@@ -2656,6 +2693,10 @@ public:
 
   [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
       const TextRunnerSnapshot& snapshot) const override {
+    if (distributed_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support persistent snapshots");
+    }
     const auto* qfn_snapshot =
         dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
     if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
@@ -2670,6 +2711,10 @@ public:
   [[nodiscard]] std::size_t SerializePersistentSnapshot(
       const TextRunnerSnapshot& snapshot,
       std::span<std::uint8_t> destination) const override {
+    if (distributed_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support persistent snapshots");
+    }
     const auto* qfn_snapshot =
         dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
     if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
@@ -2692,6 +2737,10 @@ public:
   void RestorePersistentSnapshot(
       TextRunnerState& state,
       std::span<const std::uint8_t> payload) const override {
+    if (distributed_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support persistent snapshots");
+    }
     auto& restored = RequireQwenFlashNextState(state);
     std::string error;
     if (!restored.session().RestoreSnapshot(payload, &error)) {
@@ -2714,6 +2763,7 @@ private:
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
+  bool distributed_{false};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 #endif
@@ -2822,7 +2872,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             TextSchedulerPolicy scheduler_policy,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
-                            const std::string& vision_model_path) {
+                            const std::string& vision_model_path,
+                            const TextTpConfig& tp_config) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -2832,12 +2883,15 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
+  const std::string architecture(
+      reader->GetMetadataString("general.architecture").value_or(""));
+  if (tp_config.world_size > 1 && architecture != "qwen4exp") {
+    SetError(error, "HTTP TP=2 is supported only by Qwen3.8-Flash-Next");
+    return false;
+  }
   if (max_context == 0) {
-    const auto architecture =
-        reader->GetMetadataString("general.architecture").value_or("");
     const auto native =
-        reader->GetMetadataUint64(std::string(architecture) + ".context_length")
-            .value_or(0);
+        reader->GetMetadataUint64(architecture + ".context_length").value_or(0);
     if (native < 2 || native > std::numeric_limits<std::uint32_t>::max()) {
       SetError(error,
                "GGUF has no valid native context length; specify --context");
@@ -2846,7 +2900,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     max_context = static_cast<std::uint32_t>(native);
   }
 
-  if (reader->GetMetadataString("general.architecture") == "deepseek4") {
+  if (architecture == "deepseek4") {
     if (!vision_model_path.empty()) {
       SetError(error, "DeepSeek does not support --mmproj");
       return false;
@@ -2901,7 +2955,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config));
   }
-  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+  if (architecture == "qwen4exp") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kMtp) {
       SetError(error,
@@ -2944,11 +2998,26 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
+            .tp_rank = tp_config.rank,
+            .tp_world_size = tp_config.world_size,
+            .hip_device = tp_config.hip_device,
+            .communicator = tp_config.communicator,
         },
         &load_error);
     if (model == nullptr) {
       SetError(error,
                "Failed to create Qwen3.8-Flash-Next model: " + load_error);
+      return false;
+    }
+    if (model->TpWorldSize() > 1 && session_count != 1) {
+      SetError(error,
+               "Qwen3.8-Flash-Next TP2 currently requires one session");
+      return false;
+    }
+    if (model->TpWorldSize() > 1 &&
+        DiskCacheEnabled(resolved_disk_cache_config)) {
+      SetError(error,
+               "Qwen3.8-Flash-Next TP2 does not support disk continuation");
       return false;
     }
     if (DiskCacheEnabled(resolved_disk_cache_config) &&
@@ -3011,6 +3080,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)speculative_config;
   (void)disk_cache_config;
   (void)vision_model_path;
+  (void)tp_config;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -3249,6 +3319,12 @@ bool InferenceBackend::load(
   if (max_context == 0)
     max_context = model->MaxContext();
 
+  if (model->TpWorldSize() > 1 &&
+      (session_count != 1 || DiskCacheEnabled(disk_cache_config))) {
+    SetError(error,
+             "Qwen3.8-Flash-Next TP2 requires one session and no disk cache");
+    return false;
+  }
   if (session_count == 0) {
     SetError(error, "HTTP session count must be at least one");
     return false;

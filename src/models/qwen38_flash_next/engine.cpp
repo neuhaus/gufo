@@ -144,12 +144,14 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                std::to_string(c.context_length) + " tokens");
     return nullptr;
   }
-  try {
-    m->vision_ = qwen::vision::Encoder::Open(
-        model_path, options.vision_model_path, c.hidden_size);
-  } catch (const std::exception& e) {
-    AssignError(error_msg, e.what());
-    return nullptr;
+  if (options.tp_world_size == 1) {
+    try {
+      m->vision_ = qwen::vision::Encoder::Open(
+          model_path, options.vision_model_path, c.hidden_size);
+    } catch (const std::exception& e) {
+      AssignError(error_msg, e.what());
+      return nullptr;
+    }
   }
   m->tokenizer_ =
       tokenization::QwenTokenizer::CreateFromGguf(*m->reader_, error_msg);

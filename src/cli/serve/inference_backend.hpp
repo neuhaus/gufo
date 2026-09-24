@@ -24,7 +24,10 @@ class Model;
 
 namespace gufo::models::qwen38_flash_next {
 class Model;
+namespace rocm {
+class Communicator;
 }
+}  // namespace gufo::models::qwen38_flash_next
 
 namespace gufo::tokenization {
 class QwenTokenizer;
@@ -46,6 +49,13 @@ struct TextSpeculativeConfig {
   std::uint32_t min_draft_tokens{1};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
+};
+
+struct TextTpConfig {
+  std::uint32_t rank{0};
+  std::uint32_t world_size{1};
+  int hip_device{0};
+  std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> communicator;
 };
 
 struct TextDiskCacheConfig {
@@ -80,7 +90,8 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             const TextSpeculativeConfig& speculative_config = {},
             const TextDiskCacheConfig& disk_cache_config = {},
-            const std::string& vision_model_path = {});
+            const std::string& vision_model_path = {},
+            const TextTpConfig& tp_config = {});
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
