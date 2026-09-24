@@ -122,7 +122,11 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
-            TextDiskCacheConfig disk_cache_config = {});
+            TextDiskCacheConfig disk_cache_config = {},
+            const TextTpConfig& tp_config = {});
+
+  /// Runs the rank-1 TP2 worker loop until the control channel closes.
+  [[nodiscard]] bool run_worker(std::string* error);
 #endif
 
   /// Stable model identifier used in API responses.

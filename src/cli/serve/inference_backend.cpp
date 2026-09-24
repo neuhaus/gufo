@@ -2775,6 +2775,9 @@ struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
     std::shared_ptr<TextGenerationScheduler> scheduler;
+    std::shared_ptr<TpControlChannel> control;
+    std::uint32_t tp_rank{0};
+    std::uint32_t tp_world_size{1};
     std::string model_id;
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
@@ -2786,15 +2789,46 @@ struct InferenceBackend::Impl {
     ScheduledGenerationRequest(
         std::shared_ptr<const State> model_state,
         TextGenerationScheduler::Request scheduled_request,
-        InitialOutputState initial = InitialOutputState::kContent)
+        InitialOutputState initial = InitialOutputState::kContent,
+        std::shared_ptr<TpControlChannel> control = {},
+        std::shared_ptr<std::mutex> control_mutex = {},
+        std::uint64_t sequence = 0)
         : state_(std::move(model_state)),
-          request_(std::move(scheduled_request)) {
+          request_(std::move(scheduled_request)),
+          control_(std::move(control)),
+          control_mutex_(std::move(control_mutex)),
+          sequence_(sequence) {
       if (initial == InitialOutputState::kReasoning)
         reasoning_end_ = state_->scheduler->runner().Tokenize("</think>");
+      if (control_ != nullptr && control_mutex_ == nullptr) {
+        control_mutex_ = std::make_shared<std::mutex>();
+      }
     }
 
     Result Wait(const TokenCallback& on_token) override {
       auto result = request_.Wait(on_token);
+      if (control_ != nullptr) {
+        const std::lock_guard<std::mutex> lock(*control_mutex_);
+        TpControlResponse response;
+        std::string error;
+        if (!control_->ReceiveResponse(&response, &error)) {
+          throw std::runtime_error("TP worker response failed: " + error);
+        }
+        if (response.sequence != sequence_ || !response.error.empty()) {
+          throw std::runtime_error(response.error.empty()
+                                       ? "TP worker response sequence mismatch"
+                                       : "TP worker failed: " + response.error);
+        }
+        if (response.tokens.size() != result.tokens.size()) {
+          throw std::runtime_error("TP worker token count mismatch");
+        }
+        for (std::size_t i = 0; i < result.tokens.size(); ++i) {
+          if (static_cast<std::uint32_t>(response.tokens[i]) !=
+              result.tokens[i]) {
+            throw std::runtime_error("TP worker token mismatch");
+          }
+        }
+      }
       if (!reasoning_end_.empty()) {
         const auto end =
             std::search(result.tokens.begin(), result.tokens.end(),
@@ -2805,12 +2839,19 @@ struct InferenceBackend::Impl {
       return result;
     }
 
-    void Cancel() noexcept override { request_.Cancel(); }
+    void Cancel() noexcept override {
+      if (control_ == nullptr) {
+        request_.Cancel();
+      }
+    }
 
   private:
     std::shared_ptr<const State> state_;
     TextGenerationScheduler::Request request_;
     std::vector<tokenization::TokenId> reasoning_end_;
+    std::shared_ptr<TpControlChannel> control_;
+    std::shared_ptr<std::mutex> control_mutex_;
+    std::uint64_t sequence_{0};
   };
 
   [[nodiscard]] std::shared_ptr<const State> Snapshot() const {
@@ -2840,6 +2881,71 @@ struct InferenceBackend::Impl {
       return result;
     }
 
+    if (current->control != nullptr) {
+      if (!sampling.can_use_unmodified_argmax() || context != nullptr ||
+          cache_prefix_tokens != 0 || !stop_sequences.empty() ||
+          max_tokens > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(
+            "TP2 currently supports only greedy, uncached text requests "
+            "without stop sequences");
+      }
+      std::vector<std::int32_t> worker_prompt;
+      worker_prompt.reserve(prompt_tokens.size());
+      for (const auto token : prompt_tokens) {
+        if (token > static_cast<TextRunnerToken>(
+                         std::numeric_limits<std::int32_t>::max())) {
+          throw std::invalid_argument(
+              "TP2 prompt token exceeds the worker protocol range");
+        }
+        worker_prompt.push_back(static_cast<std::int32_t>(token));
+      }
+      const std::lock_guard<std::mutex> lock(*tp_submit_mutex);
+      const std::uint64_t sequence = tp_sequence++;
+      auto request = current->scheduler->Submit(
+          std::move(prompt_tokens), max_tokens, sampling, {},
+          static_cast<bool>(on_token),
+          TextRequestMetadata{
+              .client_id = client_id,
+              .deadline = std::nullopt,
+              .request_start = request_start,
+              .prompt_context = nullptr,
+              .cache_prompt = false,
+              .cache_prefix_tokens = 0,
+          });
+      TpControlCommand command{
+          .sequence = sequence,
+          .max_tokens = static_cast<std::uint32_t>(max_tokens),
+          .prompt_tokens = std::move(worker_prompt),
+          .client_id = client_id,
+      };
+      std::string control_error;
+      if (!current->control->SendCommand(command, &control_error)) {
+        throw std::runtime_error("TP worker command failed: " + control_error);
+      }
+      TpControlResponse response;
+      if (!current->control->ReceiveResponse(&response, &control_error)) {
+        throw std::runtime_error("TP worker response failed: " + control_error);
+      }
+      if (response.sequence != sequence || !response.error.empty()) {
+        throw std::runtime_error(response.error.empty()
+                                     ? "TP worker response sequence mismatch"
+                                     : "TP worker failed: " + response.error);
+      }
+      ScheduledGenerationRequest generation(current, std::move(request),
+                                            initial);
+      result = generation.Wait(on_token);
+      if (response.tokens.size() != result.tokens.size()) {
+        throw std::runtime_error("TP worker token count mismatch");
+      }
+      for (std::size_t i = 0; i < result.tokens.size(); ++i) {
+        if (static_cast<std::uint32_t>(response.tokens[i]) !=
+            result.tokens[i]) {
+          throw std::runtime_error("TP worker token mismatch");
+        }
+      }
+      return result;
+    }
+
     auto request = current->scheduler->Submit(
         std::move(prompt_tokens), max_tokens, sampling, is_cancelled,
         static_cast<bool>(on_token),
@@ -2858,6 +2964,9 @@ struct InferenceBackend::Impl {
   }
 
   mutable std::mutex state_mutex;
+  mutable std::shared_ptr<std::mutex> tp_submit_mutex{
+      std::make_shared<std::mutex>()};
+  mutable std::uint64_t tp_sequence{0};
   std::shared_ptr<const State> state;
 #endif
 };
@@ -3039,7 +3148,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config));
+                std::move(resolved_disk_cache_config), tp_config);
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
@@ -3312,7 +3421,7 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config) {
+    TextDiskCacheConfig disk_cache_config, const TextTpConfig& tp_config) {
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
@@ -3320,6 +3429,11 @@ bool InferenceBackend::load(
   if (max_context == 0)
     max_context = model->MaxContext();
 
+  if (model->TpWorldSize() > 1 && tp_config.control == nullptr) {
+    SetError(error,
+             "Qwen3.8-Flash-Next TP2 requires a worker control channel");
+    return false;
+  }
   if (model->TpWorldSize() > 1 &&
       (session_count != 1 || DiskCacheEnabled(disk_cache_config))) {
     SetError(error,
@@ -3361,6 +3475,9 @@ bool InferenceBackend::load(
              "invalid");
     return false;
   }
+  const auto tp_world_size = model->TpWorldSize();
+  const auto tp_rank = model->TpRank();
+  const bool has_mtp = model->HasMtp();
   try {
     auto new_state = std::make_shared<Impl::State>();
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
@@ -3383,6 +3500,23 @@ bool InferenceBackend::load(
         std::move(runner), session_count, std::move(runner_disk_cache));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
+    new_state->control = tp_config.control;
+    new_state->tp_rank = tp_rank;
+    new_state->tp_world_size = tp_world_size;
+    if (tp_world_size > 1) {
+      const TpControlConfig control_config{
+          .rank = tp_rank,
+          .world_size = tp_world_size,
+          .max_context = max_context,
+          .max_draft_tokens = has_mtp ? speculative_config.max_draft_tokens : 0,
+          .use_mtp = has_mtp,
+      };
+      std::string control_error;
+      if (!tp_config.control->Handshake(control_config, &control_error)) {
+        SetError(error, "TP worker handshake failed: " + control_error);
+        return false;
+      }
+    }
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -3392,6 +3526,66 @@ bool InferenceBackend::load(
     SetError(error, exception.what());
     return false;
   }
+}
+
+bool InferenceBackend::run_worker(std::string* error) {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->control == nullptr ||
+      state->tp_world_size != 2 || state->tp_rank != 1) {
+    SetError(error, "TP worker requires a loaded rank-1 Flash-Next model");
+    return false;
+  }
+  try {
+    for (;;) {
+      TpControlCommand command;
+      std::string control_error;
+      if (!state->control->ReceiveCommand(&command, &control_error)) {
+        SetError(error, "TP worker command receive failed: " + control_error);
+        return false;
+      }
+      sampling::SamplingConfig greedy;
+      auto request = state->scheduler->Submit(
+          std::move(command.prompt_tokens), command.max_tokens, greedy, {},
+          false,
+          TextRequestMetadata{
+              .client_id = command.client_id,
+              .deadline = std::nullopt,
+              .request_start = Clock::now(),
+              .prompt_context = nullptr,
+              .cache_prompt = false,
+              .cache_prefix_tokens = 0,
+          });
+      const auto result = request.Wait({});
+      TpControlResponse response{
+          .sequence = command.sequence,
+          .tokens = {},
+          .draft_tokens = result.draft_tokens,
+          .draft_accepted_tokens = result.draft_accepted_tokens,
+          .error = result.cancelled ? "worker request cancelled" : "",
+      };
+      response.tokens.reserve(result.tokens.size());
+      for (const auto token : result.tokens) {
+        if (token > static_cast<tokenization::TokenId>(
+                         std::numeric_limits<std::int32_t>::max())) {
+          SetError(error, "TP worker produced an out-of-range token");
+          return false;
+        }
+        response.tokens.push_back(static_cast<std::int32_t>(token));
+      }
+      if (!state->control->SendResponse(response, &control_error)) {
+        SetError(error, "TP worker response send failed: " + control_error);
+        return false;
+      }
+    }
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+#else
+  SetError(error, "TP worker requires the HIP backend");
+  return false;
+#endif
 }
 #endif
 
@@ -3584,6 +3778,52 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
 
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
+  if (state->control != nullptr) {
+    if (stream_output || !sampling_config.can_use_unmodified_argmax() ||
+        prompt->context != nullptr || prompt->cache_prefix_tokens != 0 ||
+        !request.stop_sequences.empty() ||
+        max_tokens > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::invalid_argument(
+          "TP2 start_chat supports one greedy, uncached non-stream request "
+          "without stop sequences");
+    }
+    std::vector<std::int32_t> worker_prompt;
+    worker_prompt.reserve(prompt->tokens.size());
+    for (const auto token : prompt->tokens) {
+      if (token > static_cast<TextRunnerToken>(
+                       std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument(
+            "TP2 prompt token exceeds the worker protocol range");
+      }
+      worker_prompt.push_back(static_cast<std::int32_t>(token));
+    }
+    const std::lock_guard<std::mutex> lock(*impl_->tp_submit_mutex);
+    const std::uint64_t sequence = impl_->tp_sequence++;
+    auto scheduled_request = state->scheduler->Submit(
+        std::move(prompt->tokens), max_tokens, sampling_config, {}, false,
+        TextRequestMetadata{
+            .client_id = client_id,
+            .deadline = std::nullopt,
+            .request_start = request_start,
+            .prompt_context = nullptr,
+            .cache_prompt = false,
+            .cache_prefix_tokens = 0,
+        });
+    TpControlCommand command{
+        .sequence = sequence,
+        .max_tokens = static_cast<std::uint32_t>(max_tokens),
+        .prompt_tokens = std::move(worker_prompt),
+        .client_id = client_id,
+    };
+    std::string control_error;
+    if (!state->control->SendCommand(command, &control_error)) {
+      throw std::runtime_error("TP worker command failed: " + control_error);
+    }
+    return std::make_shared<Impl::ScheduledGenerationRequest>(
+        state, std::move(scheduled_request),
+        state->scheduler->runner().InitialOutputState(request), state->control,
+        impl_->tp_submit_mutex, sequence);
+  }
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt->tokens), max_tokens, sampling_config, is_cancelled,
       stream_output,

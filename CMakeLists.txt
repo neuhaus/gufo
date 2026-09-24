@@ -219,7 +219,12 @@ add_executable(gufo
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
 )
-target_link_libraries(gufo PRIVATE gufo_diagnostics gufo_core gufo_llm_cli gufo_http gufo_tp_control CURL::libcurl)
+target_link_libraries(gufo PRIVATE
+  gufo_diagnostics gufo_core gufo_llm_cli gufo_http gufo_tp_control
+  CURL::libcurl)
+if (GUFO_ENABLE_TP2_RDMA)
+  target_compile_definitions(gufo PRIVATE GUFO_ENABLE_TP2_RDMA=1)
+endif()
 target_compile_definitions(gufo PRIVATE
   GUFO_VERSION="${GUFO_VERSION}"
   GUFO_EVAL_SOURCE_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json"

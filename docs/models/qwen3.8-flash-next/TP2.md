@@ -43,7 +43,40 @@ The loader discovers the remaining target shards beside the first shard. The
 lower-level `qwen38_flash_next_gpu_probe` remains available for prefill/logit-dump
 comparisons.
 
-## Current boundaries
+## C1 serving qualification
+
+After the probe passes, rank 0 can run the fail-stop HTTP worker path and
+rank 1 can run the worker-only path. The first serving slice is intentionally
+limited to one greedy, non-streaming, uncached request at a time:
+
+```sh
+# rank 0: public HTTP server
+build/gpu-tp2/gufo serve llm \
+  --model models/qwen3.8-flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --speculative mtp \
+  --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  --draft-tokens 1 --min-draft-tokens 1 \
+  --tp-world-size 2 --tp-rank 0 \
+  --tp-bootstrap-port 18515 --tp-control-port 18516 \
+  --max-pending 1 --max-pending-per-client 1 --max-connections 1
+
+# rank 1: worker only; this process does not bind the public HTTP port
+build/gpu-tp2/gufo serve llm \
+  --model models/qwen3.8-flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --speculative mtp \
+  --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  --draft-tokens 1 --min-draft-tokens 1 \
+  --tp-world-size 2 --tp-rank 1 \
+  --tp-bootstrap-host RANK0_ADDRESS \
+  --tp-bootstrap-port 18515 --tp-control-port 18516 \
+  --max-pending 1 --max-pending-per-client 1 --max-connections 1
+```
+
+The worker uses a separate ordered TCP control channel for prepared prompt
+submissions. RDMA remains the tensor transport. Do not use this C1 path for
+streaming, cancellation, sampled decoding, vision, disk continuation, or
+multiple concurrent requests yet.
+
 
 - Expert-parallel routed MoE with replicated dense, attention, GDN, HC,
   embedding, and LM-head weights.
@@ -56,9 +89,10 @@ comparisons.
   compared with an explicit tolerance rather than claimed bit-identical.
 - A rank with no locally selected experts emits a zero routed contribution
   and still participates in the collective.
-- The serving runner now marks distributed TP2 as serial-only and disables
-  snapshots, forks, prefix reuse, persistence, and batched decode; distributed
-  serving still requires the separate rank-1 worker control channel.
+- The serving runner marks distributed TP2 as serial-only and disables
+  snapshots, forks, prefix reuse, persistence, and batched decode. The C1 path
+  uses a separate rank-1 worker control channel and does not yet support
+  streaming, cancellation, sampled decoding, or concurrent requests.
 - Distributed snapshots, disk continuation, and vision are rejected for now.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
