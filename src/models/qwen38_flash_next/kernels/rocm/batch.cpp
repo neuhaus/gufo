@@ -618,11 +618,21 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   if (!DenseBatch(l.router, x, base.router, rows, error))
     return false;
   RouterTopK(base.router, c.num_experts + 1, base.ids, base.weights, rows,
-             c.num_experts, c.num_experts_used, stream_);
-  if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
-                       error) ||
-      !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
+             c.num_experts, c.num_experts_used, model_->expert_begin(),
+             model_->local_experts(), stream_);
+  if (model_->tp_rank() != 0) {
+    if (!Check(hipMemsetAsync(base.shexp_out, 0,
+                              static_cast<std::size_t>(rows) * c.hidden_size *
+                                  sizeof(float),
+                              stream_),
+               error))
+      return false;
+  } else if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
+                              error) ||
+             !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows,
+                         error)) {
     return false;
+  }
   if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
       l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
     // Share expert weights across request boundaries while retaining the
@@ -630,17 +640,18 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     if (qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),
                               l.ffn_gate_exps.data, l.ffn_up_exps.data, x,
                               base.ids, base.gate_e, c.expert_ff, c.hidden_size,
-                              rows, c.num_experts, c.num_experts_used,
+                              rows, l.ffn_gate_exps.experts, c.num_experts_used,
                               stream_) != 0 ||
         qfn_mmq_moe_vec(
             static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
             base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,
-            rows * c.num_experts_used, c.num_experts, 1, stream_) != 0)
+            rows * c.num_experts_used, l.ffn_down_exps.experts, 1,
+            stream_) != 0)
       return Fail(error, "batched routed vector projection failed");
     MoeEpilogue(base.down_e, base.weights, base.shexp_out,
                 base.router + c.num_experts, c.num_experts + 1, out, rows,
                 c.num_experts_used, c.hidden_size, stream_);
-    return true;
+    return AllReduce(out, rows, error);
   }
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
     UseScratch(RowScratch(base, r));
@@ -651,7 +662,7 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     if (!ok)
       return false;
   }
-  return true;
+  return AllReduce(out, rows, error);
 }
 
 bool Executor::ForwardBatch(std::span<const BatchItem> items,

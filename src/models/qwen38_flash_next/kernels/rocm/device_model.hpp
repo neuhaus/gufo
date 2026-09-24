@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -72,7 +73,8 @@ public:
   [[nodiscard]] static std::unique_ptr<DeviceModel> Upload(
       const ModelWeights& weights, const core::GgufReader& reader,
       const MtpWeights* mtp, const core::GgufReader* mtp_reader,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr,
+      const distributed::TpPartition* partition = nullptr);
 
   const Config& config() const noexcept { return config_; }
   const DeviceTensor& token_embd() const noexcept { return token_embd_; }
@@ -82,6 +84,16 @@ public:
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
   const DeviceLayer& mtp() const noexcept { return mtp_; }
   [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
+  [[nodiscard]] std::uint32_t tp_rank() const noexcept { return tp_rank_; }
+  [[nodiscard]] std::uint32_t tp_world_size() const noexcept {
+    return tp_world_size_;
+  }
+  [[nodiscard]] std::uint32_t local_experts() const noexcept {
+    return local_experts_;
+  }
+  [[nodiscard]] std::uint32_t expert_begin() const noexcept {
+    return expert_begin_;
+  }
   /// Widest K among the BF16/F16 matrices (activation staging for hipBLAS).
   [[nodiscard]] std::size_t max_half_cols() const noexcept {
     return max_half_cols_;
@@ -103,6 +115,10 @@ private:
   bool has_mtp_{false};
   std::vector<void*> allocations_;
   std::size_t bytes_{0};
+  std::uint32_t tp_rank_{0};
+  std::uint32_t tp_world_size_{1};
+  std::uint32_t expert_begin_{0};
+  std::uint32_t local_experts_{1};
   std::size_t max_half_cols_{1};
   std::size_t max_q8_cols_{32};
 };

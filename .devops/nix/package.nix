@@ -11,6 +11,8 @@
   openssl,
   ffmpeg-headless,
   rocmPackages,
+  rdma-core ? null,
+  enableTp2Rdma ? false,
   version,
 }:
 
@@ -66,7 +68,7 @@ stdenv.mkDerivation {
     rocmPackages.rocprim
     rocmPackages.rocwmma
     rocmPackages.rocblas
-  ];
+  ] ++ lib.optionals enableTp2Rdma [ rdma-core rdma-core.dev ];
 
   cmakeFlags = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
@@ -75,7 +77,7 @@ stdenv.mkDerivation {
     "-DGUFO_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
     "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
     "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
-  ];
+  ] ++ lib.optionals enableTp2Rdma [ "-DGUFO_ENABLE_TP2_RDMA=ON" ];
 
   doInstallCheck = true;
   installCheckPhase = ''
@@ -88,6 +90,10 @@ stdenv.mkDerivation {
     test ! -e $out/bin/gufo-kernel-bench
     test -f $out/share/licenses/gufo/LICENSE
     test -f $out/share/licenses/gufo/third-party/LICENSE.ds4
+    ${lib.optionalString enableTp2Rdma ''
+      test -e $out/lib/libibverbs.so
+      test -f $out/share/licenses/gufo/third-party/rdma-core/COPYING.GPL2
+    ''}
 
     runHook postInstallCheck
   '';
@@ -106,7 +112,8 @@ stdenv.mkDerivation {
   meta = with lib; {
     description = "Gufo Engine — local inference runtime for AMD Strix Halo (gfx1151 GPU)";
     homepage = "https://github.com/gufo-org/gufo";
-    license = licenses.mit;
+    license =
+      if enableTp2Rdma then licenses.gpl2Only else licenses.mit;
     platforms = [ "x86_64-linux" ];
     mainProgram = "gufo";
   };

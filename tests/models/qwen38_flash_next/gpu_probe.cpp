@@ -3,6 +3,8 @@
 //
 // gpu_probe --model FIRST_SHARD.gguf --prompt TEXT [--reference]
 //           [--batch T] [--context N] [--dump logits.bin]
+// TP=2 probe: --tp-rank 0|1 --tp-world-size 2
+//              --tp-bootstrap-host HOST --tp-bootstrap-port PORT
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
 //                      [--depth N] (default: 0, 4096, 32768)
@@ -10,8 +12,10 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -19,8 +23,13 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/tokenizer.hpp"
+#include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+#ifdef GUFO_ENABLE_TP2_RDMA
+#include "src/models/qwen38_flash_next/kernels/rocm/verbs.hpp"
+#endif
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/reference.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
@@ -85,6 +94,12 @@ int main(int argc, char** argv) {
   std::optional<std::uint32_t> cost_depth;
   std::uint32_t batch = 512;
   std::uint32_t context = 4096;
+  std::uint32_t tp_rank = 0;
+  std::uint32_t tp_world_size = 1;
+  std::string tp_bootstrap_host;
+  std::uint16_t tp_bootstrap_port = 18515;
+  std::uint32_t tp_device = 0;
+  std::uint32_t tp_gid = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto next = [&]() -> std::string {
@@ -118,6 +133,40 @@ int main(int argc, char** argv) {
         return 2;
       }
       cost_depth = depth;
+    } else if (arg == "--tp-rank" || arg == "--tp-world-size" ||
+               arg == "--tp-bootstrap-port" || arg == "--tp-device" ||
+               arg == "--tp-gid-index") {
+      const auto value = next();
+      std::uint32_t parsed = 0;
+      const auto [end, ec] =
+          std::from_chars(value.data(), value.data() + value.size(), parsed);
+      if (ec != std::errc{} || end != value.data() + value.size()) {
+        std::fprintf(stderr, "%s requires an unsigned integer\n", arg.c_str());
+        return 2;
+      }
+      if (arg == "--tp-rank") {
+        tp_rank = parsed;
+      } else if (arg == "--tp-world-size") {
+        tp_world_size = parsed;
+      } else if (arg == "--tp-bootstrap-port") {
+        if (parsed == 0 ||
+            parsed > std::numeric_limits<std::uint16_t>::max()) {
+          std::fprintf(stderr, "--tp-bootstrap-port is out of range\n");
+          return 2;
+        }
+        tp_bootstrap_port = static_cast<std::uint16_t>(parsed);
+      } else if (arg == "--tp-device") {
+        if (parsed > static_cast<std::uint32_t>(
+                         std::numeric_limits<int>::max())) {
+          std::fprintf(stderr, "--tp-device is out of range\n");
+          return 2;
+        }
+        tp_device = parsed;
+      } else {
+        tp_gid = parsed;
+      }
+    } else if (arg == "--tp-bootstrap-host") {
+      tp_bootstrap_host = next();
     } else if (arg == "--prompt") {
       prompt = next();
     } else if (arg == "--reference") {
@@ -155,6 +204,28 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--depth requires --cost-audit\n");
     return 2;
   }
+  if (tp_world_size != 1 && tp_world_size != 2) {
+    std::fprintf(stderr, "--tp-world-size must be 1 or 2\n");
+    return 2;
+  }
+  if (tp_world_size == 1 && tp_rank != 0) {
+    std::fprintf(stderr, "single-rank probe requires --tp-rank 0\n");
+    return 2;
+  }
+  if (tp_rank >= tp_world_size) {
+    std::fprintf(stderr, "--tp-rank must be less than --tp-world-size\n");
+    return 2;
+  }
+  if (tp_world_size == 2 && tp_rank == 1 && tp_bootstrap_host.empty()) {
+    std::fprintf(stderr, "rank one requires --tp-bootstrap-host\n");
+    return 2;
+  }
+  if (tp_device > static_cast<std::uint32_t>(
+                       std::numeric_limits<int>::max()) ||
+      hipSetDevice(static_cast<int>(tp_device)) != hipSuccess) {
+    std::fprintf(stderr, "HIP device selection failed\n");
+    return 1;
+  }
   std::string error;
   auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
   if (!reader) {
@@ -177,6 +248,35 @@ int main(int argc, char** argv) {
       (c.context_length < 96 || *cost_depth > c.context_length - 96)) {
     std::fprintf(stderr, "--depth leaves no room for the cost-audit suffix\n");
     return 2;
+  }
+  std::optional<q::distributed::TpPartition> partition;
+  std::shared_ptr<q::rocm::Communicator> communicator;
+  if (tp_world_size == 2) {
+    partition = q::distributed::TpPartition::Create(
+        c.num_experts, tp_rank, tp_world_size, &error);
+    if (!partition) {
+      std::fprintf(stderr, "partition failed: %s\n", error.c_str());
+      return 1;
+    }
+#ifdef GUFO_ENABLE_TP2_RDMA
+    const q::rocm::IbrverbsConfig config{
+        .rank = tp_rank,
+        .world_size = tp_world_size,
+        .bootstrap_host = tp_bootstrap_host,
+        .bootstrap_port = tp_bootstrap_port,
+        .device_index = tp_device,
+        .gid_index = tp_gid,
+    };
+    communicator =
+        q::rocm::CreateIbrverbsCommunicator(config, &error);
+    if (!communicator) {
+      std::fprintf(stderr, "RDMA communicator failed: %s\n", error.c_str());
+      return 1;
+    }
+#else
+    std::fprintf(stderr, "this probe was built without TP2 RDMA support\n");
+    return 2;
+#endif
   }
   std::unique_ptr<q::NgramTable> ngram;
   if (c.ple_layer >= 0) {
@@ -201,18 +301,31 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
+  const auto* partition_ptr = partition ? &*partition : nullptr;
   auto device = q::rocm::DeviceModel::Upload(
       *weights, *reader, mtp_weights ? &*mtp_weights : nullptr,
-      mtp_reader.get(), &error);
+      mtp_reader.get(), &error, partition_ptr);
   if (!device) {
     std::fprintf(stderr, "upload failed: %s\n", error.c_str());
     return 1;
   }
+  if (tp_world_size == 2) {
+    std::printf("TP2 rank=%u world=%u local_experts=%u resident_bytes=%zu\n",
+                tp_rank, tp_world_size, device->local_experts(),
+                device->resident_bytes());
+  }
   q::rocm::Executor::Options options;
+  options.device_index = static_cast<int>(tp_device);
   options.max_batch = batch;
   options.max_logit_rows = std::min<std::uint32_t>(batch, 64);
   if (mtp_audit || cost_audit)
     options.max_speculative = 8;
+  if (communicator) {
+    options.all_reduce = [communicator](float* data, std::size_t bytes,
+                                       hipStream_t stream, std::string* error) {
+      return communicator->AllReduceSum(data, bytes, stream, error);
+    };
+  }
 
   if (cost_audit) {
     options.max_batch = 2048;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <limits>
 
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -35,6 +36,7 @@ struct Uploader {
   std::string* error;
   bool ok{true};
   std::uint32_t shard_base{0};
+  const distributed::TpPartition* partition{nullptr};
 
   void Fail(const std::string& message) {
     if (ok && error != nullptr) {
@@ -43,12 +45,17 @@ struct Uploader {
     ok = false;
   }
 
-  DeviceTensor Copy(const TensorRef& t) {
+  DeviceTensor CopyRange(const TensorRef& t, std::uint64_t relative_offset,
+                         std::size_t size, std::uint32_t experts) {
     DeviceTensor d;
     if (t.empty() || !ok) {
       return d;
     }
-    const std::size_t size = t.SizeBytes();
+    if (relative_offset > std::numeric_limits<std::uint64_t>::max() -
+                              t.file_offset) {
+      Fail("weight range offset overflow for " + std::string(t.name));
+      return d;
+    }
     void* ptr = nullptr;
     if (hipMalloc(&ptr, size + kTailMargin) != hipSuccess) {
       Fail("hipMalloc failed for " + std::string(t.name) + " (" +
@@ -57,7 +64,8 @@ struct Uploader {
     }
     allocations.push_back(ptr);
     bytes += size + kTailMargin;
-    if (!stager.Copy(shard_base + t.shard, t.file_offset, size, ptr, error)) {
+    if (!stager.Copy(shard_base + t.shard,
+                     t.file_offset + relative_offset, size, ptr, error)) {
       Fail("upload failed for " + std::string(t.name) +
            (error != nullptr ? ": " + *error : std::string()));
       return d;
@@ -68,14 +76,40 @@ struct Uploader {
     d.type = t.type;
     d.cols = static_cast<std::uint32_t>(t.cols);
     d.rows = static_cast<std::uint32_t>(t.rows);
-    d.experts = static_cast<std::uint32_t>(t.experts);
+    d.experts = experts;
     if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16) {
       max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
     }
-    if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {
+    if (t.type == core::GgmlType::kQ8_0 && experts == 1) {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     }
     return d;
+  }
+
+  DeviceTensor Copy(const TensorRef& t) {
+    if (t.empty() || !ok) {
+      return {};
+    }
+    return CopyRange(t, 0, t.SizeBytes(),
+                     static_cast<std::uint32_t>(t.experts));
+  }
+
+  DeviceTensor CopyRouted(const TensorRef& t) {
+    if (t.empty() || !ok) {
+      return {};
+    }
+    if (partition == nullptr) {
+      return Copy(t);
+    }
+    const auto range = distributed::LocalExpertRange(t, *partition, error);
+    if (!range) {
+      Fail(error != nullptr && !error->empty()
+               ? *error
+               : "invalid routed tensor partition");
+      return {};
+    }
+    return CopyRange(t, range->byte_offset, range->byte_size,
+                     range->expert_count);
   }
 
   // GGUF packs [fc_embedding | fc_hidden] across each row. Split on a
@@ -241,9 +275,9 @@ struct Uploader {
     d.ple_norm_conv = Copy(l.ple_norm_conv);
     d.ple_conv1d = Copy(l.ple_conv1d);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
-    d.ffn_gate_exps = Copy(l.ffn_gate_exps);
-    d.ffn_up_exps = Copy(l.ffn_up_exps);
-    d.ffn_down_exps = Copy(l.ffn_down_exps);
+    d.ffn_gate_exps = CopyRouted(l.ffn_gate_exps);
+    d.ffn_up_exps = CopyRouted(l.ffn_up_exps);
+    d.ffn_down_exps = CopyRouted(l.ffn_down_exps);
     d.shexp_gate = Copy(l.shexp_gate);
     d.shexp_up = Copy(l.shexp_up);
     d.shexp_down = Copy(l.shexp_down);
@@ -267,7 +301,7 @@ DeviceModel::~DeviceModel() {
 std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
-    std::string* error_msg) {
+    std::string* error_msg, const distributed::TpPartition* partition) {
   // The CPU reference also reads Q6_K, but the production embedding, dense
   // and routed kernels do not. Reject it before allocating device weights.
   const auto supported = [&](const TensorRef& t) {
@@ -288,6 +322,23 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   std::unique_ptr<DeviceModel> m(new DeviceModel());
   m->config_ = w.config;
+  if (partition == nullptr) {
+    m->tp_rank_ = 0;
+    m->tp_world_size_ = 1;
+    m->expert_begin_ = 0;
+    m->local_experts_ = static_cast<std::uint32_t>(w.config.num_experts);
+  } else {
+    if (!partition->Valid() || partition->num_experts != w.config.num_experts) {
+      if (error_msg != nullptr) {
+        *error_msg = "TP partition expert count does not match the model";
+      }
+      return nullptr;
+    }
+    m->tp_rank_ = partition->rank;
+    m->tp_world_size_ = partition->world_size;
+    m->expert_begin_ = partition->expert_begin;
+    m->local_experts_ = partition->expert_count;
+  }
   const auto regions = reader.GetMappedRegions();
   std::vector<core::GgufMappedRegion> shards(regions.begin(), regions.end());
   const auto shard_count = static_cast<std::uint32_t>(shards.size());
@@ -306,7 +357,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   std::vector<Conversion> conversions;
   Uploader up{*stager,           conversions,     m->allocations_, m->bytes_,
-              m->max_half_cols_, m->max_q8_cols_, error_msg};
+              m->max_half_cols_, m->max_q8_cols_, error_msg,
+              true,              0,                partition};
   m->token_embd_ = up.Copy(w.token_embd);
   m->output_ =
       w.output.data == w.token_embd.data ? m->token_embd_ : up.Copy(w.output);

@@ -29,6 +29,7 @@ struct MtpWeights;
 class NgramTable;
 struct MtpCandidateLogits;
 namespace rocm {
+class Communicator;
 class DeviceModel;
 class Executor;
 class Session;
@@ -45,6 +46,12 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
+  /// Optional two-rank expert-parallel identity. World size one preserves the
+  /// existing single-rank path and needs no communicator.
+  std::uint32_t tp_rank = 0;
+  std::uint32_t tp_world_size = 1;
+  int hip_device = 0;
+  std::shared_ptr<rocm::Communicator> communicator;
 };
 
 class Session;

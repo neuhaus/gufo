@@ -219,7 +219,7 @@ void CheckRouter(int tokens, int experts, int used, int pattern) {
   std::vector<std::int32_t> first_ids;
   for (int replay = 0; replay < 2; ++replay) {
     q::RouterTopK(d_logits, stride, d_ids + 1, d_weights + 1, tokens, experts,
-                  used, nullptr);
+                  used, 0, experts, nullptr);
     CheckHip(hipDeviceSynchronize(), "router");
     std::vector<float> weights(count + 2);
     std::vector<std::int32_t> ids(count + 2);
@@ -277,6 +277,38 @@ void CheckRouter(int tokens, int experts, int used, int pattern) {
         if (ids[at] != order[i] || !std::isfinite(weights[at]) ||
             std::abs(weights[at] - expected) > 2e-6) {
           throw std::runtime_error("router differs from softmax reference");
+        }
+      }
+    }
+    if (experts >= 2 && experts % 2 == 0) {
+      for (std::uint32_t part = 0; part < 2; ++part) {
+        const std::uint32_t begin = part * (experts / 2);
+        q::RouterTopK(d_logits, stride, d_ids + 1, d_weights + 1, tokens,
+                      experts, used, begin, experts / 2, nullptr);
+        CheckHip(hipDeviceSynchronize(), "partitioned router");
+        std::vector<float> local_weights(count + 2);
+        std::vector<std::int32_t> local_ids(count + 2);
+        CheckHip(hipMemcpy(local_weights.data(), d_weights,
+                           local_weights.size() * sizeof(float),
+                           hipMemcpyDeviceToHost),
+                 "download partitioned router weights");
+        CheckHip(hipMemcpy(local_ids.data(), d_ids,
+                           local_ids.size() * sizeof(std::int32_t),
+                           hipMemcpyDeviceToHost),
+                 "download partitioned router ids");
+        for (std::size_t at = 1; at < local_ids.size() - 1; ++at) {
+          const auto global = first_ids[at];
+          const bool local =
+              global >= static_cast<std::int32_t>(begin) &&
+              global < static_cast<std::int32_t>(begin + experts / 2);
+          const auto expected =
+              local ? global - static_cast<std::int32_t>(begin) : -1;
+          const float weight = local ? first_weights[at] : 0.0f;
+          if (local_ids[at] != expected ||
+              std::bit_cast<std::uint32_t>(local_weights[at]) !=
+                  std::bit_cast<std::uint32_t>(weight)) {
+            throw std::runtime_error("partitioned router mapping differs");
+          }
         }
       }
     }
