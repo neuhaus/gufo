@@ -35,7 +35,7 @@ namespace {
 constexpr std::uint32_t kWireMagic = 0x47554654U;  // "GUFT"
 constexpr std::uint32_t kWireVersion = 2;
 constexpr std::uint32_t kCollectiveMagic = 0x47554348U;  // "GUCH"
-constexpr std::uint32_t kCollectiveVersion = 1;
+constexpr std::uint32_t kCollectiveVersion = 2;
 constexpr std::uint32_t kDataReadyMagic = 0x47554452U;  // "GUDR"
 constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
 constexpr std::size_t kBufferBytes = 64U << 20;

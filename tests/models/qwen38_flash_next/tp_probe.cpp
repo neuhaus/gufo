@@ -186,8 +186,8 @@ int main(int argc, char** argv) {
   }
 
   const gufo::sampling::SamplingConfig sampling{
-      .temperature = 0.0F,
-      .seed = 7,
+      .temperature = temperature,
+      .seed = seed,
   };
   gufo::sampling::SamplerState sampler(sampling);
   std::vector<std::int32_t> output;

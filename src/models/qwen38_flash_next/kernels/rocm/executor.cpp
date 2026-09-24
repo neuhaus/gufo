@@ -410,21 +410,21 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
-  s.expert_counts = Alloc<std::uint32_t>(a, model_->local_experts(), error_msg);
+  s.expert_counts =
+      Alloc<std::uint32_t>(a, model.local_experts(), error_msg);
   {
     const std::size_t compact =
-        RoutedCompactRows(slots, model_->local_experts());
+        RoutedCompactRows(slots, model.local_experts());
     s.routed_bounds =
-        Alloc<std::int32_t>(a, model_->local_experts() + 1, error_msg);
+        Alloc<std::int32_t>(a, model.local_experts() + 1, error_msg);
     s.routed_cursors =
-        Alloc<std::int32_t>(a, model_->local_experts(), error_msg);
+        Alloc<std::int32_t>(a, model.local_experts(), error_msg);
     s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
     s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
     s.routed_tiles =
-        Alloc<std::int32_t>(a,
-                            3 * RoutedTileCapacity(
-                                   slots, model_->local_experts()),
-                            error_msg);
+        Alloc<std::int32_t>(
+            a, 3 * RoutedTileCapacity(slots, model.local_experts()),
+            error_msg);
   }
   s.weights = f32(slots);
   s.gate_e = f32(slots * c.expert_ff);
@@ -452,7 +452,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     }
     void* counts = nullptr;
     if (!Check(hipHostMalloc(
-                   &counts, model_->local_experts() * sizeof(std::uint32_t)),
+                   &counts, model.local_experts() * sizeof(std::uint32_t)),
                "pinned expert counts", error_msg)) {
       return nullptr;
     }
@@ -460,7 +460,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     void* tiles = nullptr;
     if (!Check(hipHostMalloc(
                    &tiles,
-                   3 * RoutedTileCapacity(slots, model_->local_experts()) *
+                   3 * RoutedTileCapacity(slots, model.local_experts()) *
                        sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
