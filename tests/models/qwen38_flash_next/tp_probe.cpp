@@ -1,0 +1,184 @@
+#include <charconv>
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "src/core/sampling.hpp"
+#include "src/models/qwen38_flash_next/engine.hpp"
+#ifdef GUFO_ENABLE_TP2_RDMA
+#include "src/models/qwen38_flash_next/kernels/rocm/verbs.hpp"
+#endif
+
+namespace q = gufo::models::qwen38_flash_next;
+
+namespace {
+
+void Fail(const std::string& message) {
+  std::fprintf(stderr, "%s\n", message.c_str());
+}
+
+bool ParseUint(std::string_view text, std::uint32_t* value) {
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), *value);
+  return error == std::errc{} && end == text.data() + text.size();
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  std::string model_path;
+  std::string mtp_path;
+  std::string prompt = "The capital of France is";
+  std::uint32_t context = 4096;
+  std::uint32_t tokens = 16;
+  std::uint32_t rank = 0;
+  std::uint32_t world_size = 1;
+  std::uint32_t device = 0;
+  std::uint32_t gid = 0;
+  std::uint16_t port = 18515;
+  std::string bootstrap_host;
+
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    const auto next = [&]() -> std::string {
+      return i + 1 < argc ? argv[++i] : std::string();
+    };
+    if (arg == "--model") {
+      model_path = next();
+    } else if (arg == "--mtp-model") {
+      mtp_path = next();
+    } else if (arg == "--prompt") {
+      prompt = next();
+    } else if (arg == "--context") {
+      if (!ParseUint(next(), &context)) {
+        Fail("--context requires an unsigned integer");
+        return 2;
+      }
+    } else if (arg == "--tokens") {
+      if (!ParseUint(next(), &tokens)) {
+        Fail("--tokens requires an unsigned integer");
+        return 2;
+      }
+    } else if (arg == "--tp-rank") {
+      if (!ParseUint(next(), &rank)) {
+        Fail("--tp-rank requires an unsigned integer");
+        return 2;
+      }
+    } else if (arg == "--tp-world-size") {
+      if (!ParseUint(next(), &world_size)) {
+        Fail("--tp-world-size requires an unsigned integer");
+        return 2;
+      }
+    } else if (arg == "--tp-device") {
+      if (!ParseUint(next(), &device)) {
+        Fail("--tp-device requires an unsigned integer");
+        return 2;
+      }
+    } else if (arg == "--tp-gid-index") {
+      if (!ParseUint(next(), &gid)) {
+        Fail("--tp-gid-index requires an unsigned integer");
+        return 2;
+      }
+    } else if (arg == "--tp-bootstrap-port") {
+      std::uint32_t parsed = 0;
+      if (!ParseUint(next(), &parsed) || parsed == 0 || parsed > 65535) {
+        Fail("--tp-bootstrap-port is out of range");
+        return 2;
+      }
+      port = static_cast<std::uint16_t>(parsed);
+    } else if (arg == "--tp-bootstrap-host") {
+      bootstrap_host = next();
+    } else {
+      Fail("unknown argument: " + arg);
+      return 2;
+    }
+  }
+  if (model_path.empty() || context == 0 || tokens == 0 ||
+      (world_size != 1 && world_size != 2) || rank >= world_size ||
+      (world_size == 1 && rank != 0) ||
+      (world_size == 2 && rank == 1 && bootstrap_host.empty())) {
+    Fail("invalid TP2 probe arguments");
+    return 2;
+  }
+
+  std::shared_ptr<q::rocm::Communicator> communicator;
+#ifdef GUFO_ENABLE_TP2_RDMA
+  if (world_size == 2) {
+    std::string error;
+    const q::rocm::IbrverbsConfig config{
+        .rank = rank,
+        .world_size = world_size,
+        .bootstrap_host = bootstrap_host,
+        .bootstrap_port = port,
+        .device_index = device,
+        .gid_index = gid,
+    };
+    communicator = q::rocm::CreateIbrverbsCommunicator(config, &error);
+    if (!communicator) {
+      Fail("RDMA communicator failed: " + error);
+      return 1;
+    }
+  }
+#else
+  if (world_size == 2) {
+    Fail("this probe was built without TP2 RDMA support");
+    return 2;
+  }
+#endif
+
+  std::string error;
+  q::ModelOptions options{
+      .max_context = context,
+      .mtp_model_path = mtp_path,
+      .max_draft_tokens = 7,
+      .tp_rank = rank,
+      .tp_world_size = world_size,
+      .hip_device = static_cast<int>(device),
+      .communicator = communicator,
+  };
+  auto model = q::Model::Load(model_path, options, &error);
+  if (!model) {
+    Fail("model load failed: " + error);
+    return 1;
+  }
+  const auto prompt_tokens = model->Tokenize(prompt);
+  if (prompt_tokens.empty() || prompt_tokens.size() > context ||
+      tokens > context - prompt_tokens.size()) {
+    Fail("prompt is outside the requested context");
+    return 2;
+  }
+  auto session = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      context, &error);
+  if (!session || !session->Sync(prompt_tokens, &error)) {
+    Fail("prompt sync failed: " + error);
+    return 1;
+  }
+
+  const gufo::sampling::SamplingConfig sampling{
+      .temperature = 0.0F,
+      .seed = 7,
+  };
+  gufo::sampling::SamplerState sampler(sampling);
+  std::vector<std::int32_t> output;
+  while (output.size() < tokens) {
+    q::Session::DecodeResult step;
+    if (!session->DecodeStep(tokens - output.size(), sampler, &step, &error,
+                             false)) {
+      Fail("decode failed: " + error);
+      return 1;
+    }
+    output.insert(output.end(), step.tokens.begin(), step.tokens.end());
+  }
+  if (output.size() > tokens) {
+    output.resize(tokens);
+  }
+  std::printf("rank=%u tokens=%zu text=%s\n", rank, output.size(),
+              model->Decode(output).c_str());
+  return 0;
+}

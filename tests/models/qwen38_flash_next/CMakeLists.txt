@@ -43,6 +43,10 @@ if (ENGINE_ENABLE_HIP)
   add_custom_target(qwen38_flash_next_model_tests
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test)
 
+  add_executable(qwen38_flash_next_tp_probe EXCLUDE_FROM_ALL tp_probe.cpp)
+  target_link_libraries(qwen38_flash_next_tp_probe PRIVATE
+    gufo_qwen38_flash_next)
+
   add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp
     mtp_audit.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE

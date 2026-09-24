@@ -39,7 +39,9 @@ let
       || relativePath == "tests/models"
       || relativePath == "tests/models/deepseek_v4_flash"
       || relativePath == "tests/models/deepseek_v4_flash/fixtures"
-      || relativePath == "tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json";
+      || relativePath == "tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json"
+      || relativePath == "tests/models/qwen38_flash_next"
+      || lib.hasPrefix "tests/models/qwen38_flash_next/" relativePath;
   };
 in
 stdenv.mkDerivation {

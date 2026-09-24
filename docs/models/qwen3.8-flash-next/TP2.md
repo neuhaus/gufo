@@ -11,7 +11,7 @@ disabled in the default build.
 ```sh
 nix develop --inputs-from .#tp2-rdma -c cmake --preset gpu-tp2
 nix develop --inputs-from .#tp2-rdma -c cmake --build --preset gpu-tp2 \
-  --target qwen38_flash_next_gpu_probe
+  --target qwen38_flash_next_tp_probe qwen38_flash_next_gpu_probe
 ```
 
 The target and MTP sidecar must be present on both hosts. The first run uses
@@ -24,22 +24,24 @@ Run rank 0 first. `BOOTSTRAP_HOST` is the address rank 1 uses to reach rank
 
 ```sh
 # host 0
-build/gpu-tp2/tests/models/qwen38_flash_next/qwen38_flash_next_gpu_probe \
+build/gpu-tp2/tests/models/qwen38_flash_next/qwen38_flash_next_tp_probe \
   --model models/qwen3.8-flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  --prompt 'The capital of France is' --batch 32 --context 4096 \
+  --prompt 'The capital of France is' --tokens 16 --context 4096 \
   --tp-world-size 2 --tp-rank 0 --tp-bootstrap-port 18515
 
 # host 1
-build/gpu-tp2/tests/models/qwen38_flash_next/qwen38_flash_next_gpu_probe \
+build/gpu-tp2/tests/models/qwen38_flash_next/qwen38_flash_next_tp_probe \
   --model models/qwen3.8-flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  --prompt 'The capital of France is' --batch 32 --context 4096 \
+  --prompt 'The capital of France is' --tokens 16 --context 4096 \
   --tp-world-size 2 --tp-rank 1 --tp-bootstrap-host RANK0_ADDRESS \
   --tp-bootstrap-port 18515
 ```
 
-The loader discovers the remaining target shards beside the first shard.
+The loader discovers the remaining target shards beside the first shard. The
+lower-level `qwen38_flash_next_gpu_probe` remains available for prefill/logit-dump
+comparisons.
 
 ## Current boundaries
 
