@@ -58,6 +58,7 @@ build/gpu-tp2/gufo serve llm \
   --draft-tokens 1 --min-draft-tokens 1 \
   --tp-world-size 2 --tp-rank 0 \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
+  --tp-control-token SHARED_TOKEN \
   --max-pending 1 --max-pending-per-client 1 --max-connections 1
 
 # rank 1: worker only; this process does not bind the public HTTP port
@@ -69,11 +70,13 @@ build/gpu-tp2/gufo serve llm \
   --tp-world-size 2 --tp-rank 1 \
   --tp-bootstrap-host RANK0_ADDRESS \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
+  --tp-control-token SHARED_TOKEN \
   --max-pending 1 --max-pending-per-client 1 --max-connections 1
 ```
 
 The worker uses a separate ordered TCP control channel for prepared prompt
-submissions. RDMA remains the tensor transport. Do not use this C1 path for
+submissions. Both ranks must receive the same `--tp-control-token`. RDMA remains
+the tensor transport. Do not use this C1 path for
 streaming, cancellation, sampled decoding, vision, disk continuation, or
 multiple concurrent requests yet.
 

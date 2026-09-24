@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@ struct TpControlConfig {
   std::uint32_t max_context{4096};
   std::uint32_t max_draft_tokens{7};
   bool use_mtp{false};
+  std::string auth_token;
 };
 
 struct TpControlCommand {
@@ -63,7 +65,7 @@ class TpControlChannel final {
   [[nodiscard]] std::uint32_t world_size() const noexcept;
 
  private:
-  explicit TpControlChannel(int fd, std::uint32_t rank);
+  TpControlChannel(int fd, std::uint32_t rank, std::uint16_t port);
 
   [[nodiscard]] bool SendFrame(std::uint16_t type, std::uint64_t sequence,
                                const std::vector<std::uint8_t>& payload,
@@ -79,6 +81,10 @@ class TpControlChannel final {
   std::uint16_t port_{0};
   std::uint32_t rank_{0};
   std::uint32_t world_size_{1};
+  std::uint32_t max_context_{0};
+  bool handshaken_{false};
+  std::string auth_token_;
+  std::mutex io_mutex_;
   std::vector<std::uint8_t> command_prompt_;
   std::vector<std::uint8_t> response_payload_;
 };

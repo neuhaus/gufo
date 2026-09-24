@@ -479,6 +479,7 @@ void PrintServeHelp(std::string_view program_name,
     std::uint32_t tp_bootstrap_port = 18515;
     std::uint32_t tp_control_port = 18516;
     std::string tp_bootstrap_host;
+    std::string tp_control_token;
 
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
@@ -511,6 +512,9 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--tp-control-port", "N",
                      "TCP worker control port (default: 18516)", "TP2",
                      &tp_control_port);
+    parser.AddOption("", "--tp-control-token", "TOKEN",
+                     "Shared token for TP worker authentication", "TP2",
+                     &tp_control_token);
     parser.AddOption("", "--tp-device", "N", "HIP device index", "TP2",
                      &tp_device);
     parser.AddOption("", "--tp-gid-index", "N", "InfiniBand GID index", "TP2",
@@ -954,6 +958,7 @@ int RunServe(std::span<const char* const> args) {
     std::uint32_t tp_bootstrap_port = 18515;
     std::uint32_t tp_control_port = 18516;
     std::string tp_bootstrap_host;
+    std::string tp_control_token;
 
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
@@ -985,6 +990,9 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--tp-control-port", "N",
                          "TCP worker control port (default: 18516)", "TP2",
                          &tp_control_port);
+    llm_parser.AddOption("", "--tp-control-token", "TOKEN",
+                         "Shared token for TP worker authentication", "TP2",
+                         &tp_control_token);
     llm_parser.AddOption("", "--tp-device", "N", "HIP device index", "TP2",
                          &tp_device);
     llm_parser.AddOption("", "--tp-gid-index", "N", "InfiniBand GID index",
@@ -1190,6 +1198,11 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
     if (tp_world_size == 2 &&
+        (tp_control_token.empty() || tp_control_token.size() > 4096)) {
+      std::cerr << "Error: TP2 requires --tp-control-token\n";
+      return 2;
+    }
+    if (tp_world_size == 2 &&
         (draft_tokens != 1 || min_draft_tokens != 1 ||
          max_pending_requests != 1 || max_pending_requests_per_client != 1 ||
          request_timeout_ms != 0 || !cache_disk_directory.empty() ||
@@ -1204,6 +1217,7 @@ int RunServe(std::span<const char* const> args) {
         .rank = tp_rank,
         .world_size = tp_world_size,
         .hip_device = static_cast<int>(tp_device),
+        .auth_token = tp_control_token,
     };
     std::shared_ptr<models::qwen38_flash_next::rocm::Communicator>
         tp_communicator;

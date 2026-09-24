@@ -72,11 +72,22 @@ int main() {
                         .world_size = 2,
                         .max_context = 4096,
                         .max_draft_tokens = 7,
-                        .use_mtp = true};
+                        .use_mtp = true,
+                        .auth_token = "test-token"};
   TpControlConfig rank1 = rank0;
   rank1.rank = 1;
-  Require(server->Handshake(rank0, &server_error), server_error);
-  Require(client->Handshake(rank1, &client_error), client_error);
+  bool server_handshake = false;
+  bool client_handshake = false;
+  std::thread server_handshake_thread([&] {
+    server_handshake = server->Handshake(rank0, &server_error);
+  });
+  std::thread client_handshake_thread([&] {
+    client_handshake = client->Handshake(rank1, &client_error);
+  });
+  server_handshake_thread.join();
+  client_handshake_thread.join();
+  Require(server_handshake, server_error);
+  Require(client_handshake, client_error);
 
   TpControlCommand command{.sequence = 7,
                            .max_tokens = 4,
@@ -94,7 +105,8 @@ int main() {
   TpControlResponse response{.sequence = received.sequence,
                              .tokens = {20, 21},
                              .draft_tokens = 3,
-                             .draft_accepted_tokens = 2};
+                             .draft_accepted_tokens = 2,
+                             .error = {}};
   Require(client->SendResponse(response, &client_error), client_error);
   TpControlResponse received_response;
   Require(server->ReceiveResponse(&received_response, &server_error),
@@ -106,7 +118,8 @@ int main() {
                   response.draft_accepted_tokens,
           "TP control response round trip");
 
-  Require(server->port() == port, "TP control listener port");
+  Require(server->port() == port && client->port() == port,
+          "TP control service port");
   std::puts("PASS: TP control handshake and framed worker messages");
   return 0;
 }

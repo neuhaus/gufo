@@ -348,7 +348,7 @@ if (BUILD_TESTING)
   add_executable(tp_control_test tests/cli/tp_control_test.cpp)
   target_link_libraries(tp_control_test PRIVATE gufo_tp_control)
   add_test(NAME tp_control_test COMMAND tp_control_test)
-  set_tests_properties(tp_control_test PROPERTIES LABELS "cpu;tp2")
+  set_tests_properties(tp_control_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 10)
 
   add_executable(json_test tests/core/json_test.cpp)
   target_link_libraries(json_test PRIVATE gufo_core)

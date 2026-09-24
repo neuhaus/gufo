@@ -3510,6 +3510,7 @@ bool InferenceBackend::load(
           .max_context = max_context,
           .max_draft_tokens = has_mtp ? speculative_config.max_draft_tokens : 0,
           .use_mtp = has_mtp,
+          .auth_token = tp_config.auth_token,
       };
       std::string control_error;
       if (!tp_config.control->Handshake(control_config, &control_error)) {

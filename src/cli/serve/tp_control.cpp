@@ -27,10 +27,11 @@ constexpr std::uint16_t kVersion = 1;
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
-constexpr std::size_t kMaxPayloadBytes = 64U << 20;
+constexpr std::size_t kMaxPayloadBytes = 16U << 20;
 constexpr std::size_t kMaxPromptTokens = 1U << 20;
 constexpr std::size_t kMaxClientIdBytes = 4096;
 constexpr std::size_t kMaxErrorBytes = 1U << 20;
+constexpr std::size_t kMaxAuthTokenBytes = 4096;
 constexpr auto kIoTimeout = std::chrono::seconds(30);
 
 void SetError(std::string* error, std::string message) {
@@ -43,10 +44,8 @@ std::string SystemError(const char* operation) {
   return std::string(operation) + ": " + std::strerror(errno);
 }
 
-void SetTimeouts(int fd) {
+void ClearTimeouts(int fd) {
   timeval timeout{};
-  timeout.tv_sec = 30;
-  timeout.tv_usec = 0;
   (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 }
@@ -95,12 +94,16 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
 
 }  // namespace
 
-TpControlChannel::TpControlChannel(int fd, std::uint32_t rank)
-    : fd_(fd), rank_(rank) {
-  sockaddr_in address{};
-  socklen_t length = sizeof(address);
-  if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&address), &length) == 0) {
-    port_ = ntohs(address.sin_port);
+TpControlChannel::TpControlChannel(int fd, std::uint32_t rank,
+                                   std::uint16_t port)
+    : fd_(fd), port_(port), rank_(rank) {
+  if (port_ == 0) {
+    sockaddr_in address{};
+    socklen_t length = sizeof(address);
+    if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&address), &length) ==
+        0) {
+      port_ = ntohs(address.sin_port);
+    }
   }
 }
 
@@ -140,8 +143,9 @@ std::shared_ptr<TpControlChannel> TpControlChannel::Listen(
     SetError(error, SystemError("TP control accept"));
     return nullptr;
   }
-  SetTimeouts(peer);
-  return std::shared_ptr<TpControlChannel>(new TpControlChannel(peer, 0));
+  ClearTimeouts(peer);
+  return std::shared_ptr<TpControlChannel>(
+      new TpControlChannel(peer, 0, port));
 }
 
 std::shared_ptr<TpControlChannel> TpControlChannel::Connect(
@@ -198,9 +202,9 @@ std::shared_ptr<TpControlChannel> TpControlChannel::Connect(
     }
     ::freeaddrinfo(addresses);
     if (fd >= 0) {
-      SetTimeouts(fd);
+      ClearTimeouts(fd);
       return std::shared_ptr<TpControlChannel>(
-          new TpControlChannel(fd, 1));
+          new TpControlChannel(fd, 1, port));
     }
     if (std::chrono::steady_clock::now() >= deadline) {
       SetError(error, "TP control connect timed out");
@@ -221,7 +225,8 @@ bool TpControlChannel::SendAll(const void* data, std::size_t bytes,
   const auto* cursor = static_cast<const std::uint8_t*>(data);
   std::size_t sent = 0;
   while (sent < bytes) {
-    const ssize_t result = ::send(fd_, cursor + sent, bytes - sent, 0);
+    const ssize_t result =
+        ::send(fd_, cursor + sent, bytes - sent, MSG_NOSIGNAL);
     if (result > 0) {
       sent += static_cast<std::size_t>(result);
       continue;
@@ -261,6 +266,7 @@ bool TpControlChannel::RecvAll(void* data, std::size_t bytes,
 bool TpControlChannel::SendFrame(std::uint16_t type, std::uint64_t sequence,
                                  const std::vector<std::uint8_t>& payload,
                                  std::string* error) {
+  const std::lock_guard<std::mutex> lock(io_mutex_);
   if (fd_ < 0 || payload.size() > kMaxPayloadBytes ||
       payload.size() > std::numeric_limits<std::uint32_t>::max()) {
     SetError(error, "TP control frame is invalid or too large");
@@ -282,6 +288,7 @@ bool TpControlChannel::SendFrame(std::uint16_t type, std::uint64_t sequence,
 bool TpControlChannel::ReceiveFrame(std::uint16_t type, std::uint64_t* sequence,
                                     std::vector<std::uint8_t>* payload,
                                     std::string* error) {
+  const std::lock_guard<std::mutex> lock(io_mutex_);
   if (fd_ < 0 || sequence == nullptr || payload == nullptr) {
     SetError(error, "TP control receive state is invalid");
     return false;
@@ -305,24 +312,33 @@ bool TpControlChannel::ReceiveFrame(std::uint16_t type, std::uint64_t* sequence,
     SetError(error, "TP control frame length is invalid");
     return false;
   }
-  payload->assign(bytes, 0);
-  return bytes == 0 || RecvAll(payload->data(), payload->size(), error);
+  std::vector<std::uint8_t> received(bytes);
+  if (bytes != 0 && !RecvAll(received.data(), received.size(), error)) {
+    return false;
+  }
+  *payload = std::move(received);
+  return true;
 }
 
 bool TpControlChannel::Handshake(const TpControlConfig& config,
                                  std::string* error) {
-  if (config.world_size != 2 || config.rank > 1 ||
+  if (config.world_size != 2 || config.rank != rank_ || config.rank > 1 ||
+      config.max_context == 0 || config.auth_token.empty() ||
+      config.auth_token.size() > kMaxAuthTokenBytes || handshaken_ ||
       (config.use_mtp && config.max_draft_tokens == 0)) {
     SetError(error, "TP control configuration is invalid");
     return false;
   }
-  world_size_ = config.world_size;
+  auth_token_ = config.auth_token;
   std::vector<std::uint8_t> payload;
   AppendU32(&payload, config.rank);
   AppendU32(&payload, config.world_size);
   AppendU32(&payload, config.max_context);
   AppendU32(&payload, config.max_draft_tokens);
   AppendU32(&payload, config.use_mtp ? 1U : 0U);
+  AppendU32(&payload, static_cast<std::uint32_t>(config.auth_token.size()));
+  payload.insert(payload.end(), config.auth_token.begin(),
+                 config.auth_token.end());
   if (!SendFrame(kHello, 0, payload, error)) {
     return false;
   }
@@ -338,23 +354,35 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   std::uint32_t context = 0;
   std::uint32_t draft = 0;
   std::uint32_t mtp = 0;
+  std::uint32_t auth_size = 0;
+  std::string peer_token;
   if (!ReadU32(peer, &offset, &rank, error) ||
       !ReadU32(peer, &offset, &world, error) ||
       !ReadU32(peer, &offset, &context, error) ||
       !ReadU32(peer, &offset, &draft, error) ||
-      !ReadU32(peer, &offset, &mtp, error) || offset != peer.size() ||
-      rank != 1U - config.rank || world != config.world_size ||
+      !ReadU32(peer, &offset, &mtp, error) ||
+      !ReadU32(peer, &offset, &auth_size, error) ||
+      auth_size > kMaxAuthTokenBytes || peer.size() - offset != auth_size) {
+    SetError(error, "TP control hello payload is invalid");
+    return false;
+  }
+  peer_token.assign(reinterpret_cast<const char*>(peer.data() + offset),
+                    auth_size);
+  if (rank != 1U - config.rank || world != config.world_size ||
       context != config.max_context || draft != config.max_draft_tokens ||
-      mtp != (config.use_mtp ? 1U : 0U)) {
+      mtp != (config.use_mtp ? 1U : 0U) || peer_token != auth_token_) {
     SetError(error, "TP control hello configuration mismatch");
     return false;
   }
+  world_size_ = config.world_size;
+  max_context_ = config.max_context;
+  handshaken_ = true;
   return true;
 }
 
 bool TpControlChannel::SendCommand(const TpControlCommand& command,
                                    std::string* error) {
-  if (rank_ != 0 || command.max_tokens == 0 ||
+  if (!handshaken_ || rank_ != 0 || command.max_tokens == 0 ||
       command.prompt_tokens.empty() ||
       command.prompt_tokens.size() > kMaxPromptTokens ||
       command.client_id.size() > kMaxClientIdBytes) {
@@ -378,7 +406,7 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
 
 bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
                                       std::string* error) {
-  if (rank_ != 1 || command == nullptr) {
+  if (!handshaken_ || rank_ != 1 || command == nullptr) {
     SetError(error, "TP control command role is invalid");
     return false;
   }
@@ -397,10 +425,13 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
       !ReadU32(command_prompt_, &offset, &client_size, error) ||
       embedded != sequence || max_tokens == 0 ||
       prompt_count == 0 || prompt_count > kMaxPromptTokens ||
+      max_context_ == 0 || prompt_count > max_context_ ||
       client_size > kMaxClientIdBytes ||
       command_prompt_.size() - offset !=
           static_cast<std::size_t>(prompt_count) * sizeof(std::int32_t) +
               client_size) {
+    command_prompt_.clear();
+    command_prompt_.shrink_to_fit();
     SetError(error, "TP control command payload is invalid");
     return false;
   }
@@ -422,7 +453,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
 
 bool TpControlChannel::SendResponse(const TpControlResponse& response,
                                     std::string* error) {
-  if (rank_ != 1 || response.tokens.size() > kMaxPromptTokens ||
+  if (!handshaken_ || rank_ != 1 || response.tokens.size() > kMaxPromptTokens ||
       response.error.size() > kMaxErrorBytes) {
     SetError(error, "TP control response is invalid");
     return false;
@@ -444,7 +475,7 @@ bool TpControlChannel::SendResponse(const TpControlResponse& response,
 
 bool TpControlChannel::ReceiveResponse(TpControlResponse* response,
                                        std::string* error) {
-  if (rank_ != 0 || response == nullptr) {
+  if (!handshaken_ || rank_ != 0 || response == nullptr) {
     SetError(error, "TP control response role is invalid");
     return false;
   }
@@ -467,6 +498,8 @@ bool TpControlChannel::ReceiveResponse(TpControlResponse* response,
       response_payload_.size() - offset !=
           static_cast<std::size_t>(token_count) * sizeof(std::int32_t) +
               error_size) {
+    response_payload_.clear();
+    response_payload_.shrink_to_fit();
     SetError(error, "TP control response payload is invalid");
     return false;
   }
