@@ -301,6 +301,17 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
+  if (partition) {
+    const auto routed_plan = q::distributed::PlanRoutedBytes(
+        *weights, *partition, mtp_weights ? &*mtp_weights : nullptr, &error);
+    if (!routed_plan) {
+      std::fprintf(stderr, "routed weight plan failed: %s\n", error.c_str());
+      return 1;
+    }
+    std::printf("TP2 routed_bytes full=%zu local=%zu\\n",
+                routed_plan->full_encoded_bytes,
+                routed_plan->local_encoded_bytes);
+  }
   const auto* partition_ptr = partition ? &*partition : nullptr;
   auto device = q::rocm::DeviceModel::Upload(
       *weights, *reader, mtp_weights ? &*mtp_weights : nullptr,

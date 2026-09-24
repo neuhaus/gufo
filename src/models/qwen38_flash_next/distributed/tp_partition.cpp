@@ -12,7 +12,88 @@ void SetError(std::string* error_msg, std::string message) {
   }
 }
 
+bool CheckedAdd(std::size_t* total, std::size_t value,
+                const char* label, std::string* error_msg) {
+  if (*total > std::numeric_limits<std::size_t>::max() - value) {
+    SetError(error_msg, std::string("TP routed weight plan overflows in ") +
+                            label);
+    return false;
+  }
+  *total += value;
+  return true;
+}
+
+std::optional<std::size_t> EncodedSize(const TensorRef& tensor,
+                                       std::string* error_msg) {
+  const std::size_t row_bytes = tensor.RowBytes();
+  if (tensor.empty() || row_bytes == 0 || tensor.rows == 0 ||
+      tensor.experts == 0) {
+    SetError(error_msg, "TP routed weight plan has an invalid tensor shape");
+    return std::nullopt;
+  }
+  if (tensor.rows > std::numeric_limits<std::size_t>::max() / row_bytes) {
+    SetError(error_msg, "TP routed weight plan row bytes overflow");
+    return std::nullopt;
+  }
+  const std::size_t rows = static_cast<std::size_t>(tensor.rows);
+  const std::size_t row_total = rows * row_bytes;
+  if (tensor.experts >
+      static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() /
+                                 (row_total == 0 ? 1 : row_total))) {
+    SetError(error_msg, "TP routed weight plan expert bytes overflow");
+    return std::nullopt;
+  }
+  return row_total * static_cast<std::size_t>(tensor.experts);
+}
+
+bool AddRoutedTensor(const TensorRef& tensor, const TpPartition& partition,
+                     RoutedWeightPlan* plan, std::string* error_msg) {
+  const auto full = EncodedSize(tensor, error_msg);
+  const auto range = LocalExpertRange(tensor, partition, error_msg);
+  if (!full || !range) {
+    return false;
+  }
+  return CheckedAdd(&plan->full_encoded_bytes, *full, "full tensor",
+                    error_msg) &&
+         CheckedAdd(&plan->local_encoded_bytes, range->byte_size,
+                    "local tensor", error_msg);
+}
+
+bool AddLayerRouted(const LayerWeights& layer, const TpPartition& partition,
+                    RoutedWeightPlan* plan, std::string* error_msg) {
+  return AddRoutedTensor(layer.ffn_gate_exps, partition, plan, error_msg) &&
+         AddRoutedTensor(layer.ffn_up_exps, partition, plan, error_msg) &&
+         AddRoutedTensor(layer.ffn_down_exps, partition, plan, error_msg);
+}
+
 }  // namespace
+
+std::optional<RoutedWeightPlan> PlanRoutedBytes(
+    const ModelWeights& weights, const TpPartition& partition,
+    const MtpWeights* mtp_weights, std::string* error_msg) {
+  if (error_msg != nullptr) {
+    error_msg->clear();
+  }
+  if (!partition.Valid() ||
+      partition.num_experts != weights.config.num_experts ||
+      (mtp_weights != nullptr &&
+       mtp_weights->config.num_experts != partition.num_experts)) {
+    SetError(error_msg,
+             "TP routed weight plan geometry does not match the model");
+    return std::nullopt;
+  }
+  RoutedWeightPlan plan{};
+  for (const auto& layer : weights.layers) {
+    if (!AddLayerRouted(layer, partition, &plan, error_msg)) {
+      return std::nullopt;
+    }
+  }
+  if (mtp_weights != nullptr &&
+      !AddLayerRouted(mtp_weights->block, partition, &plan, error_msg)) {
+    return std::nullopt;
+  }
+  return plan;
+}
 
 std::optional<TpPartition> TpPartition::Create(std::uint32_t num_experts,
                                                std::uint32_t rank,

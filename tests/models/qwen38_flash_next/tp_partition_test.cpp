@@ -9,8 +9,10 @@
 namespace {
 
 using gufo::core::GgmlType;
+using gufo::models::qwen38_flash_next::ModelWeights;
 using gufo::models::qwen38_flash_next::TensorRef;
 using gufo::models::qwen38_flash_next::distributed::LocalExpertRange;
+using gufo::models::qwen38_flash_next::distributed::PlanRoutedBytes;
 using gufo::models::qwen38_flash_next::distributed::TpPartition;
 
 void Require(bool condition, const char* message) {
@@ -71,6 +73,18 @@ int main() {
   Require(q8_second->byte_offset == 2 * 2 * 34 &&
               q8_second->byte_size == 2 * 2 * 34,
           "Q8_0 second range");
+
+  ModelWeights planned;
+  planned.config.num_experts = 4;
+  planned.layers.resize(1);
+  planned.layers[0].ffn_gate_exps = q8;
+  planned.layers[0].ffn_up_exps = q8;
+  planned.layers[0].ffn_down_exps = q8;
+  const auto plan = PlanRoutedBytes(planned, *small_first, nullptr, &error);
+  Require(plan.has_value(), error.c_str());
+  Require(plan->full_encoded_bytes == 3 * 4 * 2 * 34 &&
+              plan->local_encoded_bytes == 3 * 2 * 2 * 34,
+          "routed weight plan bytes");
 
   const TensorRef mismatch{data, GgmlType::kQ8_0, 32, 2, 3, 0, 0, "bad"};
   Require(!LocalExpertRange(mismatch, *small_first, &error).has_value(),

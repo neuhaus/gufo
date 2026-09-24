@@ -58,5 +58,7 @@ comparisons.
   and still participates in the collective.
 - Distributed snapshots, disk continuation, and vision are rejected for now.
 - MTP follows the same expert partition and collective path.
-- Q8_0 uses the same partition/upload contract; its larger target must pass a
-  local-memory fit check before it is promoted to a serving target.
+- Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
+  routed source bytes and the device model reports post-conversion resident
+  bytes. The larger target must pass that local-memory fit check before it is
+  promoted to a serving target.

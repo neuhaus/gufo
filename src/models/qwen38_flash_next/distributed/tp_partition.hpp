@@ -57,6 +57,19 @@ struct TensorRange {
   std::size_t byte_size{0};
 };
 
+struct RoutedWeightPlan {
+  std::size_t full_encoded_bytes;
+  std::size_t local_encoded_bytes;
+};
+
+/// Computes the exact encoded byte count of the routed tensors and the local
+/// expert subset selected by `partition`. This is a source-artifact estimate;
+/// DeviceModel::resident_bytes() remains the authoritative post-conversion
+/// device-memory measurement.
+[[nodiscard]] std::optional<RoutedWeightPlan> PlanRoutedBytes(
+    const ModelWeights& weights, const TpPartition& partition,
+    const MtpWeights* mtp_weights = nullptr, std::string* error = nullptr);
+
 /// Selects the local expert range without decoding or repacking the GGUF
 /// tensor. RowBytes() supplies the format-specific geometry (Q8_0, Q4_K,
 /// F32, and the other formats accepted by the model binder).
