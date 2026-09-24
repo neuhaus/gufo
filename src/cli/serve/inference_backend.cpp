@@ -3004,8 +3004,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
-  const std::string architecture =
-      reader->GetMetadataString("general.architecture").value_or("");
+  const std::string architecture = std::string(
+      reader->GetMetadataString("general.architecture")
+          .value_or(std::string_view{}));
   if (tp_config.world_size > 1 && architecture != "qwen4exp") {
     SetError(error, "HTTP TP=2 is supported only by Qwen3.8-Flash-Next");
     return false;
