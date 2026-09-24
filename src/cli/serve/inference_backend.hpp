@@ -34,6 +34,7 @@ class QwenTokenizer;
 }
 
 namespace gufo::server {
+class TpControlChannel;
 
 enum class TextSpeculativeBackend : std::uint8_t {
   kDisabled,
@@ -56,6 +57,7 @@ struct TextTpConfig {
   std::uint32_t world_size{1};
   int hip_device{0};
   std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> communicator;
+  std::shared_ptr<TpControlChannel> control;
 };
 
 struct TextDiskCacheConfig {

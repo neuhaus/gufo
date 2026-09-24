@@ -22,6 +22,7 @@
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
+#include "src/cli/serve/tp_control.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
