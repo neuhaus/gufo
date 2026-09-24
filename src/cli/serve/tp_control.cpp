@@ -323,7 +323,8 @@ bool TpControlChannel::ReceiveFrame(std::uint16_t type, std::uint64_t* sequence,
 bool TpControlChannel::Handshake(const TpControlConfig& config,
                                  std::string* error) {
   if (config.world_size != 2 || config.rank != rank_ || config.rank > 1 ||
-      config.max_context == 0 || config.auth_token.empty() ||
+      config.max_context == 0 || config.prefill_chunk_tokens == 0 ||
+      config.auth_token.empty() ||
       config.auth_token.size() > kMaxAuthTokenBytes || handshaken_ ||
       (config.use_mtp && config.max_draft_tokens == 0)) {
     SetError(error, "TP control configuration is invalid");
@@ -334,6 +335,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   AppendU32(&payload, config.rank);
   AppendU32(&payload, config.world_size);
   AppendU32(&payload, config.max_context);
+  AppendU32(&payload, config.prefill_chunk_tokens);
   AppendU32(&payload, config.max_draft_tokens);
   AppendU32(&payload, config.use_mtp ? 1U : 0U);
   AppendU32(&payload, static_cast<std::uint32_t>(config.auth_token.size()));
@@ -352,6 +354,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   std::uint32_t rank = 0;
   std::uint32_t world = 0;
   std::uint32_t context = 0;
+  std::uint32_t prefill_chunk = 0;
   std::uint32_t draft = 0;
   std::uint32_t mtp = 0;
   std::uint32_t auth_size = 0;
@@ -359,6 +362,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   if (!ReadU32(peer, &offset, &rank, error) ||
       !ReadU32(peer, &offset, &world, error) ||
       !ReadU32(peer, &offset, &context, error) ||
+      !ReadU32(peer, &offset, &prefill_chunk, error) ||
       !ReadU32(peer, &offset, &draft, error) ||
       !ReadU32(peer, &offset, &mtp, error) ||
       !ReadU32(peer, &offset, &auth_size, error) ||
@@ -369,7 +373,9 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   peer_token.assign(reinterpret_cast<const char*>(peer.data() + offset),
                     auth_size);
   if (rank != 1U - config.rank || world != config.world_size ||
-      context != config.max_context || draft != config.max_draft_tokens ||
+      context != config.max_context ||
+      prefill_chunk != config.prefill_chunk_tokens ||
+      draft != config.max_draft_tokens ||
       mtp != (config.use_mtp ? 1U : 0U) || peer_token != auth_token_) {
     SetError(error, "TP control hello configuration mismatch");
     return false;

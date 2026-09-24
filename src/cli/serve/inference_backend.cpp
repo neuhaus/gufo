@@ -3450,6 +3450,11 @@ bool InferenceBackend::load(
         "HTTP context exceeds the loaded Qwen3.8-Flash-Next model context");
     return false;
   }
+  if (prefill_policy.decode_active_tokens >
+      std::numeric_limits<std::uint32_t>::max()) {
+    SetError(error, "HTTP prefill chunk exceeds the TP control range");
+    return false;
+  }
   if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
       (speculative_config.backend != TextSpeculativeBackend::kMtp ||
        !model->HasMtp())) {
@@ -3508,6 +3513,8 @@ bool InferenceBackend::load(
           .rank = tp_rank,
           .world_size = tp_world_size,
           .max_context = max_context,
+          .prefill_chunk_tokens = static_cast<std::uint32_t>(
+              prefill_policy.decode_active_tokens),
           .max_draft_tokens = has_mtp ? speculative_config.max_draft_tokens : 0,
           .use_mtp = has_mtp,
           .auth_token = tp_config.auth_token,

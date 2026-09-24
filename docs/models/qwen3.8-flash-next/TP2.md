@@ -75,11 +75,13 @@ build/gpu-tp2/gufo serve llm \
 ```
 
 The worker uses a separate ordered TCP control channel for prepared prompt
-submissions. Both ranks must receive the same `--tp-control-token`. RDMA remains
+submissions. Both ranks must receive the same `--tp-control-token` and
+prefill chunk setting (`--prefill-chunk`). RDMA remains
 the tensor transport. Do not use this C1 path for
 streaming, cancellation, sampled decoding, vision, disk continuation, or
 multiple concurrent requests yet.
 
+## Current boundaries
 
 - Expert-parallel routed MoE with replicated dense, attention, GDN, HC,
   embedding, and LM-head weights.
