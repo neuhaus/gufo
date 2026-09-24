@@ -220,7 +220,11 @@ public:
                       socket_error == 0;
         }
         if (connected) {
-          (void)::fcntl(fd, F_SETFL, flags);
+          if (::fcntl(fd, F_SETFL, flags) != 0) {
+            ::close(fd);
+            fd = -1;
+            continue;
+          }
           break;
         }
         ::close(fd);
