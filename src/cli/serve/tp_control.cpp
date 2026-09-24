@@ -44,8 +44,9 @@ std::string SystemError(const char* operation) {
   return std::string(operation) + ": " + std::strerror(errno);
 }
 
-void ClearTimeouts(int fd) {
+void SetOperationTimeouts(int fd) {
   timeval timeout{};
+  timeout.tv_sec = 24 * 60 * 60;
   (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 }
@@ -143,7 +144,7 @@ std::shared_ptr<TpControlChannel> TpControlChannel::Listen(
     SetError(error, SystemError("TP control accept"));
     return nullptr;
   }
-  ClearTimeouts(peer);
+  SetOperationTimeouts(peer);
   return std::shared_ptr<TpControlChannel>(
       new TpControlChannel(peer, 0, port));
 }
@@ -202,7 +203,7 @@ std::shared_ptr<TpControlChannel> TpControlChannel::Connect(
     }
     ::freeaddrinfo(addresses);
     if (fd >= 0) {
-      ClearTimeouts(fd);
+      SetOperationTimeouts(fd);
       return std::shared_ptr<TpControlChannel>(
           new TpControlChannel(fd, 1, port));
     }
@@ -306,6 +307,7 @@ bool TpControlChannel::ReceiveFrame(std::uint16_t type, std::uint64_t* sequence,
     SetError(error, "TP control frame header is invalid");
     return false;
   }
+  offset += 4;  // version and frame type
   std::uint32_t bytes = 0;
   if (!ReadU32(header, &offset, &bytes, error) || bytes > kMaxPayloadBytes ||
       !ReadU64(header, &offset, sequence, error)) {

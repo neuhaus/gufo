@@ -71,10 +71,10 @@ int main() {
   TpControlConfig rank0{.rank = 0,
                         .world_size = 2,
                         .max_context = 4096,
-                        .prefill_chunk_tokens = 512,
                         .max_draft_tokens = 7,
                         .use_mtp = true,
-                        .auth_token = "test-token"};
+                        .auth_token = "test-token",
+                        .prefill_chunk_tokens = 512};
   TpControlConfig rank1 = rank0;
   rank1.rank = 1;
   bool server_handshake = false;

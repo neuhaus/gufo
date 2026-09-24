@@ -14,10 +14,10 @@ struct TpControlConfig {
   std::uint32_t rank{0};
   std::uint32_t world_size{1};
   std::uint32_t max_context{4096};
-  std::uint32_t prefill_chunk_tokens{512};
   std::uint32_t max_draft_tokens{7};
   bool use_mtp{false};
   std::string auth_token;
+  std::uint32_t prefill_chunk_tokens{512};
 };
 
 struct TpControlCommand {

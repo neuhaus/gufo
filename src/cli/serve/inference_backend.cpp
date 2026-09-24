@@ -2842,6 +2842,17 @@ struct InferenceBackend::Impl {
     void Cancel() noexcept override {
       if (control_ == nullptr) {
         request_.Cancel();
+        return;
+      }
+      // C1 has no symmetric cancellation command. Finish the rank-0 request
+      // and consume the worker response instead of leaving one rank cancelled.
+      try {
+        (void)request_.Wait({});
+        TpControlResponse response;
+        std::string error;
+        const std::lock_guard<std::mutex> lock(*control_mutex_);
+        (void)control_->ReceiveResponse(&response, &error);
+      } catch (...) {
       }
     }
 
@@ -2993,8 +3004,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
-  const std::string architecture(
-      reader->GetMetadataString("general.architecture").value_or(""));
+  const std::string architecture =
+      reader->GetMetadataString("general.architecture").value_or("");
   if (tp_config.world_size > 1 && architecture != "qwen4exp") {
     SetError(error, "HTTP TP=2 is supported only by Qwen3.8-Flash-Next");
     return false;
@@ -3513,11 +3524,11 @@ bool InferenceBackend::load(
           .rank = tp_rank,
           .world_size = tp_world_size,
           .max_context = max_context,
-          .prefill_chunk_tokens = static_cast<std::uint32_t>(
-              prefill_policy.decode_active_tokens),
           .max_draft_tokens = has_mtp ? speculative_config.max_draft_tokens : 0,
           .use_mtp = has_mtp,
           .auth_token = tp_config.auth_token,
+          .prefill_chunk_tokens = static_cast<std::uint32_t>(
+              prefill_policy.decode_active_tokens),
       };
       std::string control_error;
       if (!tp_config.control->Handshake(control_config, &control_error)) {
@@ -3544,18 +3555,29 @@ bool InferenceBackend::run_worker(std::string* error) {
     SetError(error, "TP worker requires a loaded rank-1 Flash-Next model");
     return false;
   }
-  try {
-    for (;;) {
-      TpControlCommand command;
-      std::string control_error;
-      if (!state->control->ReceiveCommand(&command, &control_error)) {
-        SetError(error, "TP worker command receive failed: " + control_error);
-        return false;
+  for (;;) {
+    TpControlCommand command;
+    std::string control_error;
+    if (!state->control->ReceiveCommand(&command, &control_error)) {
+      SetError(error, "TP worker command receive failed: " + control_error);
+      return false;
+    }
+    TpControlResponse response{.sequence = command.sequence};
+    try {
+      std::vector<TextRunnerToken> prompt_tokens;
+      prompt_tokens.reserve(command.prompt_tokens.size());
+      for (const auto token : command.prompt_tokens) {
+        if (token < 0 ||
+            static_cast<std::uint64_t>(token) >
+                std::numeric_limits<TextRunnerToken>::max()) {
+          throw std::invalid_argument(
+              "TP worker received an out-of-range prompt token");
+        }
+        prompt_tokens.push_back(static_cast<TextRunnerToken>(token));
       }
       sampling::SamplingConfig greedy;
       auto request = state->scheduler->Submit(
-          std::move(command.prompt_tokens), command.max_tokens, greedy, {},
-          false,
+          std::move(prompt_tokens), command.max_tokens, greedy, {}, false,
           TextRequestMetadata{
               .client_id = command.client_id,
               .deadline = std::nullopt,
@@ -3565,30 +3587,28 @@ bool InferenceBackend::run_worker(std::string* error) {
               .cache_prefix_tokens = 0,
           });
       const auto result = request.Wait({});
-      TpControlResponse response{
-          .sequence = command.sequence,
-          .tokens = {},
-          .draft_tokens = result.draft_tokens,
-          .draft_accepted_tokens = result.draft_accepted_tokens,
-          .error = result.cancelled ? "worker request cancelled" : "",
-      };
       response.tokens.reserve(result.tokens.size());
       for (const auto token : result.tokens) {
         if (token > static_cast<tokenization::TokenId>(
                          std::numeric_limits<std::int32_t>::max())) {
-          SetError(error, "TP worker produced an out-of-range token");
-          return false;
+          throw std::invalid_argument(
+              "TP worker produced an out-of-range token");
         }
         response.tokens.push_back(static_cast<std::int32_t>(token));
       }
-      if (!state->control->SendResponse(response, &control_error)) {
-        SetError(error, "TP worker response send failed: " + control_error);
-        return false;
+      response.draft_tokens = result.draft_tokens;
+      response.draft_accepted_tokens = result.draft_accepted_tokens;
+      response.error = result.cancelled ? "worker request cancelled" : "";
+    } catch (const std::exception& exception) {
+      response.error = exception.what();
+      if (response.error.size() > (1U << 20)) {
+        response.error.resize(1U << 20);
       }
     }
-  } catch (const std::exception& exception) {
-    SetError(error, exception.what());
-    return false;
+    if (!state->control->SendResponse(response, &control_error)) {
+      SetError(error, "TP worker response send failed: " + control_error);
+      return false;
+    }
   }
 #else
   SetError(error, "TP worker requires the HIP backend");
