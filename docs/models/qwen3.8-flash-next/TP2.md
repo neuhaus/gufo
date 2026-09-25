@@ -193,7 +193,11 @@ experimental and must not be rendered into the published benchmark tables.
   and the control handshake rejects policy mismatches. No snapshot bytes cross
   the host boundary. The C1 path uses a separate rank-1 worker control channel
   and does not yet support streaming, cancellation, sampled decoding, or
-  concurrent requests.
+  concurrent requests. Rank 0 now owns one control-response reader and routes
+  final frames by command sequence; unknown or duplicate sequences poison the
+  channel rather than being delivered to the wrong request. This is a response-
+  ownership foundation only; it does not enable C2 or bind RDMA collectives to
+  request identities.
 - Serialized/distributed disk snapshots, arbitrary historical-prefix indexes,
   and vision remain rejected. Only the stable prompt boundary and current live
   frontier are retained by this experimental C1 slice.

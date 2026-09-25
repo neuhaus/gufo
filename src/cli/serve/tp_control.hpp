@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TP_CONTROL_HPP_
 #define GUFO_SERVER_TP_CONTROL_HPP_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -65,6 +66,8 @@ class TpControlChannel final {
                                   std::string* error);
   [[nodiscard]] bool ReceiveResponse(TpControlResponse* response,
                                      std::string* error);
+  /// Wake a blocked directional reader/writer during broker shutdown.
+  void Interrupt() noexcept;
 
   [[nodiscard]] std::uint16_t port() const noexcept;
   [[nodiscard]] std::uint32_t rank() const noexcept;
@@ -90,9 +93,39 @@ class TpControlChannel final {
   std::uint32_t max_context_{0};
   bool handshaken_{false};
   std::string auth_token_;
-  std::mutex io_mutex_;
+  std::mutex send_mutex_;
+  std::mutex receive_mutex_;
+  std::atomic<bool> interrupted_{false};
   std::vector<std::uint8_t> command_prompt_;
   std::vector<std::uint8_t> response_payload_;
+};
+
+/// Rank-zero response owner. The dedicated reader routes final responses by
+/// control sequence; production construction uses capacity one. This is a
+/// safety foundation for ordered C2 cohorts, not an enablement of C2 itself.
+class TpResponseBroker final {
+ public:
+  TpResponseBroker(std::shared_ptr<TpControlChannel> control,
+                   std::size_t max_pending_responses);
+  ~TpResponseBroker();
+
+  TpResponseBroker(const TpResponseBroker&) = delete;
+  TpResponseBroker& operator=(const TpResponseBroker&) = delete;
+  TpResponseBroker(TpResponseBroker&&) = delete;
+  TpResponseBroker& operator=(TpResponseBroker&&) = delete;
+
+  [[nodiscard]] bool RegisterPendingResponse(std::uint64_t sequence,
+                                             std::string* error);
+  [[nodiscard]] bool CancelUnsentResponse(std::uint64_t sequence,
+                                          std::string* error);
+  [[nodiscard]] bool WaitForResponse(std::uint64_t sequence,
+                                     TpControlResponse* response,
+                                     std::string* error);
+  void FailAll(std::string reason);
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace gufo::server

@@ -12,11 +12,14 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace gufo::server {
@@ -216,8 +219,17 @@ std::shared_ptr<TpControlChannel> TpControlChannel::Connect(
 }
 
 TpControlChannel::~TpControlChannel() {
+  interrupted_.store(true, std::memory_order_release);
   if (fd_ >= 0) {
+    ::shutdown(fd_, SHUT_RDWR);
     ::close(fd_);
+    fd_ = -1;
+  }
+}
+
+void TpControlChannel::Interrupt() noexcept {
+  if (!interrupted_.exchange(true, std::memory_order_acq_rel) && fd_ >= 0) {
+    ::shutdown(fd_, SHUT_RDWR);
   }
 }
 
@@ -267,7 +279,11 @@ bool TpControlChannel::RecvAll(void* data, std::size_t bytes,
 bool TpControlChannel::SendFrame(std::uint16_t type, std::uint64_t sequence,
                                  const std::vector<std::uint8_t>& payload,
                                  std::string* error) {
-  const std::lock_guard<std::mutex> lock(io_mutex_);
+  const std::lock_guard<std::mutex> lock(send_mutex_);
+  if (interrupted_.load(std::memory_order_acquire)) {
+    SetError(error, "TP control channel is interrupted");
+    return false;
+  }
   if (fd_ < 0 || payload.size() > kMaxPayloadBytes ||
       payload.size() > std::numeric_limits<std::uint32_t>::max()) {
     SetError(error, "TP control frame is invalid or too large");
@@ -289,7 +305,11 @@ bool TpControlChannel::SendFrame(std::uint16_t type, std::uint64_t sequence,
 bool TpControlChannel::ReceiveFrame(std::uint16_t type, std::uint64_t* sequence,
                                     std::vector<std::uint8_t>* payload,
                                     std::string* error) {
-  const std::lock_guard<std::mutex> lock(io_mutex_);
+  const std::lock_guard<std::mutex> lock(receive_mutex_);
+  if (interrupted_.load(std::memory_order_acquire)) {
+    SetError(error, "TP control channel is interrupted");
+    return false;
+  }
   if (fd_ < 0 || sequence == nullptr || payload == nullptr) {
     SetError(error, "TP control receive state is invalid");
     return false;
@@ -546,6 +566,190 @@ bool TpControlChannel::ReceiveResponse(TpControlResponse* response,
       reinterpret_cast<const char*>(response_payload_.data() + offset),
       error_size);
   return true;
+}
+
+struct TpResponseBroker::Impl {
+  struct Pending {
+    TpControlResponse response;
+    bool ready{false};
+    bool delivered{false};
+  };
+
+  Impl(std::shared_ptr<TpControlChannel> channel, std::size_t capacity)
+      : control(std::move(channel)), capacity(capacity) {
+    if (!control || control->rank() != 0 || capacity == 0) {
+      throw std::invalid_argument(
+          "TP response broker requires a rank-zero channel and capacity");
+    }
+    reader = std::thread([this] { ReadLoop(); });
+  }
+
+  ~Impl() { Stop("TP response broker destroyed"); }
+
+  void Stop(std::string reason) {
+    const std::lock_guard<std::mutex> stop_lock(stop_mutex);
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!stopping) {
+        stopping = true;
+        poisoned = true;
+        failure = std::move(reason);
+      }
+      condition.notify_all();
+    }
+    if (control) {
+      control->Interrupt();
+    }
+    if (reader.joinable()) {
+      reader.join();
+    }
+  }
+
+  void ReadLoop() {
+    for (;;) {
+      TpControlResponse response;
+      std::string error;
+      if (!control->ReceiveResponse(&response, &error)) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!stopping) {
+          stopping = true;
+          poisoned = true;
+          failure = "TP worker response receive failed: " + error;
+        }
+        condition.notify_all();
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (stopping) {
+          return;
+        }
+        const auto found = pending.find(response.sequence);
+        if (found == pending.end() || found->second->ready) {
+          stopping = true;
+          poisoned = true;
+          failure = "TP response sequence is unknown or duplicate: " +
+                    std::to_string(response.sequence);
+          condition.notify_all();
+          control->Interrupt();
+          return;
+        }
+        found->second->response = std::move(response);
+        found->second->ready = true;
+        condition.notify_all();
+      }
+    }
+  }
+
+  std::shared_ptr<TpControlChannel> control;
+  const std::size_t capacity;
+  std::mutex mutex;
+  std::condition_variable condition;
+  std::mutex stop_mutex;
+  std::unordered_map<std::uint64_t, std::shared_ptr<Pending>> pending;
+  bool stopping{false};
+  bool poisoned{false};
+  std::string failure;
+  std::thread reader;
+};
+
+TpResponseBroker::TpResponseBroker(
+    std::shared_ptr<TpControlChannel> control,
+    std::size_t max_pending_responses)
+    : impl_(std::make_unique<Impl>(std::move(control),
+                                   max_pending_responses)) {}
+
+TpResponseBroker::~TpResponseBroker() { impl_.reset(); }
+
+bool TpResponseBroker::RegisterPendingResponse(std::uint64_t sequence,
+                                               std::string* error) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->stopping || impl_->poisoned) {
+    SetError(error, impl_->failure.empty() ? "TP response broker is stopped"
+                                            : impl_->failure);
+    return false;
+  }
+  if (impl_->pending.size() >= impl_->capacity) {
+    SetError(error, "TP response broker capacity is exhausted");
+    return false;
+  }
+  if (!impl_->pending.emplace(sequence,
+                              std::make_shared<Impl::Pending>()).second) {
+    SetError(error, "TP response sequence is already registered");
+    return false;
+  }
+  return true;
+}
+
+bool TpResponseBroker::CancelUnsentResponse(std::uint64_t sequence,
+                                            std::string* error) {
+  bool interrupt = false;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto found = impl_->pending.find(sequence);
+    if (found == impl_->pending.end()) {
+      SetError(error, "TP response sequence is not registered");
+      return false;
+    }
+    if (found->second->ready) {
+      impl_->stopping = true;
+      impl_->poisoned = true;
+      impl_->failure = "TP response arrived before command send completed: " +
+                       std::to_string(sequence);
+      impl_->condition.notify_all();
+      SetError(error, impl_->failure);
+      interrupt = true;
+    } else {
+      impl_->pending.erase(found);
+    }
+  }
+  if (interrupt) {
+    impl_->control->Interrupt();
+  }
+  return !interrupt;
+}
+
+bool TpResponseBroker::WaitForResponse(std::uint64_t sequence,
+                                       TpControlResponse* response,
+                                       std::string* error) {
+  if (response == nullptr) {
+    SetError(error, "TP response output is null");
+    return false;
+  }
+  std::unique_lock<std::mutex> lock(impl_->mutex);
+  const auto found = impl_->pending.find(sequence);
+  if (found == impl_->pending.end()) {
+    SetError(error, "TP response sequence is not registered");
+    return false;
+  }
+  const auto pending = found->second;
+  impl_->condition.wait(lock, [&] {
+    return pending->ready || impl_->poisoned || impl_->stopping;
+  });
+  if (pending->delivered) {
+    SetError(error, "TP response sequence was already consumed");
+    return false;
+  }
+  if (impl_->poisoned || impl_->stopping) {
+    SetError(error, impl_->failure.empty() ? "TP response broker is stopped"
+                                           : impl_->failure);
+    return false;
+  }
+  if (pending->ready) {
+    pending->delivered = true;
+    *response = std::move(pending->response);
+    impl_->pending.erase(found);
+    return true;
+  }
+  SetError(error, impl_->failure.empty() ? "TP response broker is stopped"
+                                         : impl_->failure);
+  return false;
+}
+
+void TpResponseBroker::FailAll(std::string reason) {
+  if (impl_) {
+    impl_->Stop(std::move(reason));
+  }
 }
 
 std::uint16_t TpControlChannel::port() const noexcept { return port_; }
