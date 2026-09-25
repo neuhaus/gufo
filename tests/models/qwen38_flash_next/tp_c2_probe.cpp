@@ -373,6 +373,20 @@ Role:
                           InferenceBackend C2 worker, hosted in-process: it has
                           no cohort options and only serves what rank 0 sends.
 
+Step-2 spike:
+  --batched-w2            Both ranks run the SAME width-2 batched program over
+                          the engine: two live sessions, per-member prefill
+                          (prefill has no batch form), then one two-row
+                          EvaluateBatch per decode step. No cohort, no command,
+                          no control wire and no worker, so the only variable is
+                          whether a batched forward keeps both ranks on one
+                          collective schedule. Each rank prints its per-member
+                          tokens, a checksum, and the exact member set included
+                          in every batched step; diff the two logs to check both
+                          token agreement and schedule agreement. The scope id
+                          is a constant both sides bind by construction, so a
+                          run is only comparable when BOTH ranks pass this flag.
+
 Rank-one options:
   --tp-bootstrap-host HOST  REQUIRED for rank1. Rank 0's address, used for the
                           RDMA bootstrap and for the TP control connect. rank0
@@ -1047,6 +1061,184 @@ bool RunMember(const char* role, std::size_t index,
   return true;
 }
 
+/// A 64-bit FNV-1a over raw token bytes, so a cross-rank comparison has one
+/// token to diff instead of two id lists. Not a cryptographic digest: it only
+/// has to detect an unintended difference.
+std::uint64_t TokenChecksum(std::span<const std::int32_t> tokens) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (const std::int32_t token : tokens) {
+    for (int byte = 0; byte < 4; ++byte) {
+      hash ^= static_cast<std::uint8_t>((static_cast<std::uint32_t>(token) >>
+                                          (8 * byte)) &
+                                         0xFFU);
+      hash *= 1099511628211ULL;
+    }
+  }
+  return hash;
+}
+
+std::string TokenListText(std::span<const std::int32_t> tokens) {
+  std::string text;
+  for (const std::int32_t token : tokens) {
+    if (!text.empty()) {
+      text += ',';
+    }
+    text += std::to_string(token);
+  }
+  return text;
+}
+
+/// Width-2 batched advance under TP=2, run symmetrically on BOTH ranks with no
+/// cohort, no control wire and no worker. This is the step-2 spike: the serial
+/// C2 contract can never exercise a two-row `EvaluateBatch`, so the question
+/// this answers is whether a batched forward issues collectives both ranks
+/// agree on -- same scope, same strictly monotonic ordinal, same byte count.
+///
+/// Both ranks run this identical program, so the log is the whole comparison:
+/// each rank prints its per-member token list and checksum plus the exact
+/// member set included in every batched step, and the harness diffs the two
+/// logs. Schedule agreement is checked as well as token agreement, because a
+/// member that stops early drops out of later batches -- and if the ranks ever
+/// disagreed about that, the byte counts would diverge and the run would have
+/// to fail closed rather than quietly continue.
+int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
+                 const std::vector<std::int32_t> (&prompt)[kMemberCount],
+                 std::uint32_t budget, std::uint32_t context,
+                 const std::shared_ptr<CollectiveTrace>& collectives,
+                 std::string* error) {
+  // Both ranks bind the same scope id. Nothing on the wire negotiates it in
+  // this mode, so it is a constant agreed by construction, and the log prints
+  // it so a reader can confirm both sides bound the same value.
+  constexpr std::uint64_t kBatchedScope = 1;
+
+  std::array<std::unique_ptr<q::Session>, kMemberCount> session;
+  for (std::size_t index = 0; index < kMemberCount; ++index) {
+    session[index] =
+        model->CreateSession(gufo::core::SessionMode::kAutoregressive, context,
+                             error);
+    if (!session[index]) {
+      return kTransportFailure;
+    }
+  }
+
+  OperationScope scope(collectives, kBatchedScope);
+  if (!scope.Begin(error)) {
+    Warn(std::string(role) + " could not bind batched scope " +
+         std::to_string(kBatchedScope) + ": " + *error);
+    return kTransportFailure;
+  }
+  Say(role, "batched scope bound: " + std::to_string(kBatchedScope) +
+                ", prefill_capacity=" +
+                std::to_string(model->PrefillCapacity()) + " budget=" +
+                std::to_string(budget));
+
+  // Prefill stays per-session and per-member: `Prefill` is per-state and has no
+  // batch form in the runner or the engine, so a width-2 program chunks member
+  // 0 and then member 1. Only the DECODE advance is batched here.
+  MemberTrace trace[kMemberCount];
+  collectives->BeginRecording();
+  for (std::size_t index = 0; index < kMemberCount; ++index) {
+    if (!session[index]->Sync(prompt[index], error)) {
+      (void)collectives->EndRecording();
+      Warn(std::string(role) + " member " + std::to_string(index) +
+           " batched prefill failed: " + *error);
+      return kTransportFailure;
+    }
+  }
+  trace[0].prefill_sizes = collectives->EndRecording();
+  const std::size_t num_layers = model->config().num_layers;
+  trace[0].prefill_forwards =
+      num_layers == 0 ? 0 : trace[0].prefill_sizes.size() / num_layers;
+  Say(role, "batched prefill complete: " +
+                std::to_string(trace[0].prefill_sizes.size()) +
+                " collectives in " + std::to_string(trace[0].prefill_forwards) +
+                " forward(s) of [" + ByteRunsText(trace[0].prefill_sizes) +
+                "] rows, prompt sizes " + std::to_string(prompt[0].size()) +
+                "/" + std::to_string(prompt[1].size()) + " tokens");
+
+  const gufo::sampling::SamplingConfig sampling{
+      .temperature = kGreedyTemperature,
+  };
+  gufo::sampling::SamplerState sampler0(sampling);
+  gufo::sampling::SamplerState sampler1(sampling);
+  gufo::sampling::SamplerState* samplers[kMemberCount] = {&sampler0, &sampler1};
+
+  // Mirrors `RunMember` step for step, with the per-member advance replaced by
+  // one batched advance. `RunMember` also stops before evaluating the token
+  // that reaches the budget, because the distributed runner sets
+  // `final_token_advance_required` false; the same short circuit is kept so the
+  // two programs issue the same number of forwards.
+  for (std::size_t step = 0; step < budget; ++step) {
+    std::array<q::Session::AdvanceRequest, kMemberCount> requests;
+    std::size_t rows = 0;
+    std::string included;
+    for (std::size_t index = 0; index < kMemberCount; ++index) {
+      if (!trace[index].stopped_on_token &&
+          trace[index].tokens.size() >= budget) {
+        trace[index].stopped_on_budget = true;
+      }
+      if (trace[index].stopped_on_token || trace[index].stopped_on_budget) {
+        continue;
+      }
+      const auto logits = session[index]->Logits();
+      if (logits.empty()) {
+        *error = "session " + std::to_string(index) +
+                 " has no logits to sample from";
+        return kTransportFailure;
+      }
+      const auto sampled =
+          static_cast<std::int32_t>(samplers[index]->Sample(logits));
+      if (model->IsStopToken(sampled)) {
+        trace[index].stopped_on_token = true;
+        continue;
+      }
+      trace[index].tokens.push_back(sampled);
+      if (trace[index].tokens.size() >= budget) {
+        trace[index].stopped_on_budget = true;
+        continue;
+      }
+      requests[rows] = q::Session::AdvanceRequest{
+          .session = session[index].get(),
+          .token = sampled,
+      };
+      included += static_cast<char>('a' + index);
+      ++rows;
+    }
+    // The per-step member set is the schedule. It must be identical on both
+    // ranks, so it is logged rather than inferred.
+    Say(role, "batched step " + std::to_string(step) + " rows=" +
+                  std::to_string(rows) + " members=" +
+                  (included.empty() ? std::string("none") : included));
+    if (rows == 0) {
+      break;
+    }
+    if (!q::Session::EvaluateBatch(std::span(requests).first(rows), error)) {
+      Warn(std::string(role) + " batched advance failed at step " +
+           std::to_string(step) + ": " + *error);
+      return kTransportFailure;
+    }
+    for (std::size_t index = 0; index < kMemberCount; ++index) {
+      ++trace[index].decode_forwards;
+    }
+  }
+
+  if (!scope.End(error)) {
+    Warn(std::string(role) + " could not release batched scope: " + *error);
+    return kTransportFailure;
+  }
+  for (std::size_t index = 0; index < kMemberCount; ++index) {
+    Say(role, "batched member " + std::to_string(index) + " tokens=" +
+                  TokenListText(trace[index].tokens) + " count=" +
+                  std::to_string(trace[index].tokens.size()) + " checksum=" +
+                  std::to_string(TokenChecksum(trace[index].tokens)) +
+                  " decode_forwards=" +
+                  std::to_string(trace[index].decode_forwards) +
+                  (trace[index].stopped_on_token ? " stop_token" : "") +
+                  (trace[index].stopped_on_budget ? " budget" : ""));
+  }
+  return kOk;
+}
+
 /// The rank-one MTP draft sidecar for the third fault mode.
 ///
 /// An empty path is the production no-MTP policy, and `draft_tokens` is only
@@ -1275,6 +1467,11 @@ int main(int argc, char** argv) {
   /// Rank-zero fault injection: the worker will refuse the cohort at admission,
   /// so issue no lockstep collective and wait only for its response.
   bool expect_c2_error = false;
+  /// `--batched-w2`: step-2 spike. Both ranks run the identical batched
+  /// program over the engine with no cohort, no control wire and no worker, so
+  /// the only variable is whether a two-row `EvaluateBatch` keeps both ranks on
+  /// one collective schedule.
+  bool batched_w2 = false;
   /// Rank-one fault injection: the MTP draft sidecar to load before the
   /// handshake. Empty is the production no-MTP policy.
   std::string mtp_model_path;
@@ -1398,6 +1595,8 @@ int main(int argc, char** argv) {
       scope_override = parsed;
     } else if (arg == "--expect-c2-error") {
       expect_c2_error = true;
+    } else if (arg == "--batched-w2") {
+      batched_w2 = true;
     } else if (arg == "--mtp-model") {
       // An absent or empty value is a missing argument, NOT the no-sidecar
       // default, so it is refused here instead of silently dropping the fault.
@@ -1644,6 +1843,76 @@ int main(int argc, char** argv) {
           "the RDMA bootstrap and the TP control peer both connect there");
       return kInvalidArguments;
     }
+    // `--batched-w2` returns before the control connect, mirroring rank 0's
+    // branch before its control listen. RDMA first and for the same reason as
+    // `RunRank1Worker`: the bootstrap connect blocks for up to 30 s while rank
+    // 0 listens, so the model must not be mapped before it completes.
+    if (batched_w2) {
+      std::string batched_error;
+      Say("rank1", "batched-w2 mode: no control wire, no cohort, no worker");
+      const q::rocm::IbrverbsConfig batched_rdma{
+          .rank = kRank1,
+          .world_size = kWorldSize,
+          .bootstrap_host = bootstrap_host,
+          .bootstrap_port = bootstrap_port,
+          .device_index = device,
+          .gid_index = gid,
+      };
+      auto communicator =
+          q::rocm::CreateIbrverbsCommunicator(batched_rdma, &batched_error);
+      if (!communicator) {
+        Warn("batched-w2 RDMA communicator failed: " + batched_error);
+        return kTransportFailure;
+      }
+      Say("rank1", "RDMA peer established with " + bootstrap_host +
+                       " on bootstrap port " + std::to_string(bootstrap_port));
+      auto collectives =
+          std::make_shared<CollectiveTrace>(std::move(communicator));
+      q::ModelOptions batched_options{
+          .max_context = context,
+          .mtp_model_path = "",
+          .max_draft_tokens = q::kMaxMtpDraftTokens,
+          .vision_model_path = "",
+          .decode_concurrency = 1,
+          .tp_rank = kRank1,
+          .tp_world_size = kWorldSize,
+          .hip_device = static_cast<int>(device),
+          .communicator = collectives,
+      };
+      auto batched_model =
+          q::Model::Load(model_path, batched_options, &batched_error);
+      if (!batched_model) {
+        Warn("batched-w2 model load failed: " + batched_error);
+        return kTransportFailure;
+      }
+      if (batched_model->HasMtp()) {
+        Warn("batched-w2 model reports an MTP sidecar, which this mode refuses");
+        return kInvalidArguments;
+      }
+      std::vector<std::int32_t> batched_prompt[kMemberCount];
+      for (std::size_t index = 0; index < kMemberCount; ++index) {
+        batched_prompt[index] =
+            prompt_tokens[index].has_value()
+                ? SyntheticPrompt(*batched_model, *prompt_tokens[index], index)
+                : batched_model->Tokenize(prompt[index]);
+        if (batched_prompt[index].empty()) {
+          Warn("batched-w2 member " + std::to_string(index) +
+               " prompt tokenized empty");
+          return kInvalidArguments;
+        }
+        if (batched_prompt[index].size() + budget >
+            static_cast<std::size_t>(context)) {
+          Warn("batched-w2 member " + std::to_string(index) + " prompt has " +
+               std::to_string(batched_prompt[index].size()) +
+               " tokens, plus --max-tokens " + std::to_string(budget) +
+               ", which exceeds the negotiated context " +
+               std::to_string(context));
+          return kInvalidArguments;
+        }
+      }
+      return RunBatchedW2("rank1", batched_model, batched_prompt, budget,
+                           context, collectives, &batched_error);
+    }
     const MtpSidecar mtp{
         .model_path = mtp_model_path,
         .draft_tokens = mtp_draft_tokens,
@@ -1678,6 +1947,57 @@ int main(int argc, char** argv) {
   auto collectives = std::make_shared<CollectiveTrace>(std::move(communicator));
   Say("rank0", "RDMA peer established on bootstrap port " +
                    std::to_string(bootstrap_port));
+
+  // `--batched-w2` returns here, BEFORE the control listener binds: this mode
+  // has no cohort, no command and no worker, so binding a control peer would
+  // only add a second rendezvous that nothing ever connects to. Rank 1 takes
+  // the matching branch before its control connect.
+  if (batched_w2) {
+    Say("rank0", "batched-w2 mode: no control wire, no cohort, no worker");
+    q::ModelOptions batched_options{
+        .max_context = context,
+        .mtp_model_path = "",
+        .max_draft_tokens = q::kMaxMtpDraftTokens,
+        .vision_model_path = "",
+        .decode_concurrency = 1,
+        .tp_rank = 0,
+        .tp_world_size = kWorldSize,
+        .hip_device = static_cast<int>(device),
+        .communicator = collectives,
+    };
+    auto batched_model = q::Model::Load(model_path, batched_options, &error);
+    if (!batched_model) {
+      Warn("batched-w2 model load failed: " + error);
+      return kTransportFailure;
+    }
+    if (batched_model->HasMtp()) {
+      Warn("batched-w2 model reports an MTP sidecar, which this mode refuses");
+      return kInvalidArguments;
+    }
+    std::vector<std::int32_t> batched_prompt[kMemberCount];
+    for (std::size_t index = 0; index < kMemberCount; ++index) {
+      batched_prompt[index] =
+          prompt_tokens[index].has_value()
+              ? SyntheticPrompt(*batched_model, *prompt_tokens[index], index)
+              : batched_model->Tokenize(prompt[index]);
+      if (batched_prompt[index].empty()) {
+        Warn("batched-w2 member " + std::to_string(index) +
+             " prompt tokenized empty");
+        return kInvalidArguments;
+      }
+      if (batched_prompt[index].size() + budget >
+          static_cast<std::size_t>(context)) {
+        Warn("batched-w2 member " + std::to_string(index) + " prompt has " +
+             std::to_string(batched_prompt[index].size()) +
+             " tokens, plus --max-tokens " + std::to_string(budget) +
+             ", which exceeds the negotiated context " +
+             std::to_string(context));
+        return kInvalidArguments;
+      }
+    }
+    return RunBatchedW2("rank0", batched_model, batched_prompt, budget,
+                         context, collectives, &error);
+  }
 
   // 2. The rank-zero control peer listens; the worker connects and both
   //    handshakes must agree field for field.
