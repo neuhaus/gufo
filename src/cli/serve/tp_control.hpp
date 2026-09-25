@@ -73,7 +73,8 @@ struct TpControlCommand {
 };
 
 struct TpControlResponse {
-  /// Response broker correlation key. C1 worker fields remain source-compatible.
+  /// Response broker correlation key. C1 worker fields remain
+  /// source-compatible.
   std::uint64_t sequence{0};
   std::vector<std::int32_t> tokens;
   std::uint64_t draft_tokens{0};

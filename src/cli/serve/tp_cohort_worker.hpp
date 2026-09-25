@@ -27,7 +27,7 @@ enum class TpWorkerLoopStep {
 /// sequence guarantees that a successful `Begin` is matched by exactly one
 /// `End`, so a leaked scope can never poison the next C1 command's bind.
 class TpCohortLease {
- public:
+public:
   virtual ~TpCohortLease() = default;
 
   /// Binds the operation scope. A refused bind owns nothing, so `End` must not
@@ -39,7 +39,7 @@ class TpCohortLease {
 
 /// One admitted cohort member as seen by the worker loop.
 class TpCohortMemberHandle {
- public:
+public:
   virtual ~TpCohortMemberHandle() = default;
 
   /// Waits for the member's terminal result, exactly like a C1 `Request::Wait`.
@@ -50,7 +50,7 @@ class TpCohortMemberHandle {
 
 /// One atomically admitted, ordered C2 cohort.
 class TpCohortSubmission {
- public:
+public:
   virtual ~TpCohortSubmission() = default;
 
   [[nodiscard]] virtual TpCohortMemberHandle& Member(std::size_t index) = 0;

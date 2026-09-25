@@ -651,25 +651,25 @@ void TestCohortRejectsInvalidMembershipBeforeModelWork() {
                         "a zero C2 cohort member ID is rejected");
   auto sampled = MakeCohortMember(43, 3, "member-zero");
   sampled.sampling.temperature = 0.5F;
-  RequireCohortRejected(*scheduler,
-                        {std::move(sampled), MakeCohortMember(44, 4, "member-one")},
-                        "a sampled C2 cohort member is rejected");
+  RequireCohortRejected(
+      *scheduler, {std::move(sampled), MakeCohortMember(44, 4, "member-one")},
+      "a sampled C2 cohort member is rejected");
   auto streaming = MakeCohortMember(45, 5, "member-zero");
   streaming.publish_token_pieces = true;
-  RequireCohortRejected(*scheduler,
-                        {std::move(streaming), MakeCohortMember(46, 6, "member-one")},
-                        "a streaming C2 cohort member is rejected");
+  RequireCohortRejected(
+      *scheduler, {std::move(streaming), MakeCohortMember(46, 6, "member-one")},
+      "a streaming C2 cohort member is rejected");
   auto cached = MakeCohortMember(47, 7, "member-zero");
   cached.metadata.cache_prompt = true;
-  RequireCohortRejected(*scheduler,
-                        {std::move(cached), MakeCohortMember(48, 8, "member-one")},
-                        "a cached C2 cohort member is rejected");
+  RequireCohortRejected(
+      *scheduler, {std::move(cached), MakeCohortMember(48, 8, "member-one")},
+      "a cached C2 cohort member is rejected");
   auto deadline = MakeCohortMember(49, 9, "member-zero");
-  deadline.metadata.deadline = TextGenerationScheduler::Clock::now() +
-                              std::chrono::seconds(1);
-  RequireCohortRejected(*scheduler,
-                        {std::move(deadline), MakeCohortMember(50, 10, "member-one")},
-                        "a C2 cohort member with a deadline is rejected");
+  deadline.metadata.deadline =
+      TextGenerationScheduler::Clock::now() + std::chrono::seconds(1);
+  RequireCohortRejected(
+      *scheduler, {std::move(deadline), MakeCohortMember(50, 10, "member-one")},
+      "a C2 cohort member with a deadline is rejected");
   Expect(
       control->states_created.load(std::memory_order_relaxed) == initial_states,
       "invalid cohorts are rejected before any runner state is created");

@@ -189,11 +189,11 @@ public:
   /// Exactly two members with nonzero, unique IDs are required. An incomplete
   /// cohort, a duplicate ID, or a third-member join is rejected before either
   /// member can reach a runner. Members must be greedy, non-streaming, uncached
-  /// requests without prompt continuation, cancellation callbacks, or deadlines.
-  /// The members are queued atomically in the given order under one scheduler
-  /// cohort identity. This is a dormant admission and order contract: members
-  /// still execute as independent C1 work, and no distributed runner plan or
-  /// physical C2 collective is selected here.
+  /// requests without prompt continuation, cancellation callbacks, or
+  /// deadlines. The members are queued atomically in the given order under one
+  /// scheduler cohort identity. This is a dormant admission and order contract:
+  /// members still execute as independent C1 work, and no distributed runner
+  /// plan or physical C2 collective is selected here.
   [[nodiscard]] Cohort SubmitCohort(std::vector<CohortMemberRequest> members);
 
 private:

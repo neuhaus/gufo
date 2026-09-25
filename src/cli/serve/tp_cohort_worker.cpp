@@ -34,7 +34,7 @@ void SetError(std::string* error, std::string message) {
 /// no-poison safety net for an exception that unwinds past a return, never a
 /// second release.
 class TpCohortLeaseGuard {
- public:
+public:
   explicit TpCohortLeaseGuard(std::unique_ptr<TpCohortLease> lease)
       : lease_(std::move(lease)) {}
   ~TpCohortLeaseGuard() { (void)End(nullptr); }
@@ -65,7 +65,7 @@ class TpCohortLeaseGuard {
     return lease_->End(error);
   }
 
- private:
+private:
   std::unique_ptr<TpCohortLease> lease_;
   bool bound_{false};
 };
@@ -124,9 +124,10 @@ class TpCohortLeaseGuard {
 /// cleanup failure still sends the response, poisons its error with the reason
 /// the worker stopped, and stops the worker exactly as the C1 tail does; a lost
 /// control channel stops it too.
-[[nodiscard]] TpWorkerLoopStep FinalizeCohort(
-    TpControlResponse response, TpCohortLeaseGuard& operation,
-    const TpCohortWorkerHooks& hooks, std::string* error) {
+[[nodiscard]] TpWorkerLoopStep FinalizeCohort(TpControlResponse response,
+                                              TpCohortLeaseGuard& operation,
+                                              const TpCohortWorkerHooks& hooks,
+                                              std::string* error) {
   std::string operation_error;
   const bool released = operation.End(&operation_error);
   if (!released) {
@@ -215,9 +216,8 @@ TpWorkerLoopStep RunTpCohortCommand(const TpControlCommand& command,
     if (member_index + 1 < kCohort2MemberCount) {
       submission->Member(member_index + 1).Cancel();
     }
-    return FinalizeCohort(
-        BuildCohortFailureResponse(*plan, exception.what()), operation, hooks,
-        error);
+    return FinalizeCohort(BuildCohortFailureResponse(*plan, exception.what()),
+                          operation, hooks, error);
   }
   // Both members are terminal, so the admission handles are released before the
   // response is built, exactly as the dormant C2 worker released its cohort.

@@ -494,7 +494,7 @@ Exit reasons:
 /// Owns the single bound collective scope and releases it on every exit path.
 /// `EndOperation` is purely local (verbs.cpp), so this never blocks.
 class OperationScope {
- public:
+public:
   OperationScope(std::shared_ptr<q::rocm::Communicator> communicator,
                  std::uint64_t scope_id)
       : communicator_(std::move(communicator)), scope_id_(scope_id) {}
@@ -529,7 +529,7 @@ class OperationScope {
     return communicator_->EndOperation(scope_id_, error);
   }
 
- private:
+private:
   std::shared_ptr<q::rocm::Communicator> communicator_;
   const std::uint64_t scope_id_;
   bool bound_{false};
@@ -664,8 +664,7 @@ bool RunMember(const char* role, std::size_t index,
       return false;
     }
     // SelectNext: sample the current logits. No forward, no collective.
-    const auto sampled =
-        static_cast<std::int32_t>(sampler.Sample(logits));
+    const auto sampled = static_cast<std::int32_t>(sampler.Sample(logits));
     if (model->IsStopToken(sampled)) {
       trace->stopped_on_token = true;
       break;
@@ -1086,8 +1085,7 @@ int main(int argc, char** argv) {
     Warn("--tp-control-token is required and must be at most 4096 bytes");
     return kInvalidArguments;
   }
-  if (device >
-          static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+  if (device > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
       gid > std::numeric_limits<std::uint8_t>::max()) {
     Warn("--tp-device or --tp-gid-index is out of range");
     return kInvalidArguments;
@@ -1294,12 +1292,11 @@ int main(int argc, char** argv) {
     Warn("model reports an MTP sidecar, which C2 refuses");
     return kInvalidArguments;
   }
-  Say("rank0", "model loaded: layers=" +
-                   std::to_string(model->config().num_layers) + " hidden=" +
-                   std::to_string(model->config().hidden_size) +
-                   " prefill_capacity=" +
-                   std::to_string(model->PrefillCapacity()) + " context=" +
-                   std::to_string(context));
+  Say("rank0",
+      "model loaded: layers=" + std::to_string(model->config().num_layers) +
+          " hidden=" + std::to_string(model->config().hidden_size) +
+          " prefill_capacity=" + std::to_string(model->PrefillCapacity()) +
+          " context=" + std::to_string(context));
 
   // 4. Build the two members and reject anything the worker would refuse
   //    before a single collective is issued.
@@ -1349,18 +1346,17 @@ int main(int argc, char** argv) {
     command.members.push_back(std::move(member));
   }
   // Digests come from the exported canonical functions, never by hand.
-  command.execution_plan_digest =
-      server::ComputeTpExecutionPlanDigest(command);
+  command.execution_plan_digest = server::ComputeTpExecutionPlanDigest(command);
   command.cache_plan_digest = server::ComputeTpCachePlanDigest(command);
   if (!server::ValidateTpControlCommand(command, &error)) {
     Warn("local C2 command pre-flight failed: " + error);
     return kInvalidArguments;
   }
-  Say("rank0", "C2 command sequence=" + std::to_string(command.sequence) +
-                   " cohort=" + std::to_string(command.cohort_id) +
-                   " execution_plan=" +
-                   DigestHex(command.execution_plan_digest) +
-                   " cache_plan=" + DigestHex(command.cache_plan_digest));
+  Say("rank0",
+      "C2 command sequence=" + std::to_string(command.sequence) +
+          " cohort=" + std::to_string(command.cohort_id) +
+          " execution_plan=" + DigestHex(command.execution_plan_digest) +
+          " cache_plan=" + DigestHex(command.cache_plan_digest));
 
   // 5. `BeginOperation` is local, so it needs no ordering against the worker's
   //    own bind. The scope stays bound across both members: the C2 members
@@ -1418,8 +1414,8 @@ int main(int argc, char** argv) {
        ++index) {
     if (!RunMember("rank0", index, model, member_prompt[index], budget, context,
                    &trace[index], &error)) {
-      Warn("member " + std::to_string(index) + " local execution failed: " +
-           error);
+      Warn("member " + std::to_string(index) +
+           " local execution failed: " + error);
       if (scope_override.has_value()) {
         Warn("collective fault detected as designed: rank 0 bound scope " +
              std::to_string(bound_scope) +
@@ -1432,22 +1428,20 @@ int main(int argc, char** argv) {
     }
     const std::size_t forwards =
         trace[index].prefill_forwards + trace[index].decode_forwards;
-    const char* stop = trace[index].stopped_on_token
-                           ? "token"
-                           : (trace[index].stopped_on_budget ? "budget"
-                                                             : "none");
-    Say("rank0", "member " + std::to_string(index) +
-                     " prompt=" + std::to_string(member_prompt[index].size()) +
-                     "t tokens=" + std::to_string(trace[index].tokens.size()) +
-                     " prefill_forwards=" +
-                     std::to_string(trace[index].prefill_forwards) +
-                     " decode_forwards=" +
-                     std::to_string(trace[index].decode_forwards) +
-                     " forwards=" + std::to_string(forwards) +
-                     " collectives=" +
-                     std::to_string(forwards * model->config().num_layers) +
-                     " stop=" + stop + " text=" +
-                     model->Decode(trace[index].tokens));
+    const char* stop =
+        trace[index].stopped_on_token
+            ? "token"
+            : (trace[index].stopped_on_budget ? "budget" : "none");
+    Say("rank0",
+        "member " + std::to_string(index) +
+            " prompt=" + std::to_string(member_prompt[index].size()) +
+            "t tokens=" + std::to_string(trace[index].tokens.size()) +
+            " prefill_forwards=" +
+            std::to_string(trace[index].prefill_forwards) +
+            " decode_forwards=" + std::to_string(trace[index].decode_forwards) +
+            " forwards=" + std::to_string(forwards) + " collectives=" +
+            std::to_string(forwards * model->config().num_layers) +
+            " stop=" + stop + " text=" + model->Decode(trace[index].tokens));
   }
 
   // 7. Release the scope before answering, exactly like the worker tail.
@@ -1490,8 +1484,8 @@ int main(int argc, char** argv) {
       response.cache_plan_digest != command.cache_plan_digest) {
     Warn("response plan digests do not match the command: response=" +
          DigestHex(response.execution_plan_digest) + "/" +
-         DigestHex(response.cache_plan_digest) + " command=" +
-         DigestHex(command.execution_plan_digest) + "/" +
+         DigestHex(response.cache_plan_digest) +
+         " command=" + DigestHex(command.execution_plan_digest) + "/" +
          DigestHex(command.cache_plan_digest));
     return kDigestMismatch;
   }
@@ -1503,8 +1497,8 @@ int main(int argc, char** argv) {
   for (std::size_t index = 0; index < kMemberCount; ++index) {
     if (response.members[index].member_id != command.members[index].member_id) {
       Warn("response member " + std::to_string(index) + " has id " +
-           std::to_string(response.members[index].member_id) +
-           ", expected " + std::to_string(command.members[index].member_id) +
+           std::to_string(response.members[index].member_id) + ", expected " +
+           std::to_string(command.members[index].member_id) +
            " (member order is part of the C2 contract)");
       return kMemberOrderMismatch;
     }
@@ -1515,11 +1509,10 @@ int main(int argc, char** argv) {
   // only after a stalled collective.
   if (!response.error.empty()) {
     const std::string stamp = ElapsedMs();
-    std::fprintf(stderr,
-                 "[c2-probe t=%sms] C2 ERROR RESPONSE for cohort %llu: %s\n",
-                 stamp.c_str(),
-                 static_cast<unsigned long long>(response.cohort_id),
-                 response.error.c_str());
+    std::fprintf(
+        stderr, "[c2-probe t=%sms] C2 ERROR RESPONSE for cohort %llu: %s\n",
+        stamp.c_str(), static_cast<unsigned long long>(response.cohort_id),
+        response.error.c_str());
     std::fflush(stderr);
     // `--expect-worker-mtp` asserts the refusal REASON, not merely that the
     // cohort was refused: every refusal answers with this exit code, so an
@@ -1553,9 +1546,9 @@ int main(int argc, char** argv) {
   //    host float add over two rank-local partials, so bitwise logit equality
   //    is not claimed; the contract under test is the token sequence.
   const int budget_exceeded[kMemberCount] = {kMember0BudgetExceeded,
-                                            kMember1BudgetExceeded};
+                                             kMember1BudgetExceeded};
   const int token_mismatch[kMemberCount] = {kMember0TokenMismatch,
-                                           kMember1TokenMismatch};
+                                            kMember1TokenMismatch};
   for (std::size_t index = 0; index < kMemberCount; ++index) {
     const auto& received = response.members[index].tokens;
     if (received.size() > budget) {
@@ -1569,9 +1562,9 @@ int main(int argc, char** argv) {
     const auto& received = response.members[index].tokens;
     const std::span<const std::int32_t> local(trace[index].tokens);
     if (std::ranges::equal(local, received)) {
-      Say("rank0", "member " + std::to_string(index) +
-                       " AGREES with the local greedy output: " +
-                       TokensText(received));
+      Say("rank0",
+          "member " + std::to_string(index) +
+              " AGREES with the local greedy output: " + TokensText(received));
       continue;
     }
     // `at` is the shorter length when one run is a prefix of the other, so a
@@ -1582,13 +1575,11 @@ int main(int argc, char** argv) {
         at < received.size() ? std::to_string(received[at]) : "end-of-run";
     const std::string local_token =
         at < local.size() ? std::to_string(local[at]) : "end-of-run";
-    Warn("member " + std::to_string(index) +
-         " token disagreement at index " + std::to_string(at) +
-         ": worker=" + worker_token + " local=" + local_token +
-         " worker_len=" + std::to_string(received.size()) +
-         " local_len=" + std::to_string(local.size()) +
-         " worker_tokens=[" + TokensText(received) + "] local_tokens=[" +
-         TokensText(local) + "]");
+    Warn("member " + std::to_string(index) + " token disagreement at index " +
+         std::to_string(at) + ": worker=" + worker_token + " local=" +
+         local_token + " worker_len=" + std::to_string(received.size()) +
+         " local_len=" + std::to_string(local.size()) + " worker_tokens=[" +
+         TokensText(received) + "] local_tokens=[" + TokensText(local) + "]");
     return token_mismatch[index];
   }
 

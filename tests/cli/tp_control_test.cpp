@@ -63,7 +63,7 @@ std::uint16_t FreePort() {
 }
 
 TpControlCommand MakeC2Command(std::uint64_t sequence,
-                                std::uint64_t cohort_id) {
+                               std::uint64_t cohort_id) {
   TpControlCommand command{
       .sequence = sequence,
       .kind = TpControlCommandKind::kCohort2Ar,
@@ -122,26 +122,26 @@ TpResponseExpectation MakeC2Expectation(const TpControlCommand& command) {
 
 void RequireC2MembersInOrder(const TpControlCommand& command,
                              const TpControlResponse& response) {
-  Require(response.sequence == command.sequence &&
-              response.kind == TpControlResponseKind::kCohort2Ar &&
-              response.cohort_id == command.cohort_id &&
-              response.execution_plan_digest ==
-                  command.execution_plan_digest &&
-              response.cache_plan_digest == command.cache_plan_digest &&
-              response.members.size() == command.members.size() &&
-              response.members[0].member_id == command.members[0].member_id &&
-              response.members[1].member_id == command.members[1].member_id &&
-              response.members[0].tokens ==
-                  std::vector<std::int32_t>{100, 101} &&
-              response.members[1].tokens ==
-                  std::vector<std::int32_t>{200, 201, 202},
-          "TP C2 response preserves cohort and member order");
+  Require(
+      response.sequence == command.sequence &&
+          response.kind == TpControlResponseKind::kCohort2Ar &&
+          response.cohort_id == command.cohort_id &&
+          response.execution_plan_digest == command.execution_plan_digest &&
+          response.cache_plan_digest == command.cache_plan_digest &&
+          response.members.size() == command.members.size() &&
+          response.members[0].member_id == command.members[0].member_id &&
+          response.members[1].member_id == command.members[1].member_id &&
+          response.members[0].tokens == std::vector<std::int32_t>{100, 101} &&
+          response.members[1].tokens ==
+              std::vector<std::int32_t>{200, 201, 202},
+      "TP C2 response preserves cohort and member order");
 }
 
 void RequireInvalidCommand(const TpControlCommand& command,
                            const std::string& message) {
   std::string error;
-  Require(!ValidateTpControlCommand(command, &error) && !error.empty(), message);
+  Require(!ValidateTpControlCommand(command, &error) && !error.empty(),
+          message);
 }
 
 void RequireInvalidResponse(const TpControlResponse& response,
@@ -199,7 +199,8 @@ int main() {
   Require(client->ReceiveCommand(&received, &client_error), client_error);
   Require(received.sequence == command.sequence &&
               received.kind == TpControlCommandKind::kSingle &&
-              received.cohort_id == command.sequence && received.members.empty() &&
+              received.cohort_id == command.sequence &&
+              received.members.empty() &&
               received.max_tokens == command.max_tokens &&
               received.cache_prompt == command.cache_prompt &&
               received.cache_prefix_tokens == command.cache_prefix_tokens &&
@@ -253,33 +254,33 @@ int main() {
           client_error);
   Require(server->ReceiveResponse(&received_zero_scope_response, &server_error),
           server_error);
-  Require(received_zero_scope_response.sequence == 0 &&
-              received_zero_scope_response.kind ==
-                  TpControlResponseKind::kSingle &&
-              received_zero_scope_response.cohort_id == 0,
-          "TP control response preserves a zero operation scope");
+  Require(
+      received_zero_scope_response.sequence == 0 &&
+          received_zero_scope_response.kind == TpControlResponseKind::kSingle &&
+          received_zero_scope_response.cohort_id == 0,
+      "TP control response preserves a zero operation scope");
 
   const auto c2_command = MakeC2Command(20, 1000);
   std::string validation_error;
   Require(ValidateTpControlCommand(c2_command, &validation_error),
           validation_error);
-  Require(ComputeTpExecutionPlanDigest(c2_command) ==
+  Require(
+      ComputeTpExecutionPlanDigest(c2_command) ==
               c2_command.execution_plan_digest &&
-              ComputeTpCachePlanDigest(c2_command) ==
-                  c2_command.cache_plan_digest,
-          "TP C2 digest helpers are deterministic");
+          ComputeTpCachePlanDigest(c2_command) == c2_command.cache_plan_digest,
+      "TP C2 digest helpers are deterministic");
 
   auto reordered = c2_command;
   std::swap(reordered.members[0], reordered.members[1]);
-  Require(ComputeTpExecutionPlanDigest(reordered) !=
-                  c2_command.execution_plan_digest &&
-              ComputeTpCachePlanDigest(reordered) !=
-                  c2_command.cache_plan_digest,
-          "TP C2 digests bind member order");
+  Require(
+      ComputeTpExecutionPlanDigest(reordered) !=
+              c2_command.execution_plan_digest &&
+          ComputeTpCachePlanDigest(reordered) != c2_command.cache_plan_digest,
+      "TP C2 digests bind member order");
   auto changed_prompt = c2_command;
   changed_prompt.members[0].prompt_tokens.push_back(13);
   Require(ComputeTpExecutionPlanDigest(changed_prompt) !=
-              c2_command.execution_plan_digest &&
+                  c2_command.execution_plan_digest &&
               ComputeTpCachePlanDigest(changed_prompt) ==
                   c2_command.cache_plan_digest,
           "TP execution digest binds prompts without changing the cache plan");
@@ -325,7 +326,8 @@ int main() {
   RequireInvalidResponse(malformed_response,
                          "TP C2 rejects a one-member response");
   malformed_response = c2_response;
-  malformed_response.members[1].member_id = malformed_response.members[0].member_id;
+  malformed_response.members[1].member_id =
+      malformed_response.members[0].member_id;
   RequireInvalidResponse(malformed_response,
                          "TP C2 rejects duplicate response member IDs");
   malformed_response = c2_response;
@@ -427,8 +429,8 @@ int main() {
 
   TpResponseBroker broker(broker_server, 3);
   Require(broker.RegisterPendingResponse(7, &server_error), server_error);
-  Require(broker.RegisterPendingResponse(
-              9, MakeC2Expectation(c2_command), &server_error),
+  Require(broker.RegisterPendingResponse(9, MakeC2Expectation(c2_command),
+                                         &server_error),
           server_error);
   Require(broker.RegisterPendingResponse(11, &server_error), server_error);
 
@@ -498,7 +500,8 @@ int main() {
   auto contract_mismatch_server =
       TpControlChannel::Listen(contract_mismatch_port, &server_error);
   contract_connector.join();
-  Require(contract_mismatch_server != nullptr && contract_mismatch_client != nullptr,
+  Require(contract_mismatch_server != nullptr &&
+              contract_mismatch_client != nullptr,
           "TP contract mismatch pair connects");
   bool contract_server_handshake = false;
   bool contract_client_handshake = false;
@@ -517,22 +520,20 @@ int main() {
 
   TpResponseBroker contract_broker(contract_mismatch_server, 1);
   auto wrong_expectation = MakeC2Expectation(c2_command);
-  std::swap(wrong_expectation.member_ids[0],
-            wrong_expectation.member_ids[1]);
+  std::swap(wrong_expectation.member_ids[0], wrong_expectation.member_ids[1]);
   Require(contract_broker.RegisterPendingResponse(31, wrong_expectation,
                                                   &server_error),
           server_error);
   auto mismatched_response = c2_response;
   mismatched_response.sequence = 31;
   Require(contract_mismatch_client->SendResponse(mismatched_response,
-                                                  &client_error),
+                                                 &client_error),
           client_error);
   TpControlResponse ignored_contract;
-  Require(!contract_broker.WaitForResponse(31, &ignored_contract,
-                                           &server_error) &&
-              server_error.find("cohort contract mismatch") !=
-                  std::string::npos,
-          "TP broker rejects a C2 member-order mismatch");
+  Require(
+      !contract_broker.WaitForResponse(31, &ignored_contract, &server_error) &&
+          server_error.find("cohort contract mismatch") != std::string::npos,
+      "TP broker rejects a C2 member-order mismatch");
   Require(!contract_broker.RegisterPendingResponse(32, &server_error),
           "TP broker remains poisoned after a C2 contract mismatch");
 

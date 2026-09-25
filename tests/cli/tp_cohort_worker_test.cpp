@@ -76,11 +76,9 @@ bool Matches(const EventLog& log, const EventLog& expected) {
 /// for, so a leak or a double release is visible from the test side. It has no
 /// destructor-side release of its own: only the seam can end a scope.
 class FakeLease final : public TpCohortLease {
- public:
+public:
   FakeLease(std::shared_ptr<Recorder> recorder, bool begin_ok, bool end_ok)
-      : recorder_(std::move(recorder)),
-        begin_ok_(begin_ok),
-        end_ok_(end_ok) {}
+      : recorder_(std::move(recorder)), begin_ok_(begin_ok), end_ok_(end_ok) {}
 
   [[nodiscard]] bool Begin(std::string* error) override {
     recorder_->log.push_back("begin");
@@ -106,7 +104,7 @@ class FakeLease final : public TpCohortLease {
     return true;
   }
 
- private:
+private:
   std::shared_ptr<Recorder> recorder_;
   bool begin_ok_{true};
   bool end_ok_{true};
@@ -115,9 +113,9 @@ class FakeLease final : public TpCohortLease {
 /// Scriptable cohort member. `Wait` can throw and `Cancel` is recorded, so a
 /// rejected cohort can be proven to cancel exactly the peer it must.
 class FakeMember final : public TpCohortMemberHandle {
- public:
-  FakeMember(std::shared_ptr<Recorder> recorder, std::size_t index,
-             bool throws, TextGenerationBackend::Result result)
+public:
+  FakeMember(std::shared_ptr<Recorder> recorder, std::size_t index, bool throws,
+             TextGenerationBackend::Result result)
       : recorder_(std::move(recorder)),
         index_(index),
         throws_(throws),
@@ -136,7 +134,7 @@ class FakeMember final : public TpCohortMemberHandle {
     ++recorder_->cancel_calls[index_];
   }
 
- private:
+private:
   std::shared_ptr<Recorder> recorder_;
   std::size_t index_{0};
   bool throws_{false};
@@ -145,7 +143,7 @@ class FakeMember final : public TpCohortMemberHandle {
 
 /// One admitted cohort of two scriptable members.
 class FakeSubmission final : public TpCohortSubmission {
- public:
+public:
   FakeSubmission(std::shared_ptr<Recorder> recorder,
                  std::array<bool, kCohort2MemberCount> throws,
                  const MemberResults& results)
@@ -160,7 +158,7 @@ class FakeSubmission final : public TpCohortSubmission {
     return *members_[index];
   }
 
- private:
+private:
   std::shared_ptr<Recorder> recorder_;
   std::array<std::unique_ptr<FakeMember>, kCohort2MemberCount> members_;
 };
@@ -249,9 +247,10 @@ Outcome RunCommand(const TpControlCommand& command, const Options& options) {
 
   TpCohortWorkerHooks hooks;
   using Admissions = std::vector<TextGenerationScheduler::CohortMemberRequest>;
-  hooks.submit = [recorder, options, &outcome](Admissions admissions,
-                                               std::string* error)
-      -> std::unique_ptr<TpCohortSubmission> {
+  hooks.submit =
+      [recorder, options, &outcome](
+          Admissions admissions,
+          std::string* error) -> std::unique_ptr<TpCohortSubmission> {
     std::vector<std::uint64_t> member_ids;
     member_ids.reserve(admissions.size());
     for (const auto& admission : admissions) {
@@ -269,7 +268,7 @@ Outcome RunCommand(const TpControlCommand& command, const Options& options) {
                                             options.results);
   };
   hooks.send = [recorder, options, &outcome](const TpControlResponse& response,
-                                            std::string* error) {
+                                             std::string* error) {
     recorder->log.push_back("send");
     outcome.responses.push_back(response);
     if (options.send_step == TpWorkerLoopStep::kStop && error != nullptr) {
@@ -292,12 +291,11 @@ Outcome RunCommand(const TpControlCommand& command, const Options& options) {
 void RequireLease(const Outcome& outcome, int begins, int ends,
                   const std::string& what) {
   Require(outcome.recorder->begin_calls == begins,
-         what + ": binds the operation scope " + std::to_string(begins) +
-             " time(s), saw " +
-             std::to_string(outcome.recorder->begin_calls));
+          what + ": binds the operation scope " + std::to_string(begins) +
+              " time(s), saw " + std::to_string(outcome.recorder->begin_calls));
   Require(outcome.recorder->end_calls == ends,
-         what + ": releases the operation scope " + std::to_string(ends) +
-             " time(s), saw " + std::to_string(outcome.recorder->end_calls));
+          what + ": releases the operation scope " + std::to_string(ends) +
+              " time(s), saw " + std::to_string(outcome.recorder->end_calls));
 }
 
 void RequireWireValid(const TpControlResponse& response,
@@ -309,8 +307,8 @@ void RequireWireValid(const TpControlResponse& response,
 
 void RequireSingleFailure(const Outcome& outcome, const std::string& what) {
   Require(outcome.responses.size() == 1,
-         what + ": sends exactly one response, saw " +
-             std::to_string(outcome.responses.size()));
+          what + ": sends exactly one response, saw " +
+              std::to_string(outcome.responses.size()));
   Require(!outcome.responses.front().error.empty(),
           what + ": reports a non-empty failure reason");
   Require(outcome.responses.front().kind == TpControlResponseKind::kCohort2Ar,
@@ -340,19 +338,18 @@ void TestSuccessOrdersMembersAndReleasesOnce() {
   const auto& response = outcome.responses.front();
   Require(response.sequence == command.sequence &&
               response.cohort_id == command.cohort_id &&
-              response.execution_plan_digest ==
-                  command.execution_plan_digest &&
+              response.execution_plan_digest == command.execution_plan_digest &&
               response.cache_plan_digest == command.cache_plan_digest &&
               response.error.empty(),
           "TP cohort worker echoes the accepted cohort envelope");
-  Require(response.members.size() == kCohort2MemberCount &&
-              response.members[0].member_id == command.members[0].member_id &&
-              response.members[1].member_id == command.members[1].member_id &&
-              response.members[0].tokens ==
-                  std::vector<std::int32_t>{100, 101} &&
-              response.members[1].tokens ==
-                  std::vector<std::int32_t>{200, 201, 202},
-          "TP cohort worker maps member results onto the ordered identities");
+  Require(
+      response.members.size() == kCohort2MemberCount &&
+          response.members[0].member_id == command.members[0].member_id &&
+          response.members[1].member_id == command.members[1].member_id &&
+          response.members[0].tokens == std::vector<std::int32_t>{100, 101} &&
+          response.members[1].tokens ==
+              std::vector<std::int32_t>{200, 201, 202},
+      "TP cohort worker maps member results onto the ordered identities");
   RequireWireValid(response, "TP cohort worker success response");
 }
 
@@ -365,8 +362,7 @@ void TestMtpRefusalFailsClosedBeforeBinding() {
   Require(Matches(outcome.recorder->log, {"send"}),
           "TP cohort worker fails closed before it admits or binds: " +
               Join(outcome.recorder->log));
-  Require(outcome.step == TpWorkerLoopStep::kContinue &&
-              outcome.error.empty(),
+  Require(outcome.step == TpWorkerLoopStep::kContinue && outcome.error.empty(),
           "TP cohort worker keeps serving after an MTP refusal");
   RequireSingleFailure(outcome, "TP cohort worker MTP refusal");
   Require(outcome.responses.front().error ==
@@ -395,8 +391,7 @@ void TestMemberTranslationRejectionNeverBindsTheScope() {
   Require(Matches(outcome.recorder->log, {"send"}),
           "TP cohort worker rejects a refused member before it binds: " +
               Join(outcome.recorder->log));
-  Require(outcome.step == TpWorkerLoopStep::kContinue &&
-              outcome.error.empty(),
+  Require(outcome.step == TpWorkerLoopStep::kContinue && outcome.error.empty(),
           "TP cohort worker keeps serving after a member translation refusal");
   RequireSingleFailure(outcome, "TP cohort worker member translation refusal");
   Require(outcome.responses.front().members[0].member_id ==
@@ -414,8 +409,7 @@ void TestPlanRejectionReportsCommandIdentity() {
   Require(Matches(outcome.recorder->log, {"send"}),
           "TP cohort worker rejects an invalid command before it binds: " +
               Join(outcome.recorder->log));
-  Require(outcome.step == TpWorkerLoopStep::kContinue &&
-              outcome.error.empty(),
+  Require(outcome.step == TpWorkerLoopStep::kContinue && outcome.error.empty(),
           "TP cohort worker keeps serving after a command rejection");
   RequireSingleFailure(outcome, "TP cohort worker command rejection");
   const auto& response = outcome.responses.front();
@@ -464,8 +458,7 @@ void TestSubmitRefusalReleasesTheScopeAndContinues() {
   Require(Matches(outcome.recorder->log, {"begin", "submit:2", "end", "send"}),
           "TP cohort worker releases a refused admission before answering: " +
               Join(outcome.recorder->log));
-  Require(outcome.step == TpWorkerLoopStep::kContinue &&
-              outcome.error.empty(),
+  Require(outcome.step == TpWorkerLoopStep::kContinue && outcome.error.empty(),
           "TP cohort worker keeps serving after a refused admission");
   RequireSingleFailure(outcome, "TP cohort worker refused admission");
   Require(outcome.responses.front().error == options.submit_error,
@@ -514,8 +507,7 @@ void TestFirstMemberThrowCancelsThePeerAndReleasesOnce() {
   Require(outcome.recorder->cancel_calls[0] == 0 &&
               outcome.recorder->cancel_calls[1] == 1,
           "TP cohort worker cancels only the unfinished peer");
-  Require(outcome.step == TpWorkerLoopStep::kContinue &&
-              outcome.error.empty(),
+  Require(outcome.step == TpWorkerLoopStep::kContinue && outcome.error.empty(),
           "TP cohort worker keeps serving after a member wait failure");
   RequireSingleFailure(outcome, "TP cohort worker member wait failure");
   Require(outcome.responses.front().error == "cohort member wait failed",
@@ -532,15 +524,13 @@ void TestSecondMemberThrowCancelsNothingAndReleasesOnce() {
   const Outcome outcome = RunCommand(command, options);
   RequireLease(outcome, 1, 1, "TP cohort worker with a failed second member");
   Require(Matches(outcome.recorder->log,
-                  {"begin", "submit:2", "wait:0", "wait:1", "end",
-                   "send"}),
+                  {"begin", "submit:2", "wait:0", "wait:1", "end", "send"}),
           "TP cohort worker cancels no member once the last one failed: " +
               Join(outcome.recorder->log));
   Require(outcome.recorder->cancel_calls[0] == 0 &&
               outcome.recorder->cancel_calls[1] == 0,
           "TP cohort worker cancels nothing when the last member failed");
-  Require(outcome.step == TpWorkerLoopStep::kContinue &&
-              outcome.error.empty(),
+  Require(outcome.step == TpWorkerLoopStep::kContinue && outcome.error.empty(),
           "TP cohort worker keeps serving after the last member failed");
   RequireSingleFailure(outcome, "TP cohort worker last member failure");
   Require(outcome.responses.front().members[0].member_id ==
@@ -559,8 +549,7 @@ void TestRejectedMemberResultStillReleasesOnce() {
                   {"begin", "submit:2", "wait:0", "wait:1", "end", "send"}),
           "TP cohort worker releases a rejected member result once: " +
               Join(outcome.recorder->log));
-  Require(outcome.step == TpWorkerLoopStep::kContinue &&
-              outcome.error.empty(),
+  Require(outcome.step == TpWorkerLoopStep::kContinue && outcome.error.empty(),
           "TP cohort worker keeps serving after a rejected member result");
   RequireSingleFailure(outcome, "TP cohort worker rejected member result");
   Require(outcome.responses.front().error ==
@@ -584,22 +573,21 @@ void TestReleaseFailureOnSuccessStillAnswersAndStops() {
   Require(outcome.responses.size() == 1,
           "TP cohort worker still sends the cohort response it already built");
   const auto& response = outcome.responses.front();
-  Require(response.members.size() == kCohort2MemberCount &&
-              response.members[0].tokens ==
-                  std::vector<std::int32_t>{100, 101} &&
-              response.members[1].tokens ==
-                  std::vector<std::int32_t>{200, 201, 202},
-          "TP cohort worker keeps the member results on a poisoned response");
+  Require(
+      response.members.size() == kCohort2MemberCount &&
+          response.members[0].tokens == std::vector<std::int32_t>{100, 101} &&
+          response.members[1].tokens ==
+              std::vector<std::int32_t>{200, 201, 202},
+      "TP cohort worker keeps the member results on a poisoned response");
   Require(response.error ==
               "TP worker operation scope cleanup failed: scope cleanup refused",
           "TP cohort worker poisons the response with the release failure: " +
               response.error);
-  Require(outcome.step == TpWorkerLoopStep::kStop &&
-              outcome.error == response.error,
-          "TP cohort worker stops with the same poison it sent: " +
-              outcome.error);
-  RequireWireValid(response,
-                   "TP cohort worker poisoned success response");
+  Require(
+      outcome.step == TpWorkerLoopStep::kStop &&
+          outcome.error == response.error,
+      "TP cohort worker stops with the same poison it sent: " + outcome.error);
+  RequireWireValid(response, "TP cohort worker poisoned success response");
 }
 
 void TestSendFailureStillReleasesOnce() {
