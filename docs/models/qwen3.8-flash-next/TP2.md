@@ -197,6 +197,10 @@ experimental and must not be rendered into the published benchmark tables.
 - Serialized/distributed disk snapshots, arbitrary historical-prefix indexes,
   and vision remain rejected. Only the stable prompt boundary and current live
   frontier are retained by this experimental C1 slice.
+- C>1 is intentionally rejected before communicator/model setup. Merely
+  changing `--sessions` is unsafe: a future cohort implementation must add
+  request/operation identity, an ordered rank-local execution plan, and
+  explicit cache-plan parity before enabling physical batched collectives.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
   routed source bytes and the device model reports post-conversion resident
