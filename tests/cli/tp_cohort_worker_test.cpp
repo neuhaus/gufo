@@ -166,6 +166,7 @@ private:
 /// Scriptable worker environment: every knob the worker loop can turn.
 struct Options {
   bool use_mtp{false};
+  std::size_t runner_capacity{1};
   bool begin_ok{true};
   bool end_ok{true};
   bool submit_ok{true};
@@ -279,7 +280,7 @@ Outcome RunCommand(const TpControlCommand& command, const Options& options) {
 
   std::string error;
   outcome.step = RunTpCohortCommand(
-      command, options.use_mtp,
+      command, options.use_mtp, options.runner_capacity,
       std::make_unique<FakeLease>(recorder, options.begin_ok, options.end_ok),
       std::move(hooks), &error);
   outcome.error = std::move(error);
@@ -375,6 +376,39 @@ void TestMtpRefusalFailsClosedBeforeBinding() {
           "TP cohort worker MTP refusal keeps both ordered member identities");
   RequireWireValid(outcome.responses.front(),
                    "TP cohort worker MTP refusal response");
+}
+
+void TestRunnerCapacityRefusalFailsClosedBeforeBinding() {
+  // A worker pool wider than one would admit both members at once and
+  // interleave them, so the ranks' collective sequences could diverge.
+  constexpr std::array<std::size_t, 3> kRefusedCapacities{0, 2, 8};
+  for (const std::size_t capacity : kRefusedCapacities) {
+    auto options = MakeOptions();
+    options.runner_capacity = capacity;
+    const auto command = MakeC2Command(23, 420);
+    const Outcome outcome = RunCommand(command, options);
+    const std::string what =
+        "TP cohort worker with runner capacity " + std::to_string(capacity);
+    RequireLease(outcome, 0, 0, what);
+    Require(Matches(outcome.recorder->log, {"send"}),
+            what + ": fails closed before it admits or binds: " +
+                Join(outcome.recorder->log));
+    Require(
+        outcome.step == TpWorkerLoopStep::kContinue && outcome.error.empty(),
+        what + ": keeps serving after the refusal");
+    RequireSingleFailure(outcome, what);
+    Require(outcome.responses.front().error ==
+                "C2 cohort AR requires worker runner capacity 1, got " +
+                    std::to_string(capacity),
+            what + ": reports the capacity it refused: " +
+                outcome.responses.front().error);
+    Require(outcome.responses.front().members[0].member_id ==
+                    command.members[0].member_id &&
+                outcome.responses.front().members[1].member_id ==
+                    command.members[1].member_id,
+            what + ": keeps both ordered member identities");
+    RequireWireValid(outcome.responses.front(), what + " response");
+  }
 }
 
 void TestMemberTranslationRejectionNeverBindsTheScope() {
@@ -616,6 +650,7 @@ int main() {
 
   TestSuccessOrdersMembersAndReleasesOnce();
   TestMtpRefusalFailsClosedBeforeBinding();
+  TestRunnerCapacityRefusalFailsClosedBeforeBinding();
   TestMemberTranslationRejectionNeverBindsTheScope();
   TestPlanRejectionReportsCommandIdentity();
   TestBindFailureStopsWithoutReleasing();

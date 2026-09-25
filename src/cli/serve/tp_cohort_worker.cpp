@@ -18,6 +18,9 @@ constexpr std::string_view kCleanupFailure =
 /// MTP draft telemetry has no representation in the C2 response contract.
 constexpr std::string_view kMtpRefusal =
     "C2 cohort AR is not supported while the MTP sidecar is loaded";
+/// Serial members need a worker scheduler that runs one request at a time.
+constexpr std::string_view kRunnerCapacityRefusal =
+    "C2 cohort AR requires worker runner capacity 1, got ";
 
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
@@ -147,7 +150,7 @@ private:
 }  // namespace
 
 TpWorkerLoopStep RunTpCohortCommand(const TpControlCommand& command,
-                                    bool use_mtp,
+                                    bool use_mtp, std::size_t runner_capacity,
                                     std::unique_ptr<TpCohortLease> lease,
                                     TpCohortWorkerHooks hooks,
                                     std::string* error) {
@@ -160,6 +163,16 @@ TpWorkerLoopStep RunTpCohortCommand(const TpControlCommand& command,
   }
   if (use_mtp) {
     return SendCohortFailure(*plan, kMtpRefusal, hooks, error);
+  }
+  // A wider runner pool would make both members co-resident, and the
+  // scheduler would interleave them in an order the wire does not carry, so the
+  // ranks' collective sequences could pair different members at equal byte
+  // counts without a header error. Refuse before binding and before any
+  // collective. See the header for why the batched path is not the mechanism.
+  if (runner_capacity != 1) {
+    const std::string refusal =
+        std::string(kRunnerCapacityRefusal) + std::to_string(runner_capacity);
+    return SendCohortFailure(*plan, refusal, hooks, error);
   }
   auto members = BuildCohortMembers(command, &cohort_error);
   if (!members.has_value()) {

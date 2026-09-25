@@ -3920,6 +3920,7 @@ bool InferenceBackend::run_worker(std::string* error) {
         return TpWorkerLoopStep::kContinue;
       };
       if (RunTpCohortCommand(command, state->tp_use_mtp,
+                             state->scheduler->capacity(),
                              std::make_unique<TpOperationScopeLease>(
                                  state->communicator, command.sequence),
                              std::move(hooks),

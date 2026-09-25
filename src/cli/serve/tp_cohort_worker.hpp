@@ -75,8 +75,27 @@ struct TpCohortWorkerHooks {
 /// response seam rejects any member that is not serial. MTP drafts cannot be
 /// represented by the C2 response contract, so a loaded draft sidecar fails
 /// closed before the lease is bound.
+///
+/// Serial execution also depends on `runner_capacity`, the worker scheduler's
+/// runner capacity. `Admit` admits up to that many requests at once
+/// (text_generation_scheduler.cpp:491), so above one both cohort members become
+/// co-resident.
+///
+/// They would then interleave, but not through the batched path: that requires
+/// `multi_token_decode`, which is `use_mtp_` for this runner
+/// (inference_backend.cpp:2503) and therefore false for a C2 AR cohort, which
+/// refuses MTP outright. Each resident member instead advances through the
+/// per-request `StepDecode` (text_generation_scheduler.cpp:709), one at a time,
+/// in whatever order the scheduler selects.
+///
+/// That order is not carried on the wire, so the two ranks' collective sequences
+/// stop being guaranteed to match. A mismatch would also be silent: a
+/// single-row decode is `hidden * 4` bytes for either member, so ordinal N on
+/// one rank can pair with ordinal N on the other for a *different* member
+/// without tripping the communicator's scope/ordinal/bytes header check. Any
+/// capacity other than one therefore fails closed before the lease is bound.
 [[nodiscard]] TpWorkerLoopStep RunTpCohortCommand(
-    const TpControlCommand& command, bool use_mtp,
+    const TpControlCommand& command, bool use_mtp, std::size_t runner_capacity,
     std::unique_ptr<TpCohortLease> lease, TpCohortWorkerHooks hooks,
     std::string* error);
 

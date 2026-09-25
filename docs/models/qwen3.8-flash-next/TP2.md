@@ -232,7 +232,12 @@ experimental and must not be rendered into the published benchmark tables.
   The rank-1 worker dispatches `kCohort2Ar` through those layers under exactly
   one operation lease scoped to the command sequence, and fails closed when an
   MTP sidecar is loaded because drafts cannot be represented by the C2 response
-  contract. That path stays dormant: no producer constructs a C2 command. The
+  contract. It also refuses a cohort, before binding the lease, unless its
+  runner capacity is one. A wider pool would admit both members at once and
+  interleave them, and each rank's own scheduler decides that interleaving, so
+  the two ranks' collective sequences could diverge. TP2 loading already
+  requires one session, so this guard only matters once `--sessions 2` is
+  enabled. That path stays dormant: no producer constructs a C2 command. The
   sequence itself is host-testable through injected lease, submission and send
   hooks, with a single-release-site guard so a bound scope is released exactly
   once on every path — including a member failure, which would otherwise leave
@@ -265,7 +270,9 @@ experimental and must not be rendered into the published benchmark tables.
     same exit code and a mode-1 refusal would otherwise read as this mode's
     success.
 
-  Still covered by hosted tests only: peer cancel mid-cohort and member failure.
+  Still covered by hosted tests only: peer cancel mid-cohort, member failure,
+  and the runner-capacity refusal. TP2 loading rejects more than one session,
+  so that refusal cannot be injected on hardware without relaxing the guard.
   No C2 command has run with a prompt longer than one prefill chunk.
 
 - The dormant C2 path HAS now run end to end on hardware, three consecutive

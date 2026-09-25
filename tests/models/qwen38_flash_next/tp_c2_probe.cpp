@@ -156,7 +156,7 @@
 //   3. MTP-SIDECAR REFUSAL (rank 1 `--mtp-model PATH`, rank 0
 //      `--expect-worker-mtp` with `--expect-c2-error`)
 //      `RunTpCohortCommand` refuses a cohort while MTP is loaded BEFORE it
-//      binds the operation scope (tp_cohort_worker.cpp:160-162, `kMtpRefusal`),
+//      binds the operation scope (tp_cohort_worker.cpp:164-166, `kMtpRefusal`),
 //      so on this path the lease bind and the first collective are dead code.
 //      `Impl::State::tp_use_mtp` comes from `Model::HasMtp`
 //      (inference_backend.cpp:3839) and the handshake then presents
@@ -478,7 +478,7 @@ Fault-injection modes (all deliberate, all fail closed; none can pass):
        rank1: --mtp-model PATH [--draft-tokens N]
        rank0: --expect-worker-mtp [--draft-tokens N] --expect-c2-error
      The worker refuses any C2 cohort while an MTP draft sidecar is loaded, and
-     it decides that BEFORE BeginOperation (tp_cohort_worker.cpp:160-162,
+     it decides that BEFORE BeginOperation (tp_cohort_worker.cpp:164-166,
      kMtpRefusal), so no lease is bound and no collective is issued.
      EXPECTED: rank 1 loads the sidecar, handshakes, logs its ready line with
      the draft width and refuses. The C2 error response still carries BOTH
@@ -1200,7 +1200,7 @@ int RunRank1Worker(const std::string& model_path, std::uint32_t context,
           "; waiting for the C2 command");
   if (mtp_loaded) {
     // The refusal is decided before `BuildCohortMembers` and before admission
-    // (tp_cohort_worker.cpp:160-162), so a loaded sidecar decides the outcome
+    // (tp_cohort_worker.cpp:164-166), so a loaded sidecar decides the outcome
     // even when `--worker-max-pending 1` is also set, and the two banners can
     // never both be true at once.
     Say("rank1",
