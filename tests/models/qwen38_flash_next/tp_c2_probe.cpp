@@ -22,28 +22,64 @@
 // COLLECTIVE TRACE ARITHMETIC (load-bearing)
 //   One `Executor::Forward(n)` runs the trunk layer loop once and issues
 //   exactly `num_layers` `AllReduceSum` collectives of `n * hidden_size * 4`
-//   bytes (executor.cpp: one `Moe` -> one `AllReduce` per layer).
+//   bytes (executor.cpp: one `Moe` -> one `AllReduce` per layer). Byte size is
+//   therefore fully determined by the forward's row count.
 //
 //   The worker runs each cohort member as independent serial C1 work, so for
-//   member m with prompt P and budget K, without MTP:
-//     prefill: one `Sync(P)`  -> 1 Forward(n=|P|)   (a single chunk requires
-//              |P| <= PrefillCapacity(); this probe refuses longer prompts)
+//   member m with prompt P, budget K and prefill capacity
+//   C = `PrefillCapacity()` (min(2048, context)), without MTP:
+//     prefill: ceil(P / C) forwards of n = min(C, remaining) rows each, in
+//              chunk order. Rank 0's `Session::Sync(P)` chunks inside `Feed`
+//              at `exec.max_batch`, which `Model::Load` sets to
+//              `PrefillCapacity()` (engine.cpp:190, 599-620). The worker's
+//              Qwen Flash-Next `Prefill` caps `consumed` at the same
+//              `PrefillCapacity` and re-`Sync`s the CUMULATIVE prefix, whose
+//              common-prefix skip feeds exactly the new tail
+//              (inference_backend.cpp:2646-2672), so it issues the same
+//              forwards with the same row counts in the same order. The member
+//              is the only resident request (runner pool capacity 1) and no
+//              decoder is runnable, so `bounded_prefill` is false
+//              (text_generation_scheduler.cpp:568-572): the worker's per-step
+//              budget is the whole remaining prompt, and it is the
+//              `PrefillCapacity` cap, NOT the handshake's
+//              `prefill_chunk_tokens`, that chunks a long prompt.
+//              Nothing else in the worker bounds a prompt: `BuildCohortMembers`
+//              only requires an uncached member, and the runner's own length
+//              check is `max_context` (text_model_runner.cpp:1273).
 //     decode:  the scheduler alternates `SelectNext()` (samples the current
 //              logits, NO forward) with `Advance()` (= `Evaluate` = 1 Forward
 //              of one row). `TextRunnerCapabilities::final_token_advance_-
 //              required` is false for the distributed Flash-Next runner, so
 //              `PrepareDecode` completes the request at the token limit
 //              WITHOUT advancing the final token.
-//     => tokens published T, forwards A = T - 1 when the run ends on the
-//        length limit, and A = T when `SelectNext` returns a stop token first.
-//        Per member: 1 + A forwards, i.e. (1 + A) * num_layers collectives.
+//     => tokens published T, decode forwards A = T - 1 when the run ends on
+//        the length limit, and A = T when `SelectNext` returns a stop token
+//        first. Per member: (ceil(P / C) + A) * num_layers collectives, whose
+//        prefill byte sequence is `num_layers` copies of
+//        `min(C, remaining) * hidden_size * 4` per chunk, in chunk order, and
+//        whose decode byte sequence is A * num_layers copies of
+//        `hidden_size * 4`.
 //
-//   `RunMember` below reproduces exactly that: sample from `session->Logits()`
-//   (no collective), stop on `model->IsStopToken`, stop at the budget, and only
-//   then `session->Evaluate(token)` (one collective group). It deliberately
+//   `RunMember` below reproduces exactly that: one `session->Sync(prompt)`,
+//   then sample from `session->Logits()` (no collective), stop on
+//   `model->IsStopToken`, stop at the budget, and only then
+//   `session->Evaluate(token)` (one collective group). It deliberately
 //   does NOT use `Session::DecodeStep`, which always advances the token it
 //   samples and would therefore issue one extra forward per member and
-//   desynchronise the trace.
+//   desynchronise the trace. A FRESH session per member is what makes the
+//   prefill start from an empty prefix, which is also what the worker does for
+//   an uncached member (`cache_prompt = false`, `allow_cache_reuse = false`),
+//   so `Sync`'s common-prefix skip is zero on both sides and both chunk the
+//   whole prompt.
+//
+//   The probe OBSERVES the prefill byte sequence rather than trusting the
+//   formula: rank 0 installs a `CollectiveTrace` decorator on the model
+//   communicator, so the trace carries the byte size of every collective rank 0
+//   actually issued, and `PlanPrefill`'s prediction is compared against it
+//   before the member line is reported. A mismatch is exit 13, never a silent
+//   pass: a wrong prefill chunk count is the one assumption that would
+//   otherwise desynchronise both ranks into an unattributable 30 s collective
+//   timeout, and the log names the first divergent index and both byte sizes.
 //
 // OPERATING RULES
 //   * Start BOTH roles under an external timeout (`timeout 900 ...`). The RDMA
@@ -166,6 +202,10 @@
 //  12  a C2 error response arrived, but not the MTP sidecar refusal that
 //      `--expect-worker-mtp` asserts; the run still failed closed, but it did
 //      not fail for the injected reason
+//  13  the collective byte sequence rank 0 ISSUED for a member's prefill
+//      differs from the sequence `PlanPrefill` PREDICTED from the chunking;
+//      the executed and reported prefill forward counts disagree, so the
+//      lockstep would not mirror the worker
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -234,6 +274,24 @@ constexpr std::uint64_t kMinMemberId = 1;
 /// (tp_cohort_plan.cpp), and the C2 envelope carries no sampling fields, so
 /// both roles decode greedily.
 constexpr float kGreedyTemperature = 0.0F;
+/// First id `--prompt-tokens-N` emits. The band is deliberately LOW: the head
+/// of a byte-level BPE vocabulary is ordinary text bytes, so a synthetic prompt
+/// stays well conditioned instead of probing arbitrary embedding rows, and the
+/// walk starts at 1 rather than 0.
+constexpr std::int32_t kSyntheticFirstToken = 1;
+/// `--prompt-tokens-N` walks the low band with this stride. It is coprime with
+/// `kSyntheticSpan` (512) so the sequence visits every id in the band before it
+/// repeats, which keeps a long synthetic prompt from degenerating into a
+/// trivially periodic one.
+constexpr std::size_t kSyntheticStride = 5;
+/// Width of the low band `--prompt-tokens-N` walks. Clamped to `vocab - 1` at
+/// run time so the emitted ids are always inside the embedding.
+constexpr std::size_t kSyntheticSpan = 512;
+/// Member m's synthetic prompt starts this far into the walk, so the two
+/// members carry DIFFERENT prompts of equal length: the C2 digests stay
+/// distinguishable and a mixed cohort (one short member, one long member) is
+/// expressible without a second mechanism.
+constexpr std::size_t kSyntheticMemberOffset = 11;
 /// `run_worker` reports rank 0's exit as a closed channel (tp_control.cpp
 /// `RecvAll`). That is the one worker stop that is not a rank-1 failure.
 constexpr std::string_view kPeerClosedChannel =
@@ -269,6 +327,13 @@ enum ExitReason {
   /// asserts. Every refusal shares exit 7, so without this the third mode could
   /// not tell its own verdict from any other refusal.
   kC2ErrorReasonMismatch = 12,
+  /// The prefill byte sequence rank 0 actually ISSUED for a member differs from
+  /// the sequence `PlanPrefill` PREDICTED from the chunking. The two sides
+  /// would not mirror each other, and a driver that reported the prediction as
+  /// if it were the observation would turn that desync into a silent pass, so
+  /// it is its own hard failure rather than a transport error or a logged
+  /// warning.
+  kCollectiveTraceDesync = 13,
 };
 
 /// Milliseconds elapsed since process start.
@@ -354,6 +419,21 @@ Rank-zero options (ignored by rank1):
   --prompt-1 TEXT         Member 1 prompt (default: a planet question)
   --prompt-file-0 PATH    Read member 0's prompt from a file instead
   --prompt-file-1 PATH    Read member 1's prompt from a file instead
+  --prompt-tokens-0 N     Synthesize member 0's prompt as exactly N token ids
+                          instead of tokenizing text. Refused together with
+                          --prompt-0 or --prompt-file-0 for the same member.
+  --prompt-tokens-1 N     The same for member 1.
+                          This is how a prompt longer than one prefill chunk is
+                          exercised: a synthetic sequence has an EXACT token
+                          count, so the chunking, the plan digest and the
+                          collective byte sequence are all reproducible, which
+                          prose cannot promise (one edit of the vocabulary can
+                          change a text prompt's token count). Ids are walked
+                          from 1 with stride 5 across the first 512 ids of the
+                          vocabulary, member 1 starting 11 steps in, skipping
+                          any id the model reports as a stop token. Set only one
+                          member for a mixed cohort: one single-chunk and one
+                          multi-chunk member inside the same collective scope.
   --tp-scope-override N   Fault injection: bind collective scope N instead of
                           --sequence, while still sending a command whose
                           sequence is --sequence. N must be nonzero and must
@@ -457,8 +537,17 @@ Limits and hazards:
     "Operation now in progress" connect failure on rank 1.
   * The RDMA adapter maps fixed IOVA windows, so the two roles must run on
     separate hosts with no other RDMA process on either.
-  * Each prompt must fit one prefill chunk (<= PrefillCapacity, which is
-    min(2048, context)); a longer prompt is refused before any collective.
+  * A prompt MAY span several prefill chunks. It is prefilled in
+    ceil(tokens / PrefillCapacity) forwards of min(capacity, remaining) rows,
+    and PrefillCapacity is min(2048, --context), so a prompt longer than
+    min(2048, context) is the case this exercises. Use --prompt-tokens-0/-1
+    for it: the token count must be exact for the plan digest and the chunk
+    arithmetic to be reproducible, and a text prompt's count is only known
+    after the model is loaded.
+  * Prompt + budget must fit the negotiated --context. For a --prompt-tokens
+    value that is checked at t=0 ms, before any RDMA peer exists; for a text or
+    file prompt it can only be checked after the model is loaded, because the
+    token count is not known until then.
   * Start rank 0 first and rank 1 within 30 s of it: the RDMA bootstrap polls
     for 30 s on both sides, then gives up. rank 0 sends the cohort as soon as
     its OWN model is loaded, so rank 1 must be loaded before rank 0's first
@@ -472,6 +561,32 @@ Limits and hazards:
     --expect-c2-error only removes rank 0's collectives, and a response
     without an error in that mode is itself an envelope mismatch (exit 4).
 
+Reading a long-prompt run (the collective byte sequence is CHUNKED):
+  Rank 0 prints, per member, the prefill it PREDICTED and then the prefill it
+  ISSUED. A run is only a PASS when the two agree; a divergence is exit 13 and
+  the log names the first index at which they differ. With L the layer count
+  and H the hidden size the "model loaded" line reports, C the capacity and
+  r0..rk-1 the chunk row counts:
+    [c2-probe rank0 t=Nms] member 0 prefill plan: <P>t in <k> forward(s) of
+        [<r0>,...,<rk-1>] rows, capacity <C>, <k*L> collectives of
+        [<r0*H*4>B xL, ..., <rk-1*H*4>B xL]
+    [c2-probe rank0 t=Nms] member 0 prefill complete: <P>t in <k> forward(s),
+        <k*L> collectives
+    [c2-probe rank0 t=Nms] member 0 prefill issued: <k*L> collectives of
+        [<r0*H*4>B xL, ..., <rk-1*H*4>B xL]
+  Read the three in that order, and read the byte RUNS rather than the counts
+  alone:
+    * one run of L collectives per chunk, chunk order preserved, and only the
+      LAST run shorter than C. A single-chunk prompt is the degenerate case:
+      one run of L collectives of P*H*4 bytes.
+    * a decode forward is L collectives of H*4 bytes, so the member line's
+      collectives= is (k + A) * L for A decode forwards.
+    * a shortened final chunk is NORMAL and is not a desync; a different
+      NUMBER of runs, or a different run length, is.
+    * a 30 s gap between "prefill plan" and "prefill complete" is a stalled
+      collective, not a slow prompt: the chunk count does not change the
+      per-collective timeout.
+
 Exit reasons:
   0 pass   1 transport/model/execution failure   2 arguments
   3 reserved (the unimplemented rank-1 role was retired)
@@ -483,6 +598,9 @@ Exit reasons:
   12 a C2 error response arrived, but not the MTP sidecar refusal that
     --expect-worker-mtp asserts (the mode still failed closed, for another
     reason: another refusal, or a changed production message)
+  13 the prefill collective byte sequence rank 0 issued for a member differs
+    from the one the prefill chunking predicted, so the executed and reported
+    forward counts disagree and the lockstep would not mirror the worker
   the --tp-scope-override verdict is 1 on rank 0 and 1 on rank 1
   mode 3 also exits 0 on rank 1, like mode 1, and 7 on rank 0; a handshake
   disagreement (rank 1 --mtp-model without rank 0 --expect-worker-mtp, or
@@ -533,6 +651,73 @@ private:
   std::shared_ptr<q::rocm::Communicator> communicator_;
   const std::uint64_t scope_id_;
   bool bound_{false};
+};
+
+/// Records the byte size of every collective rank 0 issues, while a recording
+/// window is open.
+///
+/// `Model::Load` wires the executor's all-reduce callback to this object's
+/// `AllReduceSum` (engine.cpp:199-202) and the callback is the ONLY route from
+/// a forward to the wire, so the sizes collected here ARE the byte sequence the
+/// peer sees. That is the point: the prefill chunking is a prediction, and a
+/// prediction the probe also reports as its own result is a prediction it can
+/// be wrong about silently. Recording makes the prediction checkable, and a
+/// divergence is reported at the first offending index instead of surfacing as
+/// an unattributable collective timeout.
+///
+/// Every method delegates, so the wire behaviour is exactly the inner
+/// communicator's; the decorator adds no collective and drops none. No lock:
+/// the executor invokes the callback on the caller's stream, and the probe
+/// drives one model from one thread.
+class CollectiveTrace : public q::rocm::Communicator {
+public:
+  explicit CollectiveTrace(std::shared_ptr<q::rocm::Communicator> inner)
+      : inner_(std::move(inner)) {}
+
+  [[nodiscard]] std::uint32_t rank() const noexcept override {
+    return inner_->rank();
+  }
+  [[nodiscard]] std::uint32_t world_size() const noexcept override {
+    return inner_->world_size();
+  }
+  [[nodiscard]] int device_index() const noexcept override {
+    return inner_->device_index();
+  }
+  [[nodiscard]] bool BeginOperation(std::uint64_t scope_id,
+                                    std::string* error) override {
+    return inner_->BeginOperation(scope_id, error);
+  }
+  [[nodiscard]] bool EndOperation(std::uint64_t scope_id,
+                                  std::string* error) override {
+    return inner_->EndOperation(scope_id, error);
+  }
+  bool AllReduceSum(float* data, std::size_t bytes, hipStream_t stream,
+                    std::string* error) override {
+    if (recording_) {
+      sizes_.push_back(bytes);
+    }
+    return inner_->AllReduceSum(data, bytes, stream, error);
+  }
+
+  /// Starts a recording window. The prefill is the only window the probe opens:
+  /// it is the phase whose chunking is predicted, and its length is bounded by
+  /// `ceil(context / PrefillCapacity) * num_layers` entries, so nothing here
+  /// grows with the token budget.
+  void BeginRecording() {
+    sizes_.clear();
+    recording_ = true;
+  }
+  /// Closes the window and returns the byte size of every collective issued
+  /// inside it, in order.
+  [[nodiscard]] std::vector<std::size_t> EndRecording() {
+    recording_ = false;
+    return sizes_;
+  }
+
+private:
+  std::shared_ptr<q::rocm::Communicator> inner_;
+  std::vector<std::size_t> sizes_;
+  bool recording_{false};
 };
 
 bool ParseUint(std::string_view text, std::uint32_t* value) {
@@ -597,11 +782,167 @@ std::string TokensText(std::span<const std::int32_t> tokens) {
   return text;
 }
 
+/// Row counts of the forwards one `Session::Sync` issues for `prompt_tokens`.
+///
+/// `Session::Feed` advances by `exec.max_batch` in
+/// `min(exec.max_batch, remaining)` row steps (engine.cpp:599-620) and
+/// `Model::Load` sets `exec.max_batch = PrefillCapacity()` (engine.cpp:190), so
+/// a fresh session prefills `P` tokens in exactly `ceil(P / PrefillCapacity)`
+/// forwards. The worker's Qwen Flash-Next `Prefill` caps `consumed` at the same
+/// `PrefillCapacity` and re-`Sync`s the cumulative prefix, whose common-prefix
+/// skip feeds exactly those new tokens (inference_backend.cpp:2646-2672), so it
+/// issues the same forwards with the same row counts in the same order. The
+/// probe's runner pool holds one runner, so the lone resident prefill is
+/// unbounded (`bounded_prefill` is false at
+/// text_generation_scheduler.cpp:568-572) and no decode interleaves the chunks.
+///
+/// `capacity` is at least 1: it is `min(2048, max_context)` of a model that
+/// loaded with the nonzero `--context` the probe validated. The loop advances
+/// by `capacity`, so that is also the precondition for its termination.
+std::vector<std::size_t> PrefillChunkRows(std::size_t prompt_tokens,
+                                          std::uint32_t capacity) {
+  std::vector<std::size_t> rows;
+  for (std::size_t fed = 0; fed < prompt_tokens; fed += capacity) {
+    rows.push_back(std::min<std::size_t>(capacity, prompt_tokens - fed));
+  }
+  return rows;
+}
+
+/// What the prefill chunking says one member will cost.
+///
+/// This is the PREDICTION, computed once from the token count and the model's
+/// own `PrefillCapacity`, before the command is sent. `MemberTrace` carries the
+/// observation; the two are compared in `main` and a divergence is exit 13.
+struct MemberPlan {
+  std::size_t prompt_tokens{0};
+  std::uint32_t capacity{0};
+  /// Rows per forward, in chunk order. Every entry but the last is `capacity`.
+  std::vector<std::size_t> chunk_rows;
+  /// `ceil(prompt_tokens / capacity)`, the number of prefill forwards.
+  std::size_t prefill_forwards{0};
+  /// The predicted byte size of every prefill collective, in order:
+  /// `num_layers` copies of `rows * hidden_size * 4` per chunk.
+  std::vector<std::size_t> expected_sizes;
+};
+
+MemberPlan PlanPrefill(std::size_t prompt_tokens, std::uint32_t capacity,
+                       const q::Config& config) {
+  MemberPlan plan;
+  plan.prompt_tokens = prompt_tokens;
+  plan.capacity = capacity;
+  plan.chunk_rows = PrefillChunkRows(prompt_tokens, capacity);
+  plan.prefill_forwards = plan.chunk_rows.size();
+  plan.expected_sizes.reserve(plan.prefill_forwards * config.num_layers);
+  const std::size_t row_bytes =
+      static_cast<std::size_t>(config.hidden_size) * sizeof(float);
+  for (const std::size_t rows : plan.chunk_rows) {
+    for (std::size_t layer = 0; layer < config.num_layers; ++layer) {
+      plan.expected_sizes.push_back(rows * row_bytes);
+    }
+  }
+  return plan;
+}
+
+/// `2048, 952`, the per-forward row counts, comma separated.
+std::string ChunkRowsText(const std::vector<std::size_t>& rows) {
+  std::string text;
+  for (const std::size_t value : rows) {
+    if (!text.empty()) {
+      text.push_back(',');
+    }
+    text += std::to_string(value);
+  }
+  return text.empty() ? "<none>" : text;
+}
+
+/// `65536B x48, 30464B x48`, the collective byte sequence run-length encoded.
+///
+/// Run length is what makes a chunked trace readable: one run of `num_layers`
+/// collectives per forward, so the reader counts forwards and sees a shortened
+/// final run directly, instead of comparing two long integer lists.
+std::string ByteRunsText(const std::vector<std::size_t>& sizes) {
+  std::string text;
+  for (std::size_t index = 0; index < sizes.size();) {
+    std::size_t run = index;
+    while (run < sizes.size() && sizes[run] == sizes[index]) {
+      ++run;
+    }
+    if (!text.empty()) {
+      text += ", ";
+    }
+    text += std::to_string(sizes[index]) + "B x" + std::to_string(run - index);
+    index = run;
+  }
+  return text.empty() ? "<none>" : text;
+}
+
+/// Index of the first position where the observed and predicted collective byte
+/// sequences differ, or the shorter length when one is a prefix of the other.
+std::size_t FirstSizeDifference(std::span<const std::size_t> expected,
+                                std::span<const std::size_t> actual) {
+  const std::size_t shared = std::min(expected.size(), actual.size());
+  for (std::size_t index = 0; index < shared; ++index) {
+    if (expected[index] != actual[index]) {
+      return index;
+    }
+  }
+  return shared;
+}
+
+/// The synthetic prompt `--prompt-tokens-N` asks for: exactly `count` ids,
+/// deterministic, and different for each member.
+///
+/// A synthetic sequence is what makes a long-prompt run reproducible. A text
+/// prompt's token count is a property of the vocabulary, so the same
+/// `--prompt-0` can produce a different id count -- and therefore a different
+/// chunk count, a different plan digest and a different byte sequence -- on any
+/// vocabulary change, and the probe could no longer claim to have exercised a
+/// multi-chunk prefill at all. The ids stay inside a low band of real
+/// byte-level tokens so the embeddings are well conditioned, and an id the
+/// model reports as a stop token is stepped over rather than dropped, because
+/// the count is the contract.
+std::vector<std::int32_t> SyntheticPrompt(const q::Model& model,
+                                          std::size_t count,
+                                          std::size_t member) {
+  const std::size_t vocab = model.VocabSize();
+  if (vocab <= static_cast<std::size_t>(kSyntheticFirstToken)) {
+    // No usable id. An empty prompt is refused by the caller, which is the same
+    // exit the tokenizer path reports for an empty prompt, so there is no
+    // unrepresentable case left.
+    return {};
+  }
+  // Clamped so the walk stays inside the embedding: the largest id it can
+  // produce is `kSyntheticFirstToken + span - 1`, and `span <= vocab - 1`.
+  const std::size_t span = std::min(kSyntheticSpan, vocab - 1);
+  const std::size_t offset = member * kSyntheticMemberOffset;
+  std::vector<std::int32_t> tokens;
+  tokens.reserve(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    std::size_t id =
+        kSyntheticFirstToken + ((index + offset) * kSyntheticStride) % span;
+    // Step over a stop id rather than dropping the position: the count is the
+    // contract. `id + 1 < vocab` keeps the walk from ever naming an id at or
+    // past the end of the embedding.
+    while (id + 1 < vocab && model.IsStopToken(static_cast<std::int32_t>(id))) {
+      ++id;
+    }
+    tokens.push_back(static_cast<std::int32_t>(id));
+  }
+  return tokens;
+}
+
 /// The collective trace rank 0 issued for one member, kept for the report.
+///
+/// `prefill_sizes` is an OBSERVATION: the byte size of every collective
+/// `CollectiveTrace` saw rank 0 issue during this member's prefill, in order.
+/// `prefill_forwards` is derived from that observation and from nothing else,
+/// so it can disagree with `MemberPlan::prefill_forwards` -- which is the
+/// point.
 struct MemberTrace {
   std::vector<std::int32_t> tokens;
   std::size_t prefill_forwards{0};
   std::size_t decode_forwards{0};
+  std::vector<std::size_t> prefill_sizes;
   bool stopped_on_token{false};
   bool stopped_on_budget{false};
 };
@@ -623,35 +964,56 @@ std::size_t FirstDifference(std::span<const std::int32_t> expected,
 /// issued. Returns false only on a local execution failure, which is a
 /// transport-level probe failure rather than a contract mismatch.
 ///
-/// The body mirrors one worker member: `Sync` (one prefill forward), then the
-/// `SelectNext`/`Advance` alternation with the length-limit short circuit.
-/// The prefill boundary is logged separately from the member completion so a
-/// stall can be attributed to the prefill collective rather than to the decode
-/// alternation or to model-load skew.
+/// The body mirrors one worker member: one `Sync` for the whole prompt, which
+/// the model chunks into `ceil(P / PrefillCapacity)` forwards, then the
+/// `SelectNext`/`Advance` alternation with the length-limit short circuit. The
+/// prefill boundary is logged separately from the member completion so a stall
+/// can be attributed to the prefill collective rather than to the decode
+/// alternation or to model-load skew, and the prefill's byte sequence is
+/// observed rather than assumed so the chunk arithmetic stays checkable.
 bool RunMember(const char* role, std::size_t index,
-               const std::shared_ptr<q::Model>& model,
-               std::vector<std::int32_t> prompt, std::uint32_t budget,
-               std::uint32_t context, MemberTrace* trace, std::string* error) {
+               const std::shared_ptr<q::Model>& model, const MemberPlan& plan,
+               std::span<const std::int32_t> prompt, std::uint32_t budget,
+               std::uint32_t context, CollectiveTrace& collectives,
+               MemberTrace* trace, std::string* error) {
   auto session = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
                                       context, error);
   if (!session) {
     return false;
   }
-  // `Sync` keeps the common prefix and feeds the rest, so a fresh session
-  // prefills the whole prompt in ceil(P / PrefillCapacity) forwards. The
-  // worker admits members one at a time at capacity 1, so its single resident
-  // prefill is also unbounded and chunks identically.
-  const std::size_t prefill_chunks =
-      (prompt.size() + model->PrefillCapacity() - 1) / model->PrefillCapacity();
+  // Reported BEFORE the prefill: the whole point of the plan line is that a
+  // reader holding a stalled run can see what was promised for the collectives
+  // that never completed.
+  Say(role, "member " + std::to_string(index) +
+                " prefill plan: " + std::to_string(plan.prompt_tokens) +
+                "t in " + std::to_string(plan.prefill_forwards) +
+                " forward(s) of [" + ChunkRowsText(plan.chunk_rows) +
+                "] rows, capacity " + std::to_string(plan.capacity) + ", " +
+                std::to_string(plan.expected_sizes.size()) +
+                " collectives of [" + ByteRunsText(plan.expected_sizes) + "]");
+  collectives.BeginRecording();
   if (!session->Sync(prompt, error)) {
+    // The window is still closed: a failed prefill is reported by the caller as
+    // a transport failure, and leaving it open would fold a later phase's
+    // collectives into this member's trace.
+    (void)collectives.EndRecording();
     return false;
   }
-  trace->prefill_forwards = prefill_chunks;
-  Say(role, "member " + std::to_string(index) +
-                " prefill complete: " + std::to_string(prompt.size()) +
-                "t in " + std::to_string(prefill_chunks) + " forward(s), " +
-                std::to_string(prefill_chunks * model->config().num_layers) +
-                " collectives");
+  // The forward count is read off the observed sequence: a forward is exactly
+  // `num_layers` collectives of one row count (executor.cpp:2013-2050), so the
+  // count is the number of collectives divided by the layer count, and the
+  // sizes are checked against the prediction afterwards rather than here.
+  const std::size_t num_layers = model->config().num_layers;
+  trace->prefill_sizes = collectives.EndRecording();
+  trace->prefill_forwards =
+      num_layers == 0 ? 0 : trace->prefill_sizes.size() / num_layers;
+  Say(role, "member " + std::to_string(index) + " prefill complete: " +
+                std::to_string(prompt.size()) + "t in " +
+                std::to_string(trace->prefill_forwards) + " forward(s), " +
+                std::to_string(trace->prefill_sizes.size()) + " collectives");
+  Say(role, "member " + std::to_string(index) + " prefill issued: " +
+                std::to_string(trace->prefill_sizes.size()) +
+                " collectives of [" + ByteRunsText(trace->prefill_sizes) + "]");
 
   const gufo::sampling::SamplingConfig sampling{
       .temperature = kGreedyTemperature,
@@ -890,6 +1252,14 @@ int main(int argc, char** argv) {
                                       "The largest planet in the solar "
                                       "system is"};
   std::string prompt_file[kMemberCount];
+  /// Whether `--prompt-N` was given for a member, so a default text prompt is
+  /// not mistaken for a requested one when `--prompt-tokens-N` is also present.
+  bool prompt_given[kMemberCount] = {false, false};
+  /// `--prompt-tokens-N`: synthesize this member's prompt as exactly N token
+  /// ids instead of tokenizing text. This is the only way to ask for a prompt
+  /// whose length is known before the model is loaded, which is what makes a
+  /// multi-chunk prefill exact and its context check free.
+  std::optional<std::uint32_t> prompt_tokens[kMemberCount];
   std::uint64_t cohort_id = 1;
   std::uint64_t sequence = 1;
   std::uint64_t member_id[kMemberCount] = {1, 2};
@@ -960,12 +1330,36 @@ int main(int argc, char** argv) {
       }
     } else if (arg == "--prompt-0") {
       prompt[0] = next();
+      prompt_given[0] = true;
     } else if (arg == "--prompt-1") {
       prompt[1] = next();
+      prompt_given[1] = true;
     } else if (arg == "--prompt-file-0") {
       prompt_file[0] = next();
     } else if (arg == "--prompt-file-1") {
       prompt_file[1] = next();
+    } else if (arg == "--prompt-tokens-0" || arg == "--prompt-tokens-1") {
+      // One parse branch for both members: the value is a token COUNT, so the
+      // name carries the member and nothing else in the argument is read.
+      const std::size_t index = arg == "--prompt-tokens-0" ? 0 : 1;
+      std::uint32_t parsed = 0;
+      if (!ParseUint(next(), &parsed)) {
+        // A missing, negative, trailing-garbage or non-numeric value all land
+        // here. None of them is a count, and none may fall back to the text
+        // prompt: that would silently prefill a length nobody asked for.
+        Warn(arg + " requires an unsigned token count");
+        return kInvalidArguments;
+      }
+      if (parsed == 0) {
+        // Refused rather than clamped: a zero-length prompt is refused by
+        // `Session::Sync` and by `ValidateMemberRequest`, and a silent clamp
+        // would report a prefill of a length nobody asked for.
+        Warn(arg +
+             " must be at least 1 token; a zero-token prompt is refused "
+             "by both Sync and the C2 member validation");
+        return kInvalidArguments;
+      }
+      prompt_tokens[index] = parsed;
     } else if (arg == "--tp-bootstrap-port") {
       if (!ParsePort(next(), &bootstrap_port)) {
         Warn("--tp-bootstrap-port is out of range");
@@ -1058,6 +1452,16 @@ int main(int argc, char** argv) {
         "required");
     return kInvalidArguments;
   }
+  // The budget against the context, on BOTH roles and here rather than after
+  // the model load: a budget that cannot fit the context is an argument
+  // mistake, and discovering it after a 30 s RDMA rendezvous and a 30 s model
+  // load wastes both. It is also the outer bound of the prompt-plus-budget
+  // check below, so it is checked once, in the cheapest place.
+  if (budget > context) {
+    Warn("--max-tokens " + std::to_string(budget) +
+         " exceeds the negotiated --context " + std::to_string(context));
+    return kInvalidArguments;
+  }
   if (cohort_id == 0 || sequence == 0) {
     Warn("--cohort-id and --sequence must both be nonzero");
     return kInvalidArguments;
@@ -1094,7 +1498,36 @@ int main(int argc, char** argv) {
   // empty prompt and only rank 0 can inject the scope override.
   if (role == "rank0") {
     for (std::size_t index = 0; index < kMemberCount; ++index) {
-      if (prompt[index].empty()) {
+      const std::string option = "--prompt-tokens-" + std::to_string(index);
+      // Two sources for one member's prompt is an argument mistake, not a
+      // precedence question: whichever won silently, the run would exercise a
+      // prompt the operator did not ask for and report a verdict about it.
+      if (prompt_tokens[index].has_value() &&
+          (prompt_given[index] || !prompt_file[index].empty())) {
+        Warn(option + " cannot be combined with --prompt-" +
+             std::to_string(index) + " or --prompt-file-" +
+             std::to_string(index) +
+             "; a member has exactly one prompt, and only the token count is "
+             "exact before the model is loaded");
+        return kInvalidArguments;
+      }
+      // A synthetic prompt's length is known here, so the context check runs
+      // BEFORE any RDMA or control peer is touched: an over-long request costs
+      // 0 ms instead of a 30 s rendezvous and a 30 s model load. A text or
+      // file prompt cannot be checked here and is checked after the load, where
+      // its token count first exists.
+      if (prompt_tokens[index].has_value() &&
+          static_cast<std::uint64_t>(*prompt_tokens[index]) + budget >
+              context) {
+        Warn("member " + std::to_string(index) + " " + option + " " +
+             std::to_string(*prompt_tokens[index]) + " plus --max-tokens " +
+             std::to_string(budget) + " (" +
+             std::to_string(static_cast<std::uint64_t>(*prompt_tokens[index]) +
+                            budget) +
+             ") exceeds the negotiated --context " + std::to_string(context));
+        return kInvalidArguments;
+      }
+      if (!prompt_tokens[index].has_value() && prompt[index].empty()) {
         Warn("member " + std::to_string(index) + " has an empty prompt");
         return kInvalidArguments;
       }
@@ -1131,6 +1564,20 @@ int main(int argc, char** argv) {
           "collective and wait only for the C2 error response");
       return kInvalidArguments;
     }
+  }
+
+  // The synthetic prompt count is a rank-zero concept: rank 1 serves whatever
+  // rank 0 sends and never builds a cohort, so the flag would be inert there.
+  // Refused rather than ignored, for the same reason `--mtp-model` is refused
+  // on rank 0.
+  if (role == "rank1" &&
+      (prompt_tokens[0].has_value() || prompt_tokens[1].has_value())) {
+    Warn(
+        "--prompt-tokens-0/1 are rank-zero options: rank 1 hosts the worker "
+        "and "
+        "only serves the cohort rank 0 sends, so it has no prompt of its own "
+        "to synthesize");
+    return kInvalidArguments;
   }
 
   // Sidecar fault injection, validated on BOTH roles and before any RDMA or
@@ -1224,6 +1671,11 @@ int main(int argc, char** argv) {
     Warn("RDMA communicator failed: " + error);
     return kTransportFailure;
   }
+  // The model is loaded over the decorator, not the raw peer, so every
+  // collective rank 0 issues is counted and its byte size is observable. The
+  // scope bind below goes through the same object, and both delegate, so the
+  // wire behaviour is exactly the inner communicator's.
+  auto collectives = std::make_shared<CollectiveTrace>(std::move(communicator));
   Say("rank0", "RDMA peer established on bootstrap port " +
                    std::to_string(bootstrap_port));
 
@@ -1281,7 +1733,7 @@ int main(int argc, char** argv) {
       .tp_rank = 0,
       .tp_world_size = 2,
       .hip_device = static_cast<int>(device),
-      .communicator = communicator,
+      .communicator = collectives,
   };
   auto model = q::Model::Load(model_path, options, &error);
   if (!model) {
@@ -1299,32 +1751,39 @@ int main(int argc, char** argv) {
           " context=" + std::to_string(context));
 
   // 4. Build the two members and reject anything the worker would refuse
-  //    before a single collective is issued.
-  if (budget > context) {
-    Warn("--max-tokens exceeds --context");
-    return kInvalidArguments;
-  }
+  //    before a single collective is issued. `--max-tokens` against `--context`
+  //    was already checked before the rendezvous; what is left here needs the
+  //    loaded model, because only now does a prompt's token count exist.
   std::vector<std::int32_t> member_prompt[kMemberCount];
+  MemberPlan plan[kMemberCount];
   for (std::size_t index = 0; index < kMemberCount; ++index) {
-    member_prompt[index] = model->Tokenize(prompt[index]);
+    if (prompt_tokens[index].has_value()) {
+      // Exact count by construction, so no tokenizer round trip and no
+      // dependency on the vocabulary: the same flag yields the same ids, the
+      // same plan digest and the same byte sequence on every run.
+      member_prompt[index] =
+          SyntheticPrompt(*model, *prompt_tokens[index], index);
+    } else {
+      member_prompt[index] = model->Tokenize(prompt[index]);
+    }
     if (member_prompt[index].empty()) {
       Warn("member " + std::to_string(index) + " prompt tokenized empty");
       return kInvalidArguments;
     }
-    if (member_prompt[index].size() > model->PrefillCapacity()) {
-      Warn("member " + std::to_string(index) + " prompt has " +
-           std::to_string(member_prompt[index].size()) +
-           " tokens and needs more than one prefill chunk (capacity " +
-           std::to_string(model->PrefillCapacity()) +
-           "); a multi-chunk prefill is not mirrored by this probe");
-      return kInvalidArguments;
-    }
+    // A prompt MAY span chunks. `PrefillCapacity` is what splits it, the worker
+    // splits it identically, and `RunMember` reports the byte sequence it
+    // actually issued so that claim is checked rather than assumed.
     if (member_prompt[index].size() + budget >
         static_cast<std::size_t>(context)) {
-      Warn("member " + std::to_string(index) +
-           " prompt plus budget exceeds the negotiated context");
+      Warn("member " + std::to_string(index) + " prompt has " +
+           std::to_string(member_prompt[index].size()) +
+           " tokens, plus --max-tokens " + std::to_string(budget) + " (" +
+           std::to_string(member_prompt[index].size() + budget) +
+           ") exceeds the negotiated context " + std::to_string(context));
       return kInvalidArguments;
     }
+    plan[index] = PlanPrefill(member_prompt[index].size(),
+                              model->PrefillCapacity(), model->config());
   }
 
   server::TpControlCommand command;
@@ -1365,7 +1824,7 @@ int main(int argc, char** argv) {
   //    the normal sequence, so rank 1's worker binds `command.sequence` and the
   //    first `AllReduceSum` header exchange must fail identity validation.
   const std::uint64_t bound_scope = scope_override.value_or(command.sequence);
-  OperationScope operation(communicator, bound_scope);
+  OperationScope operation(collectives, bound_scope);
   if (!operation.Begin(&error)) {
     Warn("collective scope bind failed: " + error);
     return kTransportFailure;
@@ -1412,8 +1871,8 @@ int main(int argc, char** argv) {
   MemberTrace trace[kMemberCount];
   for (std::size_t index = 0; index < kMemberCount && !expect_c2_error;
        ++index) {
-    if (!RunMember("rank0", index, model, member_prompt[index], budget, context,
-                   &trace[index], &error)) {
+    if (!RunMember("rank0", index, model, plan[index], member_prompt[index],
+                   budget, context, *collectives, &trace[index], &error)) {
       Warn("member " + std::to_string(index) +
            " local execution failed: " + error);
       if (scope_override.has_value()) {
@@ -1425,6 +1884,44 @@ int main(int argc, char** argv) {
              "communicators; this run must fail closed, never pass");
       }
       return kTransportFailure;
+    }
+    // The hard desync check, BEFORE the member line reports a contract. The
+    // prediction and the observation are independent: the plan came from the
+    // token count and `PrefillCapacity`, the trace came from the wire. A
+    // difference means rank 0's lockstep would not mirror the worker, so the
+    // run is a failure in its own right and the member line below, which
+    // asserts what the worker must mirror, must not be printed. The two common
+    // causes are a `Feed` that no longer chunks at `PrefillCapacity` and a
+    // `PrefillCapacity` that is not `exec.max_batch`; the log names the first
+    // differing index so either is one glance away.
+    if (trace[index].prefill_forwards != plan[index].prefill_forwards ||
+        trace[index].prefill_sizes != plan[index].expected_sizes) {
+      const std::size_t at = FirstSizeDifference(plan[index].expected_sizes,
+                                                 trace[index].prefill_sizes);
+      const std::string expected =
+          at < plan[index].expected_sizes.size()
+              ? std::to_string(plan[index].expected_sizes[at])
+              : "end-of-trace";
+      const std::string observed =
+          at < trace[index].prefill_sizes.size()
+              ? std::to_string(trace[index].prefill_sizes[at])
+              : "end-of-trace";
+      Warn("member " + std::to_string(index) +
+           " prefill trace desync: rank 0 issued " +
+           std::to_string(trace[index].prefill_forwards) + " forward(s) of " +
+           std::to_string(trace[index].prefill_sizes.size()) +
+           " collectives [" + ByteRunsText(trace[index].prefill_sizes) +
+           "], but the chunking of " +
+           std::to_string(plan[index].prompt_tokens) + "t at capacity " +
+           std::to_string(plan[index].capacity) + " predicted " +
+           std::to_string(plan[index].prefill_forwards) + " forward(s) of " +
+           std::to_string(plan[index].expected_sizes.size()) +
+           " collectives [" + ByteRunsText(plan[index].expected_sizes) +
+           "]; they first differ at collective " + std::to_string(at) +
+           " (expected " + expected + "B, observed " + observed +
+           "B), so the lockstep would NOT mirror the worker and this run is "
+           "not a pass");
+      return kCollectiveTraceDesync;
     }
     const std::size_t forwards =
         trace[index].prefill_forwards + trace[index].decode_forwards;
