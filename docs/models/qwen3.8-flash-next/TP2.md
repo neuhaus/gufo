@@ -141,8 +141,8 @@ python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
 ```
 
 The qualified d4096 probe reused 4095 cached prompt tokens and prefilled 2043
-new tokens. MTP d4096 measured 32.94 tok/s mixed and 39.81 tok/s repetitive;
-these remain experimental results, not published cells.
+new tokens. Clean-source MTP d4096 measured 32.57 tok/s mixed and 39.49 tok/s
+repetitive; these remain experimental results, not published cells.
 
 For the C1 corpus path, use an experiment configuration whose selected
 `multi-ar`/`multi-mtp` concurrency is `[1]`; the driver forces
