@@ -386,6 +386,15 @@ Step-2 spike:
                           token agreement and schedule agreement. The scope id
                           is a constant both sides bind by construction, so a
                           run is only comparable when BOTH ranks pass this flag.
+  --serial-w2             The serial baseline for --batched-w2: the same
+                          program, but each decode step advances the included
+                          members one at a time. Both modes print decode_ms and
+                          ms_per_step, so the pair measures what batching buys.
+                          BOTH ranks must pass the same mode flag.
+  --allreduce-bench N     Load no model: time N all-reduces each of 1, 2 and 8
+                          decode rows and one 512-row prefill chunk, and print
+                          min/p50/mean/p99 microseconds per collective. BOTH
+                          ranks must pass the same N.
 
 Rank-one options:
   --tp-bootstrap-host HOST  REQUIRED for rank1. Rank 0's address, used for the
@@ -1100,11 +1109,16 @@ std::string TokenListText(std::span<const std::int32_t> tokens) {
 /// member that stops early drops out of later batches -- and if the ranks ever
 /// disagreed about that, the byte counts would diverge and the run would have
 /// to fail closed rather than quietly continue.
+///
+/// `serial` is the baseline for the same program: each step advances the
+/// included members one at a time instead of in one two-row forward, so a
+/// batched and a serial run differ only in batching. Both report the decode
+/// time spent in the advances alone, excluding sampling and logging.
 int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
                  const std::vector<std::int32_t> (&prompt)[kMemberCount],
                  std::uint32_t budget, std::uint32_t context,
                  const std::shared_ptr<CollectiveTrace>& collectives,
-                 std::string* error) {
+                 bool serial, std::string* error) {
   // Both ranks bind the same scope id. Nothing on the wire negotiates it in
   // this mode, so it is a constant agreed by construction, and the log prints
   // it so a reader can confirm both sides bound the same value.
@@ -1134,6 +1148,14 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
   // batch form in the runner or the engine, so a width-2 program chunks member
   // 0 and then member 1. Only the DECODE advance is batched here.
   MemberTrace trace[kMemberCount];
+  // A zero-byte collective is a barrier: the ranks load the model at different
+  // speeds, and without it the first prefill collective would bill the slower
+  // load to the faster rank's prefill time.
+  if (!collectives->AllReduceSum(nullptr, 0, nullptr, error)) {
+    Warn(std::string(role) + " pre-prefill barrier failed: " + *error);
+    return kTransportFailure;
+  }
+  const auto prefill_start = std::chrono::steady_clock::now();
   collectives->BeginRecording();
   for (std::size_t index = 0; index < kMemberCount; ++index) {
     if (!session[index]->Sync(prompt[index], error)) {
@@ -1143,6 +1165,9 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
       return kTransportFailure;
     }
   }
+  const auto prefill_elapsed = std::chrono::steady_clock::now() - prefill_start;
+  const double prefill_ms =
+      std::chrono::duration<double, std::milli>(prefill_elapsed).count();
   trace[0].prefill_sizes = collectives->EndRecording();
   const std::size_t num_layers = model->config().num_layers;
   trace[0].prefill_forwards =
@@ -1153,6 +1178,13 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
                 " forward(s) of [" + ByteRunsText(trace[0].prefill_sizes) +
                 "] rows, prompt sizes " + std::to_string(prompt[0].size()) +
                 "/" + std::to_string(prompt[1].size()) + " tokens");
+  const std::size_t prefill_tokens = prompt[0].size() + prompt[1].size();
+  char prefill_timing[128];
+  std::snprintf(prefill_timing, sizeof(prefill_timing),
+                "prefill_ms=%.1f prefill_tokens=%zu prefill_tokens_per_s=%.1f",
+                prefill_ms, prefill_tokens,
+                prefill_ms <= 0.0 ? 0.0 : prefill_tokens * 1000.0 / prefill_ms);
+  Say(role, std::string("prefill timing: ") + prefill_timing);
 
   const gufo::sampling::SamplingConfig sampling{
       .temperature = kGreedyTemperature,
@@ -1166,8 +1198,13 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
   // that reaches the budget, because the distributed runner sets
   // `final_token_advance_required` false; the same short circuit is kept so the
   // two programs issue the same number of forwards.
+  std::chrono::steady_clock::duration decode_time{};
+  std::size_t timed_steps = 0;
+  std::size_t forwards = 0;
+  std::size_t advanced_tokens = 0;
   for (std::size_t step = 0; step < budget; ++step) {
     std::array<q::Session::AdvanceRequest, kMemberCount> requests;
+    std::array<std::size_t, kMemberCount> members{};
     std::size_t rows = 0;
     std::string included;
     for (std::size_t index = 0; index < kMemberCount; ++index) {
@@ -1199,6 +1236,7 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
           .session = session[index].get(),
           .token = sampled,
       };
+      members[rows] = index;
       included += static_cast<char>('a' + index);
       ++rows;
     }
@@ -1210,15 +1248,41 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
     if (rows == 0) {
       break;
     }
-    if (!q::Session::EvaluateBatch(std::span(requests).first(rows), error)) {
+    const auto step_start = std::chrono::steady_clock::now();
+    if (serial) {
+      for (std::size_t row = 0; row < rows; ++row) {
+        if (!requests[row].session->Evaluate(requests[row].token, error)) {
+          Warn(std::string(role) + " serial advance failed at step " +
+               std::to_string(step) + ": " + *error);
+          return kTransportFailure;
+        }
+      }
+    } else if (!q::Session::EvaluateBatch(std::span(requests).first(rows),
+                                          error)) {
       Warn(std::string(role) + " batched advance failed at step " +
            std::to_string(step) + ": " + *error);
       return kTransportFailure;
     }
-    for (std::size_t index = 0; index < kMemberCount; ++index) {
-      ++trace[index].decode_forwards;
+    decode_time += std::chrono::steady_clock::now() - step_start;
+    ++timed_steps;
+    forwards += serial ? rows : 1;
+    advanced_tokens += rows;
+    // Only the members in this step's advance took part in a forward.
+    for (std::size_t row = 0; row < rows; ++row) {
+      ++trace[members[row]].decode_forwards;
     }
   }
+  const double decode_ms =
+      std::chrono::duration<double, std::milli>(decode_time).count();
+  char timing[160];
+  std::snprintf(timing, sizeof(timing),
+                "decode_ms=%.1f ms_per_step=%.2f tokens_per_s=%.1f",
+                decode_ms, timed_steps == 0 ? 0.0 : decode_ms / timed_steps,
+                decode_ms <= 0.0 ? 0.0 : advanced_tokens * 1000.0 / decode_ms);
+  Say(role, std::string(serial ? "serial" : "batched") +
+                " decode: steps=" + std::to_string(timed_steps) +
+                " forwards=" + std::to_string(forwards) + " advanced_tokens=" +
+                std::to_string(advanced_tokens) + " " + timing);
 
   if (!scope.End(error)) {
     Warn(std::string(role) + " could not release batched scope: " + *error);
@@ -1234,6 +1298,83 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
             (trace[index].stopped_on_token ? " stop_token" : "") +
             (trace[index].stopped_on_budget ? " budget" : ""));
   }
+  return kOk;
+}
+
+/// `--allreduce-bench N`: times N back-to-back all-reduces per payload with no
+/// model loaded, on both ranks in lockstep. The payloads are one, two and eight
+/// Flash-Next decode rows and one 512-token prefill chunk, so the result is the
+/// bare communicator cost of a collective: stream sync, device-to-host staging,
+/// the TCP header and ack round trips, the RDMA read, the host sum and the copy
+/// back. Model compute is absent by construction.
+int RunAllReduceBench(const char* role, q::rocm::Communicator& communicator,
+                      std::uint32_t device, std::uint32_t iterations) {
+  // One Flash-Next hidden row: 2560 floats, the decode all-reduce unit.
+  constexpr std::size_t kRowBytes = 2560 * sizeof(float);
+  constexpr std::array<std::size_t, 4> kRows{1, 2, 8, 512};
+  constexpr std::uint64_t kBenchScope = 1;
+  if (hipSetDevice(static_cast<int>(device)) != hipSuccess) {
+    Warn(std::string(role) + " allreduce bench could not select the device");
+    return kTransportFailure;
+  }
+  float* data = nullptr;
+  hipStream_t stream = nullptr;
+  const std::size_t max_bytes = kRows.back() * kRowBytes;
+  if (hipMalloc(reinterpret_cast<void**>(&data), max_bytes) != hipSuccess ||
+      hipMemset(data, 0, max_bytes) != hipSuccess ||
+      hipStreamCreate(&stream) != hipSuccess) {
+    Warn(std::string(role) + " allreduce bench could not allocate buffers");
+    if (data != nullptr) {
+      (void)hipFree(data);
+    }
+    return kTransportFailure;
+  }
+  const auto release = [&] {
+    (void)hipStreamDestroy(stream);
+    (void)hipFree(data);
+  };
+  std::string error;
+  if (!communicator.BeginOperation(kBenchScope, &error)) {
+    Warn(std::string(role) + " allreduce bench scope bind failed: " + error);
+    release();
+    return kTransportFailure;
+  }
+  for (const std::size_t rows : kRows) {
+    const std::size_t bytes = rows * kRowBytes;
+    std::vector<double> micros;
+    micros.reserve(iterations);
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+      const auto start = std::chrono::steady_clock::now();
+      if (!communicator.AllReduceSum(data, bytes, stream, &error)) {
+        Warn(std::string(role) + " allreduce bench failed at " +
+             std::to_string(bytes) + " B: " + error);
+        release();
+        return kTransportFailure;
+      }
+      micros.push_back(std::chrono::duration<double, std::micro>(
+                           std::chrono::steady_clock::now() - start)
+                           .count());
+    }
+    std::sort(micros.begin(), micros.end());
+    double total = 0.0;
+    for (const double value : micros) {
+      total += value;
+    }
+    char line[192];
+    std::snprintf(line, sizeof(line),
+                  "allreduce rows=%zu bytes=%zu n=%u min_us=%.1f p50_us=%.1f "
+                  "mean_us=%.1f p99_us=%.1f",
+                  rows, bytes, iterations, micros.front(),
+                  micros[micros.size() / 2], total / micros.size(),
+                  micros[(micros.size() * 99) / 100]);
+    Say(role, line);
+  }
+  if (!communicator.EndOperation(kBenchScope, &error)) {
+    Warn(std::string(role) + " allreduce bench scope release failed: " + error);
+    release();
+    return kTransportFailure;
+  }
+  release();
   return kOk;
 }
 
@@ -1470,6 +1611,12 @@ int main(int argc, char** argv) {
   /// the only variable is whether a two-row `EvaluateBatch` keeps both ranks on
   /// one collective schedule.
   bool batched_w2 = false;
+  /// `--serial-w2`: the serial baseline for `--batched-w2`. Same sessions,
+  /// prompts, scope and stopping rules, but each step advances the included
+  /// members one at a time, so the two runs differ only in batching.
+  bool serial_w2 = false;
+  /// `--allreduce-bench N`: time N collectives per payload with no model.
+  std::uint32_t allreduce_bench = 0;
   /// Rank-one fault injection: the MTP draft sidecar to load before the
   /// handshake. Empty is the production no-MTP policy.
   std::string mtp_model_path;
@@ -1595,6 +1742,13 @@ int main(int argc, char** argv) {
       expect_c2_error = true;
     } else if (arg == "--batched-w2") {
       batched_w2 = true;
+    } else if (arg == "--serial-w2") {
+      serial_w2 = true;
+    } else if (arg == "--allreduce-bench") {
+      if (!ParseUint(next(), &allreduce_bench) || allreduce_bench == 0) {
+        Warn("--allreduce-bench requires a positive iteration count");
+        return kInvalidArguments;
+      }
     } else if (arg == "--mtp-model") {
       // An absent or empty value is a missing argument, NOT the no-sidecar
       // default, so it is refused here instead of silently dropping the fault.
@@ -1686,6 +1840,12 @@ int main(int argc, char** argv) {
     Warn("--tp-control-token is required and must be at most 4096 bytes");
     return kInvalidArguments;
   }
+  if (static_cast<int>(batched_w2) + static_cast<int>(serial_w2) +
+          static_cast<int>(allreduce_bench != 0) >
+      1) {
+    Warn("--batched-w2, --serial-w2 and --allreduce-bench are exclusive");
+    return kInvalidArguments;
+  }
   if (device > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
       gid > std::numeric_limits<std::uint8_t>::max()) {
     Warn("--tp-device or --tp-gid-index is out of range");
@@ -1763,11 +1923,12 @@ int main(int argc, char** argv) {
     }
   }
 
-  // The synthetic prompt count is a rank-zero concept: rank 1 serves whatever
-  // rank 0 sends and never builds a cohort, so the flag would be inert there.
-  // Refused rather than ignored, for the same reason `--mtp-model` is refused
-  // on rank 0.
-  if (role == "rank1" &&
+  // In the cohort modes the synthetic prompt count is a rank-zero concept: rank
+  // 1 serves whatever rank 0 sends and never builds a cohort, so the flag would
+  // be inert there. Refused rather than ignored, for the same reason
+  // `--mtp-model` is refused on rank 0. The two-program modes are the
+  // exception: each rank builds its own copy of the same prompts.
+  if (role == "rank1" && !batched_w2 && !serial_w2 &&
       (prompt_tokens[0].has_value() || prompt_tokens[1].has_value())) {
     Warn(
         "--prompt-tokens-0/1 are rank-zero options: rank 1 hosts the worker "
@@ -1845,9 +2006,29 @@ int main(int argc, char** argv) {
     // branch before its control listen. RDMA first and for the same reason as
     // `RunRank1Worker`: the bootstrap connect blocks for up to 30 s while rank
     // 0 listens, so the model must not be mapped before it completes.
-    if (batched_w2) {
+    if (allreduce_bench != 0) {
+      std::string bench_error;
+      const q::rocm::IbrverbsConfig bench_rdma{
+          .rank = kRank1,
+          .world_size = kWorldSize,
+          .bootstrap_host = bootstrap_host,
+          .bootstrap_port = bootstrap_port,
+          .device_index = device,
+          .gid_index = gid,
+      };
+      auto communicator =
+          q::rocm::CreateIbrverbsCommunicator(bench_rdma, &bench_error);
+      if (!communicator) {
+        Warn("allreduce bench RDMA communicator failed: " + bench_error);
+        return kTransportFailure;
+      }
+      return RunAllReduceBench("rank1", *communicator, device,
+                               allreduce_bench);
+    }
+    if (batched_w2 || serial_w2) {
       std::string batched_error;
-      Say("rank1", "batched-w2 mode: no control wire, no cohort, no worker");
+      Say("rank1", std::string(serial_w2 ? "serial-w2" : "batched-w2") +
+                       " mode: no control wire, no cohort, no worker");
       const q::rocm::IbrverbsConfig batched_rdma{
           .rank = kRank1,
           .world_size = kWorldSize,
@@ -1910,7 +2091,7 @@ int main(int argc, char** argv) {
         }
       }
       return RunBatchedW2("rank1", batched_model, batched_prompt, budget,
-                          context, collectives, &batched_error);
+                           context, collectives, serial_w2, &batched_error);
     }
     const MtpSidecar mtp{
         .model_path = mtp_model_path,
@@ -1946,13 +2127,17 @@ int main(int argc, char** argv) {
   auto collectives = std::make_shared<CollectiveTrace>(std::move(communicator));
   Say("rank0", "RDMA peer established on bootstrap port " +
                    std::to_string(bootstrap_port));
+  if (allreduce_bench != 0) {
+    return RunAllReduceBench("rank0", *collectives, device, allreduce_bench);
+  }
 
   // `--batched-w2` returns here, BEFORE the control listener binds: this mode
   // has no cohort, no command and no worker, so binding a control peer would
   // only add a second rendezvous that nothing ever connects to. Rank 1 takes
   // the matching branch before its control connect.
-  if (batched_w2) {
-    Say("rank0", "batched-w2 mode: no control wire, no cohort, no worker");
+  if (batched_w2 || serial_w2) {
+    Say("rank0", std::string(serial_w2 ? "serial-w2" : "batched-w2") +
+                     " mode: no control wire, no cohort, no worker");
     q::ModelOptions batched_options{
         .max_context = context,
         .mtp_model_path = "",
@@ -1994,8 +2179,8 @@ int main(int argc, char** argv) {
         return kInvalidArguments;
       }
     }
-    return RunBatchedW2("rank0", batched_model, batched_prompt, budget, context,
-                        collectives, &error);
+    return RunBatchedW2("rank0", batched_model, batched_prompt, budget,
+                         context, collectives, serial_w2, &error);
   }
 
   // 2. The rank-zero control peer listens; the worker connects and both
