@@ -313,3 +313,10 @@ experimental and must not be rendered into the published benchmark tables.
   numbers only, not a like-for-like comparison: `prefill_tps=950.1` at width 2,
   and `cache_snapshot_bytes` 172425656 and 121428488 per resident session,
   which bounds how wide a batch can ever be.
+- The same batched advance now also runs across two hosts. With
+  `qwen38_flash_next_tp_c2_probe --batched-w2`, both ranks produce identical
+  tokens and per-step member sets, including the routed-expert all-reduce inside
+  `MoeBatch`, and match the `--serial-w2` baseline token for token. Batching two
+  streams gives 1.67× the serial aggregate throughput. For Q4 the TP2 decode and
+  prefill rates are no better than one host; see the performance section of
+  [NEXT.md](NEXT.md#measured-tp2-performance) and `EXPERIMENTS.md`.

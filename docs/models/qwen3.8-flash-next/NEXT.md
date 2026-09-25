@@ -1,6 +1,6 @@
 # Next steps
 
-Forward plan for the Qwen3.8-Flash-Next TP2 and Q8 work, as of 2026-09-25.
+Forward plan for the Qwen3.8-Flash-Next TP2 and Q8 work, as of 2026-09-26.
 
 Companion documents: [TP2.md](TP2.md) for the C>1 boundary, `Q8.md` (added by
 [#1](https://github.com/neuhaus/gufo/pull/1)) for the full-Q8 resume handoff,
@@ -26,39 +26,78 @@ The original `feature/qwen38-flash-next-tp2-rdma` branch is retained as a
 fallback and is not proposed for merge.
 
 Another branch, `pr/c2-plan-check`, is stacked on #3. It adds the worker's
-runner-capacity refusal for C2 (step 1 below) and carries this document. It has
-not been built or opened as a PR yet.
+runner-capacity refusal for C2 (step 1 below) and carries this document. It
+builds on both hosts, passes the format gate and its hosted TP tests, and has
+not been opened as a PR. `claude/c2-spike-serial`, stacked on it, adds the
+spike's serial baseline, timing and an all-reduce microbenchmark, and records
+the measurements below.
+
+## Measured TP2 performance
+
+Q4 UD-Q4_K_XL, rank 0 `fuzzy`, rank 1 `misty`, FDR InfiniBand, 2026-09-26.
+TP2 figures come from `qwen38_flash_next_tp_c2_probe` and are development
+measurements, not published cells; single-host figures are from
+[BENCHMARKS.md](BENCHMARKS.md).
+
+| Workload | One host | TP2 |
+|---|---|---|
+| Decode, one stream, short context | 26.0 tok/s | 26.5 tok/s |
+| Decode, two streams, short context | 45.7 tok/s | 44.1 tok/s batched, 26.5 serial |
+| Prefill from 0 to 32K tokens | 1,422–1,457 tok/s | 1,070 tok/s |
+| Decode at depth 32K, one stream | 24.3 tok/s | 24.1–24.5 tok/s |
+
+For Q4, TP2 is a capacity path, not a speed path. The second host halves the
+routed-expert work, which is about 35% of prefill kernel time, and the saving is
+spent elsewhere:
+
+- Decode collectives are cheap. An all-reduce of one 10 KiB row takes 49 µs at
+  p50 (`--allreduce-bench`), so the 48 per token cost about 2.4 ms of ~38 ms.
+  The loss is structural: every `AllReduceSum` synchronizes the stream and TP2
+  runs eagerly without HIP graphs, which exposes launch latency at each of the
+  48 layers. The retained profile shows the ranks GPU-busy only 54–62%, with the
+  largest gaps at host and launch boundaries.
+- Prefill collectives are expensive. A 512-row (5 MiB) all-reduce takes 4.5 ms,
+  about 1.2 GB/s on a 56 Gb/s link, because it stages through host memory and
+  sums on one CPU thread. That adds about 215 ms to every 512-token chunk.
+
+Proposed order for TP2 speed:
+1. Prefill: reduce on the GPU and stop staging through host memory, or at least
+   overlap the copy, the RDMA read and the sum in chunks.
+2. Decode: make the collective stream-ordered, so the GPU hands each partial to
+   a host proxy thread with `hipStreamWriteValue` and waits with
+   `hipStreamWaitValue`, and the host never blocks per layer. The forward can
+   then be graph-captured again. Measure single-host decode with graphs disabled
+   first, to size the gain.
+3. Physical C2 (section 1) is feasible: the spike batched two streams with
+   identical tokens and schedules on both ranks, 1.67× over serial. On Q4 it only
+   matches one host until 1 and 2 land. For full Q8, which needs two hosts, it
+   is worth building once Q8 is qualified.
 
 ## 1. Physical C2 — critical path
 
 Each step depends on the one above it. **Step 1 is a design decision, not a
 coding task**, and nothing below it can be specified until it is made.
 
-Recommended order: prototype step 2 first as a width-2 run inside
-`qwen38_flash_next_tp_c2_probe`. With no serving or control-wire changes, that
-spike does not depend on the step 1 decision. Measure cross-rank token agreement
-and throughput against serial C2. Nothing yet shows that C2 is useful, so that
-measurement decides whether steps 1 and 3–5 are worth building.
+The step-2 spike has run on two hosts. `--batched-w2` loads the model on both
+ranks over the engine with the communicator attached, branches before the
+control wire on both sides, and runs one identical program: two live sessions,
+per-member prefill, then a two-row `EvaluateBatch` per decode step.
+`--serial-w2` runs the same program with one member advanced at a time. Each
+rank prints its per-member tokens, a checksum and the member set of every step.
 
-Status: the spike exists as `--batched-w2` in `qwen38_flash_next_tp_c2_probe`.
-It builds and passes the format gate, and it is **committed but not yet run on
-hardware** — treat it as unverified until a two-host run says otherwise. It
-loads the model on both ranks over the engine with the communicator attached,
-branches before the control wire on both sides, and runs one identical program:
-two live sessions, per-member prefill, then a two-row `EvaluateBatch` per decode
-step. Each rank prints its per-member tokens, a checksum, and the exact member
-set included in every batched step, so the harness can check **schedule**
-agreement as well as token agreement; a member that stops early drops out of
-later batches, and a rank disagreement there would diverge the byte counts.
-The scope id is a constant both sides bind by construction, so a run is only
-comparable when both ranks pass the flag.
+Results, Q4, greedy: at 64 and 128 tokens per member with short prose prompts,
+and with two 32,000-token prompts, both ranks printed identical tokens,
+checksums and per-step member sets, and the batched and serial runs produced
+identical tokens. So the two-row advance, including its routed-expert
+all-reduce in `MoeBatch`, keeps both ranks on one collective schedule, and it
+does not perturb greedy tokens at this scale. Batched decode ran at 45.4 ms per
+two-token step against 75.6 ms serial, 1.67× the aggregate throughput. The
+numbers are in `EXPERIMENTS.md`; what they mean for priorities is in the
+performance section above.
 
-The numerics precondition has been measured, on one host, for the one operation
-that is actually batched on this path: the single-token advance is token-identical
-to serial (`TP2.md`, the single-host batched-advance entry; `plan=batched-w2
-batch_width=2` confirmed in the log, `plan=serial-c1` control, all three paths
-hashing alike). Batched decode remains unmeasured, and there is no AllReduce in
-that test, so the distributed reduction order is still open.
+Still open: `DecodeBatch` (as opposed to the advance), sampled decoding, and a
+two-stream run at depth. The synthetic 32K prompts stopped the second member
+after one token, so that run measured one stream.
 
 ### 1. Carry the execution width — DECISION NEEDED
 
@@ -232,11 +271,19 @@ path reports `TP worker token mismatch`. Shard hashes are identical on both
 hosts, so this is not a transfer problem.
 
 The ordered diagnostic plan is in `Q8.md`, added by
-[#1](https://github.com/neuhaus/gufo/pull/1). The short version: a host-only
-PLE gather hash for the retained long prompt on both hosts, then a router
-global-top-k plan digest to test the leading hypothesis (rank-local routing-plan
-desynchronisation at near-ties). Do not change the Q8 quantizer, expert offsets
-or reduction order before that evidence exists.
+[#1](https://github.com/neuhaus/gufo/pull/1). Its first step, a host-only PLE
+gather hash for the retained long prompt, has run: both hosts produced identical
+hashes, so PLE is excluded.
+
+Next, locate the first divergence directly. Each all-reduce computes local plus
+peer from the same two buffers, so both ranks hold bit-identical hidden states
+right after every all-reduce. A divergence must therefore come from a replicated
+kernel between two all-reduces that gives different results on the two hosts,
+for example through nondeterministic accumulation, or from host-dependent
+input. A per-layer hidden-state hash on both ranks names the first divergent
+layer and stage; the router digest in `Q8.md` then shows whether routing flips
+there. Do not change the Q8 quantizer, expert offsets or reduction order before
+that evidence exists.
 
 The supported baseline remains Q4 UD-Q4_K_XL plus a shared-Q8 MTP sidecar.
 
@@ -253,23 +300,18 @@ The supported baseline remains Q4 UD-Q4_K_XL plus a shared-Q8 MTP sidecar.
   function's documented `global - expert_begin` rule, and that correction is
   safe *only* because nothing consumes `LocalExpert`. If it is ever wired into
   the executor, the reasoning that justified the change no longer holds.
-- **`pr/c2-plan-check` has not been compiled or run.** It was written on a host
-  with no build environment. Before it becomes a PR it needs the format check,
-  `tp_cohort_worker_test` from a `cpu-test` build, and a `gpu-tp2` build for the
-  one-line call-site change in `inference_backend.cpp`.
+- **`pr/c2-plan-check`** now builds on both hosts, and its format check and
+  hosted TP tests (`tp_cohort_worker_test`, `tp_cohort_plan_test`,
+  `tp_control_test`) pass. The capacity refusal itself stays hosted-test only.
 - **Decide the fate of `feature/qwen38-flash-next-tp2-rdma`** (58 commits): keep
   as a fallback or delete once the stack merges.
 
 ## Not claimed anywhere in this work
 
-- No batched or physical C2 exists. Everything above concerns the dormant serial
-  contract only.
-- `--batched-w2` has never been executed. Its presence in the probe is a
-  mechanism, not a result: it compiles and is format-clean, and nothing in this
-  document should be read as evidence that a batched advance works across two
-  ranks until a two-host log says so.
-- No performance claim has been measured for C2. Nothing here demonstrates that
-  C2 is useful, only that the serial contract is correct.
+- No physical C2 exists in serving. The batched advance has run only inside the
+  probe, with greedy decoding and no MTP.
+- C2 throughput is measured only in the probe, at short context and with one
+  run per configuration. Nothing is measured through serving.
 - Distributed logits are compared with an explicit tolerance, not bit-identity:
   the host float sum changes the reduction order relative to a single device.
   Between the two ranks the sum has two operands, so both ranks get the same
