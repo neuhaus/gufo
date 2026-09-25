@@ -710,6 +710,12 @@ check("--tp-cache-reuse" in local_cache and "--tp-cache-reuse" in remote_cache,
       "cache reuse is explicitly forwarded to both ranks")
 tp2_session.check_tp2_scope(tp2_config.table("single-ar"), depths=[4096])
 check(True, "cache-enabled TP2 accepts an explicit depth")
+try:
+    tp2_session.check_tp2_scope(tp2_config.table("multi-ar"), users=2)
+except RuntimeError as failure:
+    check("C1" in str(failure), "cache-enabled TP2 C>1 remains unqualified")
+else:
+    raise AssertionError("cache-enabled TP2 C>1 must remain rejected")
 tp2_config.data["gufo"]["tp2"].pop("cache_reuse")
 try:
     tp2_session.check_tp2_scope(tp2_config.table("multi-ar"), users=2)
