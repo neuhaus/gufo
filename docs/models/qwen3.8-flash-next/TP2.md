@@ -238,7 +238,7 @@ experimental and must not be rendered into the published benchmark tables.
   once on every path — including a member failure, which would otherwise leave
   a scope bound and fail-stop the next C1 request.
 
-  Two real fault injections are now verified on hardware, both fail-closed:
+  Three real fault injections are now verified on hardware, all fail-closed:
   - **Admission refusal** (rank 1 `--worker-max-pending 1`): `SubmitCohort`
     throws at admission, the seam releases the bound lease and sends a
     wire-valid C2 error response that still carries both member envelopes.
@@ -254,8 +254,19 @@ experimental and must not be rendered into the published benchmark tables.
     confirms the exactly-one-`End` contract against a real poisoned
     communicator.
 
-  Still covered by hosted tests only: peer cancel, member failure and the MTP
-  refusal. No C2 command has run with a prompt longer than one prefill chunk.
+  - **MTP refusal** (rank 1 `--mtp-model`): TP2 plus MTP is a supported
+    shipping combination, and the C2 response contract cannot carry draft
+    telemetry at all, so a cohort must be refused rather than answered
+    malformed. With a real 2.79 GB sidecar loaded, the handshake presented
+    `use_mtp=true`/`max_draft_tokens=7`, rank 0 mirrored both fields, and rank 1
+    refused **before** `BeginOperation` — no lease bound, no collective. Rank 0
+    observed both member envelopes and the exact refusal string in 1 ms. The
+    probe compares that string verbatim, because every refusal path returns the
+    same exit code and a mode-1 refusal would otherwise read as this mode's
+    success.
+
+  Still covered by hosted tests only: peer cancel mid-cohort and member failure.
+  No C2 command has run with a prompt longer than one prefill chunk.
 
 - The dormant C2 path HAS now run end to end on hardware, three consecutive
   times, via `qwen38_flash_next_tp_c2_probe` (rank 0 on `fuzzy`, rank 1 on
