@@ -329,6 +329,7 @@ def run_request(
     cache_prompt: bool | None = None,
     messages: list[dict[str, str]] | None = None,
     extra_body: dict[str, Any] | None = None,
+    stream: bool = True,
 ) -> RequestObservation:
     if endpoint_profile not in ENDPOINT_PROFILES:
         raise ValueError("endpoint profile must be gufo or openai")
@@ -338,9 +339,10 @@ def run_request(
         "messages": messages or [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
-        "stream": True,
-        "stream_options": {"include_usage": True},
+        "stream": stream,
     }
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
     if cache_prompt is not None:
         # Both Gufo and llama-server honor this request-level cache policy.
         payload["cache_prompt"] = cache_prompt
@@ -353,7 +355,7 @@ def run_request(
         headers={
             **_authorization_headers(),
             "Content-Type": "application/json",
-            "Accept": "text/event-stream",
+            "Accept": "text/event-stream" if stream else "application/json",
             "X-Client-ID": client_id,
         },
         method="POST",
@@ -375,38 +377,67 @@ def run_request(
                 raise RuntimeError(
                     f"serving request returned HTTP {response.status}"
                 )
-            for event in _sse_data(response):
-                if event == "[DONE]":
-                    saw_done = True
-                    break
+            if not stream:
                 try:
-                    chunk = json.loads(event)
-                except json.JSONDecodeError as exception:
+                    response_payload = json.loads(response.read().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exception:
                     raise RuntimeError(
-                        "serving response contained invalid SSE JSON"
+                        "serving response contained invalid JSON"
                     ) from exception
-                if "error" in chunk:
+                if not isinstance(response_payload, dict):
+                    raise RuntimeError("serving response must be a JSON object")
+                if "error" in response_payload:
                     raise RuntimeError(
-                        "serving stream failed: "
-                        + json.dumps(chunk["error"], sort_keys=True)
+                        "serving request failed: "
+                        + json.dumps(response_payload["error"], sort_keys=True)
                     )
-                choices = chunk.get("choices")
-                if isinstance(choices, list) and choices:
-                    delta = choices[0].get("delta", {})
-                    if isinstance(delta, dict):
-                        content = delta.get("content")
-                        tool_calls = delta.get("tool_calls")
-                        if isinstance(content, str) and content:
-                            completion_parts.append(content)
-                        if content or tool_calls:
-                            useful_event_times.append(clock())
-                candidate_usage = chunk.get("usage")
+                candidate_usage = response_payload.get("usage")
                 if isinstance(candidate_usage, dict):
                     usage = candidate_usage
-                # llama-server attaches `timings` to its final chunk.
-                candidate_timings = chunk.get("timings")
+                candidate_timings = response_payload.get("timings")
+                if not isinstance(candidate_timings, dict) and isinstance(usage, dict):
+                    candidate_timings = usage.get("timings")
                 if isinstance(candidate_timings, dict):
                     timings = candidate_timings
+                choices = response_payload.get("choices")
+                if isinstance(choices, list) and choices:
+                    message = choices[0].get("message", {})
+                    if isinstance(message, dict) and isinstance(message.get("content"), str):
+                        completion_parts.append(message["content"])
+                saw_done = True
+            else:
+                for event in _sse_data(response):
+                    if event == "[DONE]":
+                        saw_done = True
+                        break
+                    try:
+                        chunk = json.loads(event)
+                    except json.JSONDecodeError as exception:
+                        raise RuntimeError(
+                            "serving response contained invalid SSE JSON"
+                        ) from exception
+                    if "error" in chunk:
+                        raise RuntimeError(
+                            "serving stream failed: "
+                            + json.dumps(chunk["error"], sort_keys=True)
+                        )
+                    choices = chunk.get("choices")
+                    if isinstance(choices, list) and choices:
+                        delta = choices[0].get("delta", {})
+                        if isinstance(delta, dict):
+                            content = delta.get("content")
+                            tool_calls = delta.get("tool_calls")
+                            if isinstance(content, str) and content:
+                                completion_parts.append(content)
+                            if content or tool_calls:
+                                useful_event_times.append(clock())
+                    candidate_usage = chunk.get("usage")
+                    if isinstance(candidate_usage, dict):
+                        usage = candidate_usage
+                    # llama-server attaches `timings` to its final chunk.
+                    candidate_timings = chunk.get("timings")
+                    if isinstance(candidate_timings, dict):
+                        timings = candidate_timings
     except urllib.error.HTTPError as exception:
         raise _http_error(exception) from exception
     except urllib.error.URLError as exception:
@@ -418,14 +449,15 @@ def run_request(
     if not saw_done:
         raise RuntimeError("serving stream ended without [DONE]")
     if usage is None:
+        transport = "stream" if stream else "response"
         if endpoint_profile == "gufo":
             raise RuntimeError(
-                "serving stream omitted terminal usage; rebuild the server "
+                f"serving {transport} omitted terminal usage; rebuild the server "
                 "with the canonical benchmark metrics extension"
             )
         raise RuntimeError(
-            "serving stream omitted terminal usage; the endpoint must honour "
-            "stream_options.include_usage"
+            f"serving {transport} omitted terminal usage; the endpoint must "
+            "honour stream_options.include_usage"
         )
 
     prompt_tokens = usage.get("prompt_tokens")

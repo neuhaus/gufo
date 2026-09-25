@@ -1,7 +1,8 @@
 # TP=2 RDMA development probe
 
-This is the first Qwen3.8-Flash-Next two-rank execution path. It is a
-qualification probe, not yet the HTTP serving topology.
+This is the first Qwen3.8-Flash-Next two-rank execution path. It is an
+experimental qualification topology, not a published single-host benchmark
+configuration.
 
 ## Build
 
@@ -80,6 +81,54 @@ prefill chunk setting (`--prefill-chunk`). RDMA remains
 the tensor transport. Do not use this C1 path for
 streaming, cancellation, sampled decoding, vision, disk continuation, or
 multiple concurrent requests yet.
+
+## Experimental benchmark driver
+
+The official model-bench driver can launch the paired ROCm containers through
+an experiment-only `gufo.tp2` overlay in a copied `bench.json`; the published
+`artifacts/bench.json`, `BENCHMARKS.md`, renderer, and target variants remain
+unchanged. The overlay requires `remote_host`, `bootstrap_host`,
+`container_image`, `workspace`, `container_workspace`, `binary`, and a
+non-empty `control_token`:
+
+```json
+{
+  "gufo": {
+    "tp2": {
+      "remote_host": "misty",
+      "bootstrap_host": "RANK0_REACHABLE_ADDRESS",
+      "bootstrap_port": 18515,
+      "control_port": 18516,
+      "control_token": "EXPERIMENT_ONLY_TOKEN",
+      "container_image": "gufo-tp2-dev:7.2.3",
+      "workspace": "/path/to/gufo",
+      "container_workspace": "/workspace/gufo",
+      "binary": "build/gpu-tp2/gufo"
+    }
+  }
+}
+```
+
+Run only the supported experimental d0 cells, with a separate artifact
+directory:
+
+```sh
+python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
+  --gufo build/gpu-tp2/gufo --config /tmp/bench-tp2.json \
+  --artifacts-dir /tmp/gufo-tp2-artifacts --gguf "$MODEL" --mtp "$MTP" \
+  run --target gufo --table single-ar --depths 0 --context 4096 --mode ar
+
+python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
+  --gufo build/gpu-tp2/gufo --config /tmp/bench-tp2.json \
+  --artifacts-dir /tmp/gufo-tp2-artifacts --gguf "$MODEL" --mtp "$MTP" \
+  run --target gufo --table single-mtp --depths 0 --context 4096 --mode mtp
+```
+
+The driver uses the JSON non-streaming request profile because the current TP2
+server rejects streaming. It records a topology block, both rank fingerprints,
+redacts the control token and bootstrap address, and rejects loading, memory,
+image, concurrent, and nonzero-depth tables before launch. These artifacts are
+experimental and must not be rendered into the published benchmark tables.
 
 ## Current boundaries
 

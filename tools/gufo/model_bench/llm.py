@@ -7,6 +7,7 @@ import datetime as dt
 import functools
 import hashlib
 import json
+import shlex
 import struct
 import zlib
 import random
@@ -22,6 +23,7 @@ from typing import Any
 from gufo.serving_bench import (
     PromptCase,
     RequestObservation,
+    load_fingerprint,
     load_prompt_suite,
     load_reference_report,
     run_corpus_benchmark,
@@ -30,7 +32,7 @@ from gufo.serving_bench import (
 
 from .artifacts import artifact_path, load_artifact, merge_rows, new_artifact, public_command, save_artifact
 from .config import BenchConfig, TableSpec
-from .servers import HipMemory, Server, drop_file_cache, wait_process_exit
+from .servers import HipMemory, Server, Tp2Server, drop_file_cache, wait_process_exit
 
 print = functools.partial(print, flush=True)  # progress must reach redirected logs immediately
 
@@ -88,6 +90,7 @@ class Session:
         self.modes = modes
         self.context = context
         self.tokenizer_calibration: dict[str | None, tuple[int, float]] = {}
+        self._rank_fingerprints: dict[str, dict[str, Any]] | None = None
 
     def reps(self, spec: dict[str, Any], default: int = 1) -> int:
         return self.repetitions or int(spec.get("repetitions", default))
@@ -108,6 +111,239 @@ class Session:
     def request_model(self) -> str:
         # The upstream alias disables default DeepSeek thinking for corpus requests too.
         return "deepseek-chat" if self.target == "reference" and self.reference_kind == "ds4" else MODEL_ALIAS
+
+    @property
+    def tp2_config(self) -> dict[str, Any] | None:
+        """Optional paired-server settings from an experiment configuration."""
+        if self.target != "gufo":
+            return None
+        value = self.config.data.get("gufo", {}).get("tp2")
+        return value if isinstance(value, dict) else None
+
+    @property
+    def tp2_enabled(self) -> bool:
+        return self.tp2_config is not None
+
+    def check_tp2_scope(
+        self, table: TableSpec, *, depths: list[int] | None = None,
+    ) -> None:
+        if not self.tp2_enabled:
+            return
+        if table.kind in {"loading", "memory", "image-encoder"}:
+            raise RuntimeError(
+                f"TP2 benchmark does not support {table.kind} tables; "
+                "the two-host topology is not comparable to the published one-host method"
+            )
+        if table.kind == "single" and depths and any(depth != 0 for depth in depths):
+            raise RuntimeError(
+                "TP2 benchmark currently supports only single-user depth 0; "
+                "distributed snapshot/state transfer is required for cached prefixes"
+            )
+        if table.kind == "multi":
+            raise RuntimeError(
+                "TP2 benchmark currently supports single-user tables only; "
+                "the corpus runner has not yet been qualified for TP2"
+            )
+
+    def _checked_tp2_config(self) -> dict[str, Any]:
+        config = self.tp2_config
+        if config is None:
+            raise RuntimeError("TP2 topology is not configured")
+        required = ("remote_host", "bootstrap_host", "container_image", "workspace", "container_workspace")
+        missing = [key for key in required if not config.get(key)]
+        if not config.get("control_token"):
+            missing.append("control_token")
+        if missing:
+            raise RuntimeError(
+                "gufo.tp2 is missing required settings: " + ", ".join(missing)
+            )
+        return config
+
+    @staticmethod
+    def _container_path(path: Path, workspace: Path, container_workspace: str) -> str:
+        path = path.expanduser().resolve()
+        workspace = workspace.expanduser().resolve()
+        try:
+            relative = path.relative_to(workspace)
+        except ValueError:
+            return str(path)
+        return str(Path(container_workspace) / relative)
+
+    @staticmethod
+    def _drop_options(args: list[str], names: set[str]) -> list[str]:
+        result: list[str] = []
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in names:
+                skip_next = True
+                continue
+            result.append(arg)
+        return result
+
+    @staticmethod
+    def _container_name(table: TableSpec, tag: str, rank: int) -> str:
+        raw = f"gufo-model-bench-{table.id}-{tag}-rank{rank}"
+        return "".join(char if char.isalnum() or char in "-_" else "-" for char in raw)
+
+    def _tp2_podman_command(
+        self, name: str, serve_args: list[str], *, container_workspace: str,
+        workspace: Path, config: dict[str, Any],
+    ) -> list[str]:
+        devices = config.get("devices", [
+            "/dev/kfd", "/dev/dri", "/dev/infiniband/uverbs0",
+            "/dev/infiniband/rdma_cm",
+        ])
+        command = [
+            "podman", "run", "--rm", "--name", name,
+            "--security-opt", "label=disable",
+            "--userns", config.get("userns", "keep-id:uid=1000,gid=1000"),
+        ]
+        for device in devices:
+            command += ["--device", str(device)]
+        command += [
+            "--group-add", config.get("group_add", "keep-groups"),
+            "--ulimit", "memlock=-1",
+            "--network", config.get("network", "host"),
+            "-v", f"{workspace}:{container_workspace}",
+            "-w", container_workspace,
+        ]
+        command += [str(part) for part in config.get("run_args", [])]
+        command += [str(config["container_image"]), *serve_args]
+        return command
+
+    def _tp2_binary_path(
+        self, config: dict[str, Any], container_workspace: str, workspace: Path,
+    ) -> str:
+        binary_value = str(config.get("binary", ""))
+        if not binary_value:
+            raise RuntimeError("gufo.tp2.binary is required")
+        binary = Path(binary_value).expanduser()
+        if not binary.is_absolute():
+            binary = Path(container_workspace) / binary
+        return self._container_path(binary, workspace, container_workspace)
+
+    def _tp2_serve_args(
+        self, table: TableSpec, *, mode: str | None, context: int, sessions: int,
+        port: int, rank: int, config: dict[str, Any], container_workspace: str,
+        workspace: Path,
+    ) -> list[str]:
+        binary = self._tp2_binary_path(config, container_workspace, workspace)
+        model = self._container_path(self.config.file("gguf", table.variant), workspace, container_workspace)
+        llm_args = self._drop_options(
+            list(self.config.data["gufo"].get("llm", [])),
+            {"--max-pending", "--max-pending-per-client", "--max-connections",
+             "--request-timeout-ms", "--cache-disk", "--cache-disk-bytes",
+             "--cache-disk-staging-bytes"},
+        )
+        command = [
+            str(binary), "serve", "--host", "127.0.0.1", "--port", str(port),
+            "--sessions", str(sessions), *self.config.data["gufo"].get("serve", []),
+            "llm", "--model", model, "--context", str(context),
+            "--served-model-name", MODEL_ALIAS, *llm_args,
+        ]
+        if table.kind == "image-encoder":
+            mmproj = self._container_path(
+                self.config.file("mmproj", table.variant), workspace, container_workspace)
+            command += ["--mmproj", mmproj, "--max-request-bytes", str(64 << 20)]
+        if mode and mode != "ar":
+            speculative = []
+            for part in self.config.substitute(self.config.speculative["gufo_args"], table.variant):
+                path = self.config.file("gguf", table.variant)
+                if part == str(path):
+                    part = model
+                elif part == str(self.config.file("mtp", table.variant)):
+                    part = self._container_path(
+                        self.config.file("mtp", table.variant), workspace, container_workspace)
+                speculative.append(part)
+            command += speculative
+        else:
+            command += ["--speculative", "off"]
+        # The TP2 server currently admits only one draft, one pending request,
+        # one connection, and no request timeout or disk cache.
+        command += [
+            "--max-pending", "1", "--max-pending-per-client", "1",
+            "--max-connections", "1", "--request-timeout-ms", "0",
+            "--draft-tokens", "1", "--min-draft-tokens", "1",
+            "--tp-world-size", "2", "--tp-rank", str(rank),
+            "--tp-bootstrap-port", str(config.get("bootstrap_port", 18515)),
+            "--tp-control-port", str(config.get("control_port", 18516)),
+            "--tp-control-token", str(config["control_token"]),
+        ]
+        if rank == 1:
+            command += ["--tp-bootstrap-host", str(config["bootstrap_host"])]
+        return command
+
+    def _tp2_commands(
+        self, table: TableSpec, *, mode: str | None, context: int, sessions: int,
+        port: int, tag: str,
+    ) -> tuple[list[str], list[str], list[str], list[str], str, str]:
+        config = self._checked_tp2_config()
+        workspace = Path(str(config["workspace"])).expanduser()
+        container_workspace = str(config["container_workspace"])
+        rank0_name = self._container_name(table, tag, 0)
+        rank1_name = self._container_name(table, tag, 1)
+        rank0_args = self._tp2_serve_args(
+            table, mode=mode, context=context, sessions=sessions, port=port, rank=0,
+            config=config, container_workspace=container_workspace, workspace=workspace)
+        rank1_args = self._tp2_serve_args(
+            table, mode=mode, context=context, sessions=sessions, port=port, rank=1,
+            config=config, container_workspace=container_workspace, workspace=workspace)
+        local = self._tp2_podman_command(
+            rank0_name, rank0_args, container_workspace=container_workspace,
+            workspace=workspace, config=config)
+        remote = self._tp2_podman_command(
+            rank1_name, rank1_args, container_workspace=container_workspace,
+            workspace=workspace, config=config)
+        local_cleanup = ["podman", "rm", "-f", rank0_name]
+        remote_cleanup = ["podman", "rm", "-f", rank1_name]
+        return (
+            local, remote, local_cleanup, remote_cleanup,
+            str(config["remote_host"]), rank1_name,
+        )
+
+    def _tp2_fingerprint_command(self, name: str) -> list[str]:
+        config = self._checked_tp2_config()
+        workspace = Path(str(config["workspace"])).expanduser()
+        container_workspace = str(config["container_workspace"])
+        binary = self._tp2_binary_path(config, container_workspace, workspace)
+        return self._tp2_podman_command(
+            name, [binary, "diagnose", "--fingerprint", "--json"],
+            container_workspace=container_workspace, workspace=workspace, config=config,
+        )
+
+    def runtime_fingerprint(self) -> dict[str, Any]:
+        if not self.tp2_enabled:
+            return load_fingerprint(None, self.gufo_binary)
+        completed = subprocess.run(
+            self._tp2_fingerprint_command("gufo-model-bench-fingerprint-rank0"),
+            check=True, capture_output=True, text=True,
+        )
+        return json.loads(completed.stdout)
+
+    def rank_fingerprints(self) -> dict[str, dict[str, Any]]:
+        if not self.tp2_enabled:
+            return {}
+        if self._rank_fingerprints is None:
+            local = self.fingerprint or self.runtime_fingerprint()
+            config = self._checked_tp2_config()
+            remote_command = [
+                "ssh", "-o", "BatchMode=yes", str(config["remote_host"]),
+                "exec " + shlex.join(
+                    self._tp2_fingerprint_command("gufo-model-bench-fingerprint-rank1")
+                ),
+            ]
+            completed = subprocess.run(
+                remote_command, check=True, capture_output=True, text=True,
+                timeout=120,
+            )
+            self._rank_fingerprints = {
+                "rank0": local,
+                "rank1": json.loads(completed.stdout),
+            }
+        return self._rank_fingerprints
 
     # ----- server commands -------------------------------------------------
 
@@ -158,10 +394,23 @@ class Session:
             command += cfg.substitute(args, table.variant)
         return command
 
-    def server(self, table: TableSpec, *, mode: str | None, context: int, sessions: int, tag: str) -> Server:
+    def server(self, table: TableSpec, *, mode: str | None, context: int, sessions: int, tag: str) -> Server | Tp2Server:
         readiness = self.config.data["gufo"]["readiness"] if self.target == "gufo" else self.config.data["reference"]["readiness"]
         log = self.log_dir / f"{table.id}-{self.target}-{tag}.log"
         placeholder = Server([], readiness, log)
+        if self.target == "gufo" and self.tp2_enabled:
+            local, remote, local_cleanup, remote_cleanup, remote_host, _ = self._tp2_commands(
+                table, mode=mode, context=context, sessions=sessions,
+                port=placeholder.port, tag=tag,
+            )
+            placeholder.command = local
+            self.active_log = log
+            return Tp2Server(
+                placeholder, remote, remote_host=remote_host,
+                remote_log_path=log.with_name(f"{log.stem}-rank1{log.suffix}"),
+                local_cleanup_command=local_cleanup,
+                remote_cleanup_command=remote_cleanup,
+            )
         if self.target == "gufo":
             command = self.gufo_command(table, mode=mode, context=context, sessions=sessions, port=placeholder.port)
         else:
@@ -200,8 +449,29 @@ class Session:
         version = self.reference_version(mode)
         if version:
             notes = [f"{self.config.reference_name}: {version}", *notes]
-        return new_artifact(self.config, table, self.target, mode=mode, command=command,
-                            source=self.source, fingerprint=self.fingerprint, notes=notes)
+        if command and command[0] == "tp2":
+            notes = [
+                *notes,
+                "TP2 paired topology: rank 0 owns HTTP and rank 1 is the remote worker; "
+                "requests use the qualified non-streaming C1 path; control credentials "
+                "and endpoint addresses are omitted",
+            ]
+        artifact = new_artifact(
+            self.config, table, self.target, mode=mode, command=command,
+            source=self.source, fingerprint=self.fingerprint, notes=notes,
+        )
+        if command and command[0] == "tp2":
+            artifact["topology"] = {
+                "id": "tp2",
+                "worldSize": 2,
+                "requestTransport": "openai-chat-completions-json",
+                "limitations": [
+                    "C1 only", "greedy only", "uncached d0 only",
+                    "non-streaming only", "no published benchmark comparison",
+                ],
+                "rankFingerprints": self.rank_fingerprints(),
+            }
+        return artifact
 
     def store(self, path: Path, artifact: dict[str, Any]) -> None:
         existing = None if self.fresh else load_artifact(path)
@@ -222,7 +492,7 @@ class Session:
             timeout_seconds=REQUEST_TIMEOUT, client_id=CLIENT_ID, concurrency=1,
             repetition=1, request_index=index, endpoint_profile=self.profile,
             cache_prompt=self.cache_prompt if cache_prompt == "default" else cache_prompt, messages=messages,
-            extra_body=extra_body,
+            extra_body=extra_body, stream=not self.tp2_enabled,
         )
         if use_log:
             from ds4.server_metrics import request_metrics
@@ -321,6 +591,7 @@ def _selected_rows(session: Session, table: TableSpec, labels: dict[Any, str],
 def run_loading(session: Session, table: TableSpec) -> None:
     cfg = session.config
     spec = table.spec
+    session.check_tp2_scope(table)
     keys = _selected_rows(session, table, {v: cfg.variant_label(v) for v in cfg.variants})
     if not keys:
         print(f"{table.id}: nothing to do")
@@ -386,6 +657,7 @@ def run_single(session: Session, table: TableSpec, display_table: TableSpec | No
     if not keys:
         print(f"{table.id}: nothing to do")
         return
+    session.check_tp2_scope(table, depths=keys)
     prompt_tokens = int(spec["prompt_tokens"])
     output_tokens = int(spec["output_tokens"])
     fraction = float(spec.get("depth_tolerance", 0.005))
@@ -572,6 +844,7 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
     if not keys:
         print(f"{table.id}: nothing to do")
         return
+    session.check_tp2_scope(table)
     matched_prompt = spec.get("prompt_tokens")
     prefill_first = bool(spec.get("prefill_first", False))
     if matched_prompt:
@@ -746,6 +1019,8 @@ def run_memory(session: Session, table: TableSpec) -> None:
     if not keys:
         print(f"{table.id}: nothing to do")
         return
+    session.check_tp2_scope(
+        table, depths=[int(workloads[key]["depth"]) for key in keys])
     hip = HipMemory.for_binary(session.gufo_binary)
     if hip is None:
         raise SystemExit("memory table needs libamdhip64 (resolved through `ldd` of the Gufo binary)")
@@ -804,6 +1079,7 @@ def run_image_encoder(session: Session, table: TableSpec) -> None:
     if not keys:
         print(f"{table.id}: nothing to do")
         return
+    session.check_tp2_scope(table)
     warmup = int(spec.get("warmup", 1))
     repetitions = session.reps(spec, int(spec.get("repetitions", 3)))
     context = session.context or int(spec.get("context", 8192))
