@@ -219,13 +219,37 @@ TpPlanDigest ComputeTpExecutionPlanDigest(const TpControlCommand& command) {
                      : command.cohort_id);
   HashU32(&hash, static_cast<std::uint32_t>(members.size()));
   HashU32(&hash, static_cast<std::uint32_t>(members.size()));
+  // Execution shape. Every plan that exists today is serial: one request
+  // decodes at a time and no prefill is batched. A C2 cohort is two sequential
+  // single-row executions, not one two-row one, so a cohort is NOT a width-2
+  // execution.
+  //
+  // What each position MEANS was never established, so the values are left
+  // exactly as they were rather than being given invented names. Do not
+  // reorder or reinterpret them: that would silently change every C2 digest.
+  //
+  // Known limitation: this function cannot distinguish a serial cohort from a
+  // batched one, because the execution width is not carried on the wire. Both
+  // ranks hash the same command bytes, so comparing digests proves the command
+  // was not mutated -- it does NOT prove the two ranks will execute the same
+  // way. Closing that needs either an execution-width field on the command or
+  // a distinct command kind, and neither should be guessed before a batched
+  // runner exists to describe.
   if (command.kind == TpControlCommandKind::kCohort2Ar) {
-    HashU32(&hash, 0);
-    HashU32(&hash, 1);
-    HashU32(&hash, 0);
-    HashU32(&hash, 1);
+    constexpr std::uint32_t kC2Shape0 = 0;
+    constexpr std::uint32_t kC2Shape1 = 1;
+    constexpr std::uint32_t kC2Shape2 = 0;
+    constexpr std::uint32_t kC2Shape3 = 1;
+    HashU32(&hash, kC2Shape0);
+    HashU32(&hash, kC2Shape1);
+    HashU32(&hash, kC2Shape2);
+    HashU32(&hash, kC2Shape3);
   } else {
-    HashU32(&hash, 0);
+    // The C1 layout is a single field, not a prefix of the C2 layout, and
+    // nothing establishes that it denotes the same quantity as any of the
+    // four. Hashed as zero, unchanged.
+    constexpr std::uint32_t kC1Shape = 0;
+    HashU32(&hash, kC1Shape);
   }
   for (const auto& member : members) {
     HashU64(&hash, member.member_id);

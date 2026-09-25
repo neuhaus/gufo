@@ -97,7 +97,15 @@ struct TpResponseExpectation {
 };
 
 /// Computes the canonical C1/C2 execution-plan identity. C2 includes member
-/// order, AR width, token budgets and prompt tokens; rank identity is excluded.
+/// order, token budgets and prompt tokens; rank identity is excluded.
+///
+/// This is a command-integrity digest, not a plan-agreement check: both ranks
+/// derive it from the same command bytes, so a match proves the command was not
+/// mutated but says nothing about whether the two ranks will execute it the
+/// same way. In particular it cannot distinguish a serial cohort from a batched
+/// one, because the execution width is not carried on the wire. The shape
+/// fields are not individually named because their meaning was never
+/// established; do not infer semantics from their positions.
 [[nodiscard]] TpPlanDigest ComputeTpExecutionPlanDigest(
     const TpControlCommand& command);
 
