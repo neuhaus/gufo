@@ -232,9 +232,15 @@ experimental and must not be rendered into the published benchmark tables.
   The rank-1 worker dispatches `kCohort2Ar` through those layers under exactly
   one operation lease scoped to the command sequence, and fails closed when an
   MTP sidecar is loaded because drafts cannot be represented by the C2 response
-  contract. That path stays dormant: no producer constructs a C2 command, and
-  the scope is bound before admission so a rejection cannot leak a bound scope
-  into the next command.
+  contract. That path stays dormant: no producer constructs a C2 command. The
+  sequence itself is host-testable through injected lease, submission and send
+  hooks, with a single-release-site guard so a bound scope is released exactly
+  once on every path — including a member failure, which would otherwise leave
+  a scope bound and fail-stop the next C1 request.
+
+  Not yet exercised on hardware: no C2 command has run end to end, because a
+  driver would have to act as a full rank-0 peer (RDMA bootstrap plus control
+  handshake) and execute both members in lockstep with the rank-1 worker.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
   routed source bytes and the device model reports post-conversion resident
