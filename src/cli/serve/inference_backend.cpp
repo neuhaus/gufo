@@ -2387,7 +2387,8 @@ public:
     }
     auto prepared = PrepareQwenPrompt(request, model_->tokenizer(),
                                      model_->VisionEncoder(), max_context_);
-    if (distributed_ && request.cache_prompt && !prepared.tokens.empty()) {
+    if (allow_distributed_snapshots_ && request.cache_prompt &&
+        !prepared.tokens.empty()) {
       auto stable_options = QwenChatOptions(request);
       stable_options.add_generation_prompt = false;
       const auto tools =
