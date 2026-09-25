@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -33,16 +34,18 @@ namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 
 constexpr std::uint32_t kWireMagic = 0x47554654U;  // "GUFT"
-constexpr std::uint32_t kWireVersion = 2;
+constexpr std::uint32_t kWireVersion = 3;
 constexpr std::uint32_t kCollectiveMagic = 0x47554348U;  // "GUCH"
-constexpr std::uint32_t kCollectiveVersion = 2;
-constexpr std::uint32_t kDataReadyMagic = 0x47554452U;  // "GUDR"
+constexpr std::uint32_t kCollectiveVersion = 3;
 constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
 constexpr std::size_t kBufferBytes = 64U << 20;
 constexpr std::uintptr_t kSendAddress = 0x0000700000000000ULL;
 constexpr std::uintptr_t kRecvAddress = kSendAddress + kBufferBytes;
+constexpr std::uintptr_t kResultAddress = kRecvAddress + kBufferBytes;
 constexpr std::uint32_t kPort = 1;
 constexpr auto kCollectiveTimeout = std::chrono::seconds(30);
+constexpr int kMemoryAccessFlags =
+    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
 
 void SetError(std::string* error_msg, std::string message) {
   if (error_msg != nullptr) {
@@ -287,6 +290,9 @@ private:
     timeout.tv_usec = 0;
     (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    const int no_delay = 1;
+    (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay,
+                       sizeof(no_delay));
   }
 
   int fd_{-1};
@@ -313,13 +319,6 @@ struct CollectiveHeader {
   std::uint32_t version{kCollectiveVersion};
   std::uint64_t sequence{0};
   std::uint64_t bytes{0};
-};
-
-struct DataReady {
-  std::uint32_t magic{kDataReadyMagic};
-  std::uint32_t reserved{0};
-  std::uint64_t sequence{0};
-  std::uint64_t offset{0};
 };
 
 class Ibrverbs final : public Communicator {
@@ -390,10 +389,14 @@ public:
       return false;
     }
     recv_registered_ = true;
+    if (!MapFixedBuffer(kResultAddress, &result_buffer_, error)) {
+      return false;
+    }
+    result_registered_ = true;
     send_mr_ = ibv_reg_mr(pd_, send_buffer_, kBufferBytes,
-                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+                          kMemoryAccessFlags);
     recv_mr_ = ibv_reg_mr(pd_, recv_buffer_, kBufferBytes,
-                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+                          kMemoryAccessFlags);
     if (send_mr_ == nullptr || recv_mr_ == nullptr) {
       SetError(error, "ibv_reg_mr for verbs buffers failed");
       return false;
@@ -418,7 +421,7 @@ public:
     attr.qp_state = IBV_QPS_INIT;
     attr.pkey_index = 0;
     attr.port_num = kPort;
-    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+    attr.qp_access_flags = kMemoryAccessFlags;
     if (ibv_modify_qp(qp_, &attr,
                       IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
                           IBV_QP_ACCESS_FLAGS) != 0) {
@@ -435,8 +438,10 @@ public:
     local.gid_index = static_cast<std::uint8_t>(config_.gid_index);
     local.link_layer = static_cast<std::uint8_t>(port.link_layer);
     local.sgid = local_sgid_;
-    local.remote_mr_address = reinterpret_cast<std::uint64_t>(recv_buffer_);
-    local.rkey = recv_mr_->rkey;
+    // The peer reads the staged send window after the collective header says
+    // that this rank's device-to-host copy is complete.
+    local.remote_mr_address = reinterpret_cast<std::uint64_t>(send_buffer_);
+    local.rkey = send_mr_->rkey;
 
     Socket control = config_.rank == 0
                          ? Socket::Listen(config_.bootstrap_host,
@@ -459,7 +464,7 @@ public:
         remote.port_num != kPort ||
         remote.link_layer != IBV_LINK_LAYER_INFINIBAND ||
         remote.mtu < IBV_MTU_256 || remote.mtu > IBV_MTU_4096 ||
-        remote.remote_mr_address != kRecvAddress || remote.rkey == 0) {
+        remote.remote_mr_address != kSendAddress || remote.rkey == 0) {
       SetError(error, "verbs bootstrap metadata is invalid");
       return false;
     }
@@ -501,7 +506,7 @@ public:
       SetError(error, "ibv_modify_qp RTS failed");
       return false;
     }
-    remote_address_ = remote.remote_mr_address;
+    remote_send_address_ = remote.remote_mr_address;
     remote_rkey_ = remote.rkey;
     const std::uint32_t ready = kReadyMagic;
     std::uint32_t peer_ready = 0;
@@ -548,6 +553,16 @@ public:
         .bytes = bytes,
     };
     CollectiveHeader incoming{};
+
+    // Stage before announcing readiness. The peer can then read directly from
+    // this send window without a per-chunk TCP data-ready round trip.
+    if (bytes != 0 &&
+        (hipStreamSynchronize(stream) != hipSuccess ||
+         hipMemcpy(send_buffer_, data, bytes, hipMemcpyDeviceToHost) !=
+             hipSuccess)) {
+      SetError(error, "HIP device-to-host all-reduce staging failed");
+      return false;
+    }
     if (!control_->SendAll(&outgoing, sizeof(outgoing), error) ||
         !control_->RecvAll(&incoming, sizeof(incoming), error)) {
       return false;
@@ -565,27 +580,20 @@ public:
              control_->RecvAll(&peer_ack, sizeof(peer_ack), error) &&
              peer_ack == kReadyMagic;
     }
-    if (hipStreamSynchronize(stream) != hipSuccess ||
-        hipMemcpy(send_buffer_, data, bytes, hipMemcpyDeviceToHost) !=
-            hipSuccess) {
-      SetError(error, "HIP device-to-host all-reduce staging failed");
-      return false;
-    }
     for (std::size_t offset = 0; offset < bytes; offset += kBufferBytes) {
       const std::size_t count = std::min(kBufferBytes, bytes - offset);
-      auto* source = static_cast<std::uint8_t*>(send_buffer_) + offset;
       auto* destination = static_cast<std::uint8_t*>(recv_buffer_) + offset;
       ibv_sge sge {};
-      sge.addr = reinterpret_cast<std::uint64_t>(source);
+      sge.addr = reinterpret_cast<std::uint64_t>(destination);
       sge.length = static_cast<unsigned>(count);
-      sge.lkey = send_mr_->lkey;
+      sge.lkey = recv_mr_->lkey;
       ibv_send_wr wr {};
       wr.wr_id = static_cast<std::uint64_t>(offset);
       wr.sg_list = &sge;
       wr.num_sge = 1;
       wr.send_flags = IBV_SEND_SIGNALED;
-      wr.opcode = IBV_WR_RDMA_WRITE;
-      wr.wr.rdma.remote_addr = remote_address_ + offset;
+      wr.opcode = IBV_WR_RDMA_READ;
+      wr.wr.rdma.remote_addr = remote_send_address_ + offset;
       wr.wr.rdma.rkey = remote_rkey_;
       if (ibv_post_send(qp_, &wr, nullptr) != 0) {
         SetError(error, "ibv_post_send failed");
@@ -594,27 +602,19 @@ public:
       if (!PollCompletion(offset, error)) {
         return false;
       }
-      const DataReady data_ready{
-          .sequence = sequence,
-          .offset = offset,
-      };
-      DataReady peer_ready{};
-      if (!control_->SendAll(&data_ready, sizeof(data_ready), error) ||
-          !control_->RecvAll(&peer_ready, sizeof(peer_ready), error)) {
-        return false;
-      }
-      if (peer_ready.magic != kDataReadyMagic ||
-          peer_ready.sequence != sequence || peer_ready.offset != offset) {
-        SetError(error, "verbs peer data-ready barrier mismatch");
-        return false;
-      }
-      auto* local = reinterpret_cast<float*>(source);
+      auto* local = reinterpret_cast<float*>(
+          static_cast<std::uint8_t*>(send_buffer_) + offset);
       const auto* peer = reinterpret_cast<const float*>(destination);
+      auto* result = reinterpret_cast<float*>(
+          static_cast<std::uint8_t*>(result_buffer_) + offset);
       const std::size_t values = count / sizeof(float);
       for (std::size_t i = 0; i < values; ++i) {
-        local[i] += peer[i];
+        result[i] = local[i] + peer[i];
       }
     }
+    // Receiving the peer acknowledgement means that its read of this send
+    // window is complete. The result window is independent, so the local
+    // host-to-device copy below can proceed without racing the peer.
     const std::uint32_t ack = kReadyMagic;
     std::uint32_t peer_ack = 0;
     if (!control_->SendAll(&ack, sizeof(ack), error) ||
@@ -625,7 +625,7 @@ public:
       }
       return false;
     }
-    if (hipMemcpy(data, send_buffer_, bytes, hipMemcpyHostToDevice) !=
+    if (hipMemcpy(data, result_buffer_, bytes, hipMemcpyHostToDevice) !=
             hipSuccess ||
         hipStreamSynchronize(stream) != hipSuccess) {
       SetError(error, "HIP host-to-device all-reduce staging failed");
@@ -650,7 +650,7 @@ private:
         continue;
       }
       if (completion.status != IBV_WC_SUCCESS) {
-        SetError(error, "verbs all-reduce write failed with status " +
+        SetError(error, "verbs all-reduce read failed with status " +
                             std::to_string(completion.status));
         return false;
       }
@@ -688,6 +688,11 @@ private:
       recv_registered_ = false;
     }
     recv_buffer_ = nullptr;
+    if (result_registered_) {
+      UnmapFixedBuffer(result_buffer_);
+      result_registered_ = false;
+    }
+    result_buffer_ = nullptr;
     if (cq_ != nullptr) {
       ibv_destroy_cq(cq_);
       cq_ = nullptr;
@@ -711,10 +716,12 @@ private:
   ibv_mr* recv_mr_{nullptr};
   void* send_buffer_{nullptr};
   void* recv_buffer_{nullptr};
+  void* result_buffer_{nullptr};
   bool send_registered_{false};
   bool recv_registered_{false};
+  bool result_registered_{false};
   ibv_gid local_sgid_{};
-  std::uint64_t remote_address_{0};
+  std::uint64_t remote_send_address_{0};
   std::uint32_t remote_rkey_{0};
   std::unique_ptr<Socket> control_;
   std::uint64_t sequence_{0};

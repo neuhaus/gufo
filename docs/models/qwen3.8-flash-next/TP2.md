@@ -87,9 +87,10 @@ multiple concurrent requests yet.
   embedding, and LM-head weights.
 - Rank 0 owns the shared expert; the routed layer output is reduced with the
   ordered communicator.
-- Host-staged synchronous RDMA is used first with identical fixed IOVA windows
-  and a small ordered TCP control/ack channel; HIP graph capture is disabled.
-  The probe fails safely if its fixed staging address is already occupied.
+- Host-staged synchronous RDMA reads use identical fixed IOVA windows for
+  send, receive, and result data, with a small ordered TCP control/ack
+  channel; HIP graph capture is disabled.
+  The probe fails safely if a fixed staging address is already occupied.
 - The initial host sum changes reduction order, so distributed logits are
   compared with an explicit tolerance rather than claimed bit-identical.
 - A rank with no locally selected experts emits a zero routed contribution

@@ -2,6 +2,7 @@
 
 | Experiment | Decision / evidence |
 | --- | --- |
+| TP2 staged RDMA-read all-reduce | Retained after two-host probe and exploratory C1 AR/MTP checks: replaced the per-chunk remote-write/data-ready exchange with staged RDMA reads, an independent result window, and TCP_NODELAY. AR TP2 moved 21.19→22.23 tok/s and MTP 29.89→30.25 tok/s; completion hashes stayed unchanged. These are development measurements, not published benchmark cells. |
 | Full-width MTP RMSNorm and split projection | Retained after independent CPU stage audit; one 10240-wide normalization, embedding projection shared across HC branches. |
 | Full Q8 vocabulary head | Retained; private Q4 shortlist removed. Sampled top-64 proposals use exact target verification. |
 | Batched MTP transformer and heads | Retained; independent body/head comparisons, private KV/recurrent/rollback/RNG state. |
