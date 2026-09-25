@@ -100,6 +100,7 @@ non-empty `control_token`:
       "bootstrap_port": 18515,
       "control_port": 18516,
       "control_token": "EXPERIMENT_ONLY_TOKEN",
+      "cache_reuse": false,
       "container_image": "gufo-tp2-dev:7.2.3",
       "workspace": "/path/to/gufo",
       "container_workspace": "/workspace/gufo",
@@ -108,6 +109,11 @@ non-empty `control_token`:
   }
 }
 ```
+
+Set `cache_reuse` to `true` only for the controlled live-prefix experiment;
+it enables symmetric rank-local prefix reuse through the v2 control protocol,
+without snapshot-byte transfer. The default `false` setting preserves the
+uncached C1 boundary.
 
 Run only the supported experimental d0 cells, with a separate artifact
 directory:
@@ -123,6 +129,20 @@ python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
   --artifacts-dir /tmp/gufo-tp2-artifacts --gguf "$MODEL" --mtp "$MTP" \
   run --target gufo --table single-mtp --depths 0 --context 4096 --mode mtp
 ```
+
+For a live-prefix depth experiment, use the cache-enabled overlay and select a
+single-user depth explicitly:
+
+```sh
+python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
+  --gufo build/gpu-tp2/gufo --config /tmp/bench-tp2-cache-reuse.json \
+  --artifacts-dir /tmp/gufo-tp2-cache-depth --gguf "$MODEL" --mtp "$MTP" \
+  run --target gufo --table single-ar --depths 4096 --context 8192 --mode ar
+```
+
+The qualified d4096 probe reused 4095 cached prompt tokens and prefilled 2043
+new tokens. MTP d4096 measured 32.94 tok/s mixed and 39.81 tok/s repetitive;
+these remain experimental results, not published cells.
 
 For the C1 corpus path, use an experiment configuration whose selected
 `multi-ar`/`multi-mtp` concurrency is `[1]`; the driver forces
@@ -158,10 +178,12 @@ experimental and must not be rendered into the published benchmark tables.
   compared with an explicit tolerance rather than claimed bit-identical.
 - A rank with no locally selected experts emits a zero routed contribution
   and still participates in the collective.
-- The serving runner marks distributed TP2 as serial-only and disables
-  snapshots, forks, prefix reuse, persistence, and batched decode. The C1 path
-  uses a separate rank-1 worker control channel and does not yet support
-  streaming, cancellation, sampled decoding, or concurrent requests.
+- The serving runner marks distributed TP2 as serial-only. The default C1 path
+  disables snapshots, forks, prefix reuse, persistence, and batched decode;
+  `--tp-cache-reuse` enables only symmetric live-prefix reuse on both ranks.
+  No snapshot bytes cross the host boundary. The C1 path uses a separate
+  rank-1 worker control channel and does not yet support streaming,
+  cancellation, sampled decoding, or concurrent requests.
 - Distributed snapshots, disk continuation, and vision are rejected for now.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact

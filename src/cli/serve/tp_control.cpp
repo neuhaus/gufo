@@ -23,7 +23,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 1;
+constexpr std::uint16_t kVersion = 2;
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
@@ -393,15 +393,18 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
   if (!handshaken_ || rank_ != 0 || command.max_tokens == 0 ||
       command.prompt_tokens.empty() ||
       command.prompt_tokens.size() > kMaxPromptTokens ||
+      command.cache_prefix_tokens > command.prompt_tokens.size() ||
       command.client_id.size() > kMaxClientIdBytes) {
     SetError(error, "TP control command is invalid");
     return false;
   }
   std::vector<std::uint8_t> payload;
-  payload.reserve(20 + command.prompt_tokens.size() * sizeof(std::int32_t) +
+  payload.reserve(28 + command.prompt_tokens.size() * sizeof(std::int32_t) +
                   command.client_id.size());
   AppendU64(&payload, command.sequence);
   AppendU32(&payload, command.max_tokens);
+  AppendU32(&payload, command.cache_prompt ? 1U : 0U);
+  AppendU32(&payload, command.cache_prefix_tokens);
   AppendU32(&payload, static_cast<std::uint32_t>(command.prompt_tokens.size()));
   AppendU32(&payload, static_cast<std::uint32_t>(command.client_id.size()));
   for (const auto token : command.prompt_tokens) {
@@ -425,14 +428,19 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
   std::size_t offset = 0;
   std::uint64_t embedded = 0;
   std::uint32_t max_tokens = 0;
+  std::uint32_t cache_prompt = 0;
+  std::uint32_t cache_prefix_tokens = 0;
   std::uint32_t prompt_count = 0;
   std::uint32_t client_size = 0;
   if (!ReadU64(command_prompt_, &offset, &embedded, error) ||
       !ReadU32(command_prompt_, &offset, &max_tokens, error) ||
+      !ReadU32(command_prompt_, &offset, &cache_prompt, error) ||
+      !ReadU32(command_prompt_, &offset, &cache_prefix_tokens, error) ||
       !ReadU32(command_prompt_, &offset, &prompt_count, error) ||
       !ReadU32(command_prompt_, &offset, &client_size, error) ||
       embedded != sequence || max_tokens == 0 ||
       prompt_count == 0 || prompt_count > kMaxPromptTokens ||
+      cache_prompt > 1 || cache_prefix_tokens > prompt_count ||
       max_context_ == 0 || prompt_count > max_context_ ||
       client_size > kMaxClientIdBytes ||
       command_prompt_.size() - offset !=
@@ -445,6 +453,8 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
   }
   command->sequence = sequence;
   command->max_tokens = max_tokens;
+  command->cache_prompt = cache_prompt != 0;
+  command->cache_prefix_tokens = cache_prefix_tokens;
   command->prompt_tokens.resize(prompt_count);
   for (auto& token : command->prompt_tokens) {
     std::uint32_t value = 0;
@@ -467,12 +477,14 @@ bool TpControlChannel::SendResponse(const TpControlResponse& response,
     return false;
   }
   std::vector<std::uint8_t> payload;
-  payload.reserve(28 + response.tokens.size() * sizeof(std::int32_t) +
+  payload.reserve(40 + response.tokens.size() * sizeof(std::int32_t) +
                   response.error.size());
   AppendU64(&payload, response.sequence);
   AppendU32(&payload, static_cast<std::uint32_t>(response.tokens.size()));
   AppendU64(&payload, response.draft_tokens);
   AppendU64(&payload, response.draft_accepted_tokens);
+  AppendU32(&payload, response.cached_prompt_tokens);
+  AppendU64(&payload, response.cache_snapshot_bytes);
   AppendU32(&payload, static_cast<std::uint32_t>(response.error.size()));
   for (const auto token : response.tokens) {
     AppendU32(&payload, static_cast<std::uint32_t>(token));
@@ -500,8 +512,13 @@ bool TpControlChannel::ReceiveResponse(TpControlResponse* response,
       !ReadU64(response_payload_, &offset, &response->draft_tokens, error) ||
       !ReadU64(response_payload_, &offset, &response->draft_accepted_tokens,
                error) ||
+      !ReadU32(response_payload_, &offset, &response->cached_prompt_tokens,
+               error) ||
+      !ReadU64(response_payload_, &offset, &response->cache_snapshot_bytes,
+               error) ||
       !ReadU32(response_payload_, &offset, &error_size, error) ||
       embedded != sequence || token_count > kMaxPromptTokens ||
+      response->cached_prompt_tokens > kMaxPromptTokens ||
       error_size > kMaxErrorBytes ||
       response_payload_.size() - offset !=
           static_cast<std::size_t>(token_count) * sizeof(std::int32_t) +

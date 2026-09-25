@@ -698,7 +698,7 @@ check(public_command(local_tp2).count("<redacted>") == 1,
 try:
     tp2_session.check_tp2_scope(tp2_config.table("single-ar"), depths=[4096])
 except RuntimeError as failure:
-    check("depth 0" in str(failure), "TP2 cached-depth rows are rejected explicitly")
+    check("cache_reuse" in str(failure), "TP2 cached-depth rows are rejected explicitly")
 else:
     raise AssertionError("TP2 cached-depth rows must not be measured")
 check(

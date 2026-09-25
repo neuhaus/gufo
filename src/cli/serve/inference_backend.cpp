@@ -2309,7 +2309,7 @@ public:
                 .batched_multi_token_decode = !distributed_ && use_mtp_,
                 .batched_multi_token_decode_max_width =
                     !distributed_ && use_mtp_ ? 8u : 0u,
-                .prefix_reuse = !distributed_,
+                .prefix_reuse = true,
             },
         .persistence = persistence_,
     };
@@ -2779,6 +2779,7 @@ struct InferenceBackend::Impl {
     std::shared_ptr<TpControlChannel> control;
     std::uint32_t tp_rank{0};
     std::uint32_t tp_world_size{1};
+    bool tp_allow_cache_reuse{false};
     std::string model_id;
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
@@ -2828,6 +2829,12 @@ struct InferenceBackend::Impl {
               result.tokens[i]) {
             throw std::runtime_error("TP worker token mismatch");
           }
+        }
+        if (response.draft_tokens != result.draft_tokens ||
+            response.draft_accepted_tokens != result.draft_accepted_tokens ||
+            response.cached_prompt_tokens != result.cached_prompt_tokens ||
+            response.cache_snapshot_bytes != result.cache_snapshot_bytes) {
+          throw std::runtime_error("TP worker cache/draft telemetry mismatch");
         }
       }
       if (!reasoning_end_.empty()) {
@@ -2894,12 +2901,16 @@ struct InferenceBackend::Impl {
     }
 
     if (current->control != nullptr) {
+      const bool use_cache_reuse = current->tp_allow_cache_reuse && cache_prompt;
+      const std::size_t worker_cache_prefix_tokens =
+          use_cache_reuse ? cache_prefix_tokens : 0;
       if (!sampling.can_use_unmodified_argmax() || context != nullptr ||
-          cache_prefix_tokens != 0 || !stop_sequences.empty() ||
+          (cache_prefix_tokens != 0 && !use_cache_reuse) ||
+          !stop_sequences.empty() ||
           max_tokens > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument(
-            "TP2 currently supports only greedy, uncached text requests "
-            "without stop sequences");
+            "TP2 requires greedy text without stop sequences and an explicitly "
+            "enabled cache-reuse path");
       }
       std::vector<std::int32_t> worker_prompt;
       worker_prompt.reserve(prompt_tokens.size());
@@ -2921,12 +2932,14 @@ struct InferenceBackend::Impl {
               .deadline = std::nullopt,
               .request_start = request_start,
               .prompt_context = nullptr,
-              .cache_prompt = false,
-              .cache_prefix_tokens = 0,
+              .cache_prompt = use_cache_reuse,
+              .cache_prefix_tokens = worker_cache_prefix_tokens,
           });
       TpControlCommand command{
           .sequence = sequence,
           .max_tokens = static_cast<std::uint32_t>(max_tokens),
+          .cache_prompt = use_cache_reuse,
+          .cache_prefix_tokens = static_cast<std::uint32_t>(worker_cache_prefix_tokens),
           .prompt_tokens = std::move(worker_prompt),
           .client_id = client_id,
       };
@@ -2954,6 +2967,12 @@ struct InferenceBackend::Impl {
             result.tokens[i]) {
           throw std::runtime_error("TP worker token mismatch");
         }
+      }
+      if (response.draft_tokens != result.draft_tokens ||
+          response.draft_accepted_tokens != result.draft_accepted_tokens ||
+          response.cached_prompt_tokens != result.cached_prompt_tokens ||
+          response.cache_snapshot_bytes != result.cache_snapshot_bytes) {
+        throw std::runtime_error("TP worker cache/draft telemetry mismatch");
       }
       return result;
     }
@@ -3521,6 +3540,7 @@ bool InferenceBackend::load(
     new_state->control = tp_config.control;
     new_state->tp_rank = tp_rank;
     new_state->tp_world_size = tp_world_size;
+    new_state->tp_allow_cache_reuse = tp_config.allow_cache_reuse;
     if (tp_world_size > 1) {
       const TpControlConfig control_config{
           .rank = tp_rank,
@@ -3585,8 +3605,8 @@ bool InferenceBackend::run_worker(std::string* error) {
               .deadline = std::nullopt,
               .request_start = Clock::now(),
               .prompt_context = nullptr,
-              .cache_prompt = false,
-              .cache_prefix_tokens = 0,
+              .cache_prompt = command.cache_prompt,
+              .cache_prefix_tokens = command.cache_prefix_tokens,
           });
       const auto result = request.Wait({});
       response.tokens.reserve(result.tokens.size());
@@ -3600,6 +3620,11 @@ bool InferenceBackend::run_worker(std::string* error) {
       }
       response.draft_tokens = result.draft_tokens;
       response.draft_accepted_tokens = result.draft_accepted_tokens;
+      if (result.cached_prompt_tokens > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("TP worker cached prompt count is out of range");
+      }
+      response.cached_prompt_tokens = static_cast<std::uint32_t>(result.cached_prompt_tokens);
+      response.cache_snapshot_bytes = result.cache_snapshot_bytes;
       response.error = result.cancelled ? "worker request cancelled" : "";
     } catch (const std::exception& exception) {
       response.error = exception.what();
@@ -3809,13 +3834,18 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
   if (state->control != nullptr) {
+    const bool use_cache_reuse =
+        state->tp_allow_cache_reuse && request.cache_prompt;
+    const std::size_t worker_cache_prefix_tokens =
+        use_cache_reuse ? prompt->cache_prefix_tokens : 0;
     if (stream_output || !sampling_config.can_use_unmodified_argmax() ||
-        prompt->context != nullptr || prompt->cache_prefix_tokens != 0 ||
+        prompt->context != nullptr ||
+        (prompt->cache_prefix_tokens != 0 && !use_cache_reuse) ||
         !request.stop_sequences.empty() ||
         max_tokens > std::numeric_limits<std::uint32_t>::max()) {
       throw std::invalid_argument(
-          "TP2 start_chat supports one greedy, uncached non-stream request "
-          "without stop sequences");
+          "TP2 start_chat requires one greedy request without stop sequences "
+          "and an explicitly enabled cache-reuse path");
     }
     std::vector<std::int32_t> worker_prompt;
     worker_prompt.reserve(prompt->tokens.size());
@@ -3836,12 +3866,14 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
             .deadline = std::nullopt,
             .request_start = request_start,
             .prompt_context = nullptr,
-            .cache_prompt = false,
-            .cache_prefix_tokens = 0,
+            .cache_prompt = use_cache_reuse,
+            .cache_prefix_tokens = worker_cache_prefix_tokens,
         });
     TpControlCommand command{
         .sequence = sequence,
         .max_tokens = static_cast<std::uint32_t>(max_tokens),
+        .cache_prompt = use_cache_reuse,
+        .cache_prefix_tokens = static_cast<std::uint32_t>(worker_cache_prefix_tokens),
         .prompt_tokens = std::move(worker_prompt),
         .client_id = client_id,
     };

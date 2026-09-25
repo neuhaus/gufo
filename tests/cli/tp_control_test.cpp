@@ -92,6 +92,8 @@ int main() {
 
   TpControlCommand command{.sequence = 7,
                            .max_tokens = 4,
+                           .cache_prompt = true,
+                           .cache_prefix_tokens = 2,
                            .prompt_tokens = {10, 11, 12},
                            .client_id = "probe"};
   Require(server->SendCommand(command, &server_error), server_error);
@@ -99,6 +101,8 @@ int main() {
   Require(client->ReceiveCommand(&received, &client_error), client_error);
   Require(received.sequence == command.sequence &&
               received.max_tokens == command.max_tokens &&
+              received.cache_prompt == command.cache_prompt &&
+              received.cache_prefix_tokens == command.cache_prefix_tokens &&
               received.prompt_tokens == command.prompt_tokens &&
               received.client_id == command.client_id,
           "TP control command round trip");
@@ -107,6 +111,8 @@ int main() {
                              .tokens = {20, 21},
                              .draft_tokens = 3,
                              .draft_accepted_tokens = 2,
+                             .cached_prompt_tokens = 2,
+                             .cache_snapshot_bytes = 4096,
                              .error = {}};
   Require(client->SendResponse(response, &client_error), client_error);
   TpControlResponse received_response;
@@ -116,7 +122,11 @@ int main() {
               received_response.tokens == response.tokens &&
               received_response.draft_tokens == response.draft_tokens &&
               received_response.draft_accepted_tokens ==
-                  response.draft_accepted_tokens,
+                  response.draft_accepted_tokens &&
+              received_response.cached_prompt_tokens ==
+                  response.cached_prompt_tokens &&
+              received_response.cache_snapshot_bytes ==
+                  response.cache_snapshot_bytes,
           "TP control response round trip");
 
   Require(server->port() == port && client->port() == port,

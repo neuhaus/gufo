@@ -23,6 +23,8 @@ struct TpControlConfig {
 struct TpControlCommand {
   std::uint64_t sequence{0};
   std::uint32_t max_tokens{0};
+  bool cache_prompt{false};
+  std::uint32_t cache_prefix_tokens{0};
   std::vector<std::int32_t> prompt_tokens;
   std::string client_id;
 };
@@ -32,6 +34,8 @@ struct TpControlResponse {
   std::vector<std::int32_t> tokens;
   std::uint64_t draft_tokens{0};
   std::uint64_t draft_accepted_tokens{0};
+  std::uint32_t cached_prompt_tokens{0};
+  std::uint64_t cache_snapshot_bytes{0};
   std::string error;
 };
 

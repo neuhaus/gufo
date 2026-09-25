@@ -129,6 +129,10 @@ class Session:
         return self.tp2_config is not None
 
     @property
+    def tp2_cache_reuse(self) -> bool:
+        return bool((self.tp2_config or {}).get("cache_reuse"))
+
+    @property
     def stream_requests(self) -> bool:
         if self.request_transport == "json":
             return False
@@ -149,10 +153,10 @@ class Session:
                 f"TP2 benchmark does not support {table.kind} tables; "
                 "the two-host topology is not comparable to the published one-host method"
             )
-        if table.kind == "single" and depths and any(depth != 0 for depth in depths):
+        if (table.kind == "single" and depths and any(depth != 0 for depth in depths)
+                and not self.tp2_cache_reuse):
             raise RuntimeError(
-                "TP2 benchmark currently supports only single-user depth 0; "
-                "distributed snapshot/state transfer is required for cached prefixes"
+                "TP2 benchmark cached depths require the explicit cache_reuse experiment flag"
             )
         if table.kind == "multi" and users != 1:
             raise RuntimeError(
@@ -287,6 +291,8 @@ class Session:
             "--tp-control-port", str(config.get("control_port", 18516)),
             "--tp-control-token", str(config["control_token"]),
         ]
+        if config.get("cache_reuse"):
+            command.append("--tp-cache-reuse")
         if rank == 1:
             command += ["--tp-bootstrap-host", str(config["bootstrap_host"])]
         return command
@@ -465,25 +471,33 @@ class Session:
         if version:
             notes = [f"{self.config.reference_name}: {version}", *notes]
         if command and command[0] == "tp2":
+            cache_note = (
+                "symmetric live-prefix cache reuse is enabled"
+                if self.tp2_cache_reuse else
+                "requests are uncached"
+            )
             notes = [
                 *notes,
                 "TP2 paired topology: rank 0 owns HTTP and rank 1 is the remote worker; "
-                "requests use the qualified non-streaming C1 path; control credentials "
-                "and endpoint addresses are omitted",
+                f"requests use the qualified non-streaming C1 path; {cache_note}; "
+                "control credentials and endpoint addresses are omitted",
             ]
         artifact = new_artifact(
             self.config, table, self.target, mode=mode, command=command,
             source=self.source, fingerprint=self.fingerprint, notes=notes,
         )
         if command and command[0] == "tp2":
+            limitations = ["C1 only", "greedy only", "non-streaming only"]
+            limitations.append(
+                "symmetric live-prefix cache; no snapshot-byte transfer"
+                if self.tp2_cache_reuse else "uncached d0 only"
+            )
+            limitations.append("no published benchmark comparison")
             artifact["topology"] = {
                 "id": "tp2",
                 "worldSize": 2,
                 "requestTransport": "openai-chat-completions-json",
-                "limitations": [
-                    "C1 only", "greedy only", "uncached d0 only",
-                    "non-streaming only", "no published benchmark comparison",
-                ],
+                "limitations": limitations,
                 "rankFingerprints": self.rank_fingerprints(),
             }
         return artifact
