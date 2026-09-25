@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -119,15 +120,29 @@ struct TpResponseExpectation {
 [[nodiscard]] bool ValidateTpControlResponse(const TpControlResponse& response,
                                              std::string* error);
 
+/// Default bound on a blocking control-channel send, and on a receive before
+/// the handshake completes. It is generous because a rank waits in the
+/// handshake while its peer is still loading the model.
+inline constexpr std::chrono::milliseconds kTpControlIoTimeout =
+    std::chrono::hours(24);
+
 /// Ordered, versioned TCP control channel for the first TP=2 worker slice.
 /// Tensor payload still uses the RDMA communicator; this channel carries only
 /// prepared prompt/cohort commands, responses, and lifecycle handshakes.
+///
+/// `io_timeout` bounds every blocking send, and every receive until the
+/// handshake succeeds. After the handshake receives have no timeout: a worker
+/// waits for its next command, and rank 0's reader for its next response, for
+/// as long as the server stays idle. TCP keepalive still reports a peer whose
+/// host died.
 class TpControlChannel final {
 public:
   [[nodiscard]] static std::shared_ptr<TpControlChannel> Listen(
-      std::uint16_t port, std::string* error);
+      std::uint16_t port, std::string* error,
+      std::chrono::milliseconds io_timeout = kTpControlIoTimeout);
   [[nodiscard]] static std::shared_ptr<TpControlChannel> Connect(
-      const std::string& host, std::uint16_t port, std::string* error);
+      const std::string& host, std::uint16_t port, std::string* error,
+      std::chrono::milliseconds io_timeout = kTpControlIoTimeout);
 
   ~TpControlChannel();
 

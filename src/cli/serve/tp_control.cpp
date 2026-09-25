@@ -3,6 +3,8 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -51,11 +53,36 @@ std::string SystemError(const char* operation) {
   return std::string(operation) + ": " + std::strerror(errno);
 }
 
-void SetOperationTimeouts(int fd) {
+/// Bounds blocking sends and pre-handshake receives, and turns on TCP
+/// keepalive so a peer whose host died is reported even on an idle channel.
+void SetStartupSocketOptions(int fd, std::chrono::milliseconds io_timeout) {
+  const auto milliseconds = std::max<std::int64_t>(io_timeout.count(), 1);
   timeval timeout{};
-  timeout.tv_sec = 24 * 60 * 60;
+  timeout.tv_sec = static_cast<time_t>(milliseconds / 1000);
+  timeout.tv_usec = static_cast<suseconds_t>((milliseconds % 1000) * 1000);
   (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  const int enabled = 1;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
+#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
+  // Probe after one idle minute, then every ten seconds: a dead host is
+  // reported about two minutes after it stops answering.
+  const int idle_seconds = 60;
+  const int interval_seconds = 10;
+  const int probes = 6;
+  (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_seconds,
+                     sizeof(idle_seconds));
+  (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_seconds,
+                     sizeof(interval_seconds));
+  (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes));
+#endif
+}
+
+/// After the handshake a rank waits for the next command or response for as
+/// long as the server stays idle, so a receive timeout would end the pair.
+void ClearReceiveTimeout(int fd) {
+  const timeval none{};
+  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof(none));
 }
 
 void AppendU32(std::vector<std::uint8_t>* out, std::uint32_t value) {
@@ -401,8 +428,9 @@ TpControlChannel::TpControlChannel(int fd, std::uint32_t rank,
   }
 }
 
-std::shared_ptr<TpControlChannel> TpControlChannel::Listen(std::uint16_t port,
-                                                           std::string* error) {
+std::shared_ptr<TpControlChannel> TpControlChannel::Listen(
+    std::uint16_t port, std::string* error,
+    std::chrono::milliseconds io_timeout) {
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     SetError(error, SystemError("TP control socket"));
@@ -437,12 +465,13 @@ std::shared_ptr<TpControlChannel> TpControlChannel::Listen(std::uint16_t port,
     SetError(error, SystemError("TP control accept"));
     return nullptr;
   }
-  SetOperationTimeouts(peer);
+  SetStartupSocketOptions(peer, io_timeout);
   return std::shared_ptr<TpControlChannel>(new TpControlChannel(peer, 0, port));
 }
 
 std::shared_ptr<TpControlChannel> TpControlChannel::Connect(
-    const std::string& host, std::uint16_t port, std::string* error) {
+    const std::string& host, std::uint16_t port, std::string* error,
+    std::chrono::milliseconds io_timeout) {
   if (host.empty()) {
     SetError(error, "TP control rank one requires a host");
     return nullptr;
@@ -495,7 +524,7 @@ std::shared_ptr<TpControlChannel> TpControlChannel::Connect(
     }
     ::freeaddrinfo(addresses);
     if (fd >= 0) {
-      SetOperationTimeouts(fd);
+      SetStartupSocketOptions(fd, io_timeout);
       return std::shared_ptr<TpControlChannel>(
           new TpControlChannel(fd, 1, port));
     }
@@ -698,6 +727,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   world_size_ = config.world_size;
   max_context_ = config.max_context;
   handshaken_ = true;
+  ClearReceiveTimeout(fd_);
   return true;
 }
 

@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -581,6 +582,65 @@ int main() {
               interrupt_wait_error.find("test response reader interruption") !=
                   std::string::npos,
           "TP broker failure wakes a blocked response waiter");
+
+  // An idle pair must outlive its I/O timeout: after the handshake the worker
+  // waits for its next command, and rank 0's broker for its next response, for
+  // as long as the server is idle. A short timeout stands in for the
+  // production default, which used to end an idle pair after 24 hours.
+  constexpr std::chrono::milliseconds kShortIoTimeout{300};
+  const auto idle_port = FreePort();
+  std::shared_ptr<TpControlChannel> idle_client;
+  std::thread idle_connector([&] {
+    idle_client = TpControlChannel::Connect("127.0.0.1", idle_port,
+                                            &client_error, kShortIoTimeout);
+  });
+  auto idle_server =
+      TpControlChannel::Listen(idle_port, &server_error, kShortIoTimeout);
+  idle_connector.join();
+  Require(idle_server != nullptr && idle_client != nullptr,
+          "TP idle pair connects");
+  bool idle_server_handshake = false;
+  bool idle_client_handshake = false;
+  std::thread idle_server_thread([&] {
+    idle_server_handshake = idle_server->Handshake(rank0, &server_error);
+  });
+  std::thread idle_client_thread([&] {
+    idle_client_handshake = idle_client->Handshake(rank1, &client_error);
+  });
+  idle_server_thread.join();
+  idle_client_thread.join();
+  Require(idle_server_handshake && idle_client_handshake,
+          "TP idle pair handshakes");
+
+  bool idle_command_received = false;
+  TpControlCommand idle_command;
+  std::string idle_error;
+  std::thread idle_worker([&] {
+    idle_command_received =
+        idle_client->ReceiveCommand(&idle_command, &idle_error);
+  });
+  std::this_thread::sleep_for(kShortIoTimeout * 4);
+  Require(idle_server->SendCommand(command, &server_error), server_error);
+  idle_worker.join();
+  Require(idle_command_received && idle_command.sequence == command.sequence,
+          "TP worker survives an idle wait longer than its I/O timeout: " +
+              idle_error);
+
+  TpResponseBroker idle_broker(idle_server, 1);
+  Require(idle_broker.RegisterPendingResponse(command.sequence, &server_error),
+          server_error);
+  std::this_thread::sleep_for(kShortIoTimeout * 4);
+  const TpControlResponse idle_response{.sequence = command.sequence,
+                                        .tokens = {20, 21}};
+  Require(idle_client->SendResponse(idle_response, &client_error),
+          client_error);
+  TpControlResponse idle_received;
+  Require(idle_broker.WaitForResponse(command.sequence, &idle_received,
+                                      &server_error),
+          "TP broker survives an idle wait longer than its I/O timeout: " +
+              server_error);
+  Require(idle_received.tokens == idle_response.tokens,
+          "TP broker delivers the response that arrived after the idle wait");
 
   Require(server->port() == port && client->port() == port,
           "TP control service port");
