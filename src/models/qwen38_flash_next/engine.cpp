@@ -353,7 +353,7 @@ std::uint32_t Session::KeptHiddenRows() const noexcept {
 }
 
 std::uint64_t Session::SnapshotBytes() const {
-  if (!valid_ || model_->options_.tp_world_size > 1)
+  if (!valid_)
     return 0;
   return SessionSnapshotHostBytes(static_cast<std::uint32_t>(tokens_.size()),
                                   model_->VocabSize(), image_identity_.size()) +
@@ -362,11 +362,6 @@ std::uint64_t Session::SnapshotBytes() const {
 
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
     std::string* error_msg) const {
-  if (model_->options_.tp_world_size > 1) {
-    AssignError(error_msg,
-                "distributed Flash-Next snapshots are not supported yet");
-    return nullptr;
-  }
   if (!valid_ || tokens_.empty() || tokens_.size() != session_->position() ||
       tokens_.size() > std::numeric_limits<std::uint32_t>::max()) {
     AssignError(error_msg, "snapshot needs a synced, non-empty context");
@@ -414,16 +409,21 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
 
 bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                               std::string* error_msg) {
-  return RestoreSnapshot(snapshot.bytes(), error_msg);
+  return RestoreSnapshotPayload(snapshot.bytes(), error_msg);
 }
 
 bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
                               std::string* error_msg) {
   if (model_->options_.tp_world_size > 1) {
     AssignError(error_msg,
-                "distributed Flash-Next snapshots are not supported yet");
+                "distributed Flash-Next serialized snapshots are not supported");
     return false;
   }
+  return RestoreSnapshotPayload(payload, error_msg);
+}
+
+bool Session::RestoreSnapshotPayload(
+    std::span<const std::uint8_t> payload, std::string* error_msg) {
   SessionSnapshotHeader header{};
   if (payload.size() < sizeof(header)) {
     AssignError(error_msg, "session snapshot is truncated");

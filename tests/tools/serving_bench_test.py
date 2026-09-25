@@ -701,6 +701,22 @@ except RuntimeError as failure:
     check("cache_reuse" in str(failure), "TP2 cached-depth rows are rejected explicitly")
 else:
     raise AssertionError("TP2 cached-depth rows must not be measured")
+tp2_config.data["gufo"]["tp2"]["cache_reuse"] = True
+local_cache, remote_cache, _, _, _, _ = tp2_session._tp2_commands(
+    tp2_config.table("single-ar"), mode="ar", context=8192, sessions=1,
+    port=18081, tag="cache",
+)
+check("--tp-cache-reuse" in local_cache and "--tp-cache-reuse" in remote_cache,
+      "cache reuse is explicitly forwarded to both ranks")
+tp2_session.check_tp2_scope(tp2_config.table("single-ar"), depths=[4096])
+check(True, "cache-enabled TP2 accepts an explicit depth")
+tp2_config.data["gufo"]["tp2"].pop("cache_reuse")
+try:
+    tp2_session.check_tp2_scope(tp2_config.table("multi-ar"), users=2)
+except RuntimeError as failure:
+    check("C1" in str(failure), "TP2 C>1 remains explicitly unqualified")
+else:
+    raise AssertionError("TP2 C>1 scope must remain rejected")
 check(
     Tp2Server(Server([], "/ready", Path("/unused")), ["podman", "run", "a b"],
              remote_host="misty", remote_log_path=Path("/unused-rank1"))._ssh_command(

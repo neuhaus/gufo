@@ -76,11 +76,13 @@ build/gpu-tp2/gufo serve llm \
 ```
 
 The worker uses a separate ordered TCP control channel for prepared prompt
-submissions. Both ranks must receive the same `--tp-control-token` and
-prefill chunk setting (`--prefill-chunk`). RDMA remains
-the tensor transport. Do not use this C1 path for
-streaming, cancellation, sampled decoding, vision, disk continuation, or
-multiple concurrent requests yet.
+submissions. Both ranks must receive the same `--tp-control-token`, prefill
+chunk setting (`--prefill-chunk`), and cache policy. RDMA remains the tensor
+transport. Do not use this C1 path for streaming, cancellation, sampled
+decoding, vision, disk continuation, or multiple concurrent requests yet. For
+the controlled cache experiment, append `--tp-cache-reuse` to both rank
+commands; the flag is explicit and is not enabled by the default TP2
+configuration.
 
 ## Experimental benchmark driver
 
@@ -110,10 +112,11 @@ non-empty `control_token`:
 }
 ```
 
-Set `cache_reuse` to `true` only for the controlled live-prefix experiment;
-it enables symmetric rank-local prefix reuse through the v2 control protocol,
-without snapshot-byte transfer. The default `false` setting preserves the
-uncached C1 boundary.
+Set `cache_reuse` to `true` only for the controlled live-prefix/snapshot
+experiment. It enables symmetric rank-local live-prefix reuse plus one
+retained immutable boundary through the v3 control handshake. Snapshot bytes
+stay in each rank's host memory; no snapshot payload is sent over TCP or
+RDMA. The default `false` setting preserves the uncached C1 boundary.
 
 Run only the supported experimental d0 cells, with a separate artifact
 directory:
@@ -141,8 +144,11 @@ python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
 ```
 
 The qualified d4096 probe reused 4095 cached prompt tokens and prefilled 2043
-new tokens. Clean-source MTP d4096 measured 32.57 tok/s mixed and 39.49 tok/s
-repetitive; these remain experimental results, not published cells.
+new tokens. A paired historical-branch probe also restored the older stable
+prompt boundary after a live continuation; both ranks reported the same
+cached-token count, and MTP retained its draft acceptance. Clean-source MTP
+d4096 measured 32.57 tok/s mixed and 39.49 tok/s repetitive; these remain
+experimental results, not published cells.
 
 For the C1 corpus path, use an experiment configuration whose selected
 `multi-ar`/`multi-mtp` concurrency is `[1]`; the driver forces
@@ -179,12 +185,16 @@ experimental and must not be rendered into the published benchmark tables.
 - A rank with no locally selected experts emits a zero routed contribution
   and still participates in the collective.
 - The serving runner marks distributed TP2 as serial-only. The default C1 path
-  disables snapshots, forks, prefix reuse, persistence, and batched decode;
-  `--tp-cache-reuse` enables only symmetric live-prefix reuse on both ranks.
-  No snapshot bytes cross the host boundary. The C1 path uses a separate
-  rank-1 worker control channel and does not yet support streaming,
-  cancellation, sampled decoding, or concurrent requests.
-- Distributed snapshots, disk continuation, and vision are rejected for now.
+  disables snapshots, forks, prefix reuse, persistence, and batched decode.
+  `--tp-cache-reuse` enables symmetric rank-local live-prefix reuse and one
+  immutable in-process snapshot/fork boundary; both ranks must use the flag
+  and the control handshake rejects policy mismatches. No snapshot bytes cross
+  the host boundary. The C1 path uses a separate rank-1 worker control channel
+  and does not yet support streaming, cancellation, sampled decoding, or
+  concurrent requests.
+- Serialized/distributed disk snapshots, arbitrary historical-prefix indexes,
+  and vision remain rejected. Only the stable prompt boundary and current live
+  frontier are retained by this experimental C1 slice.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
   routed source bytes and the device model reports post-conversion resident

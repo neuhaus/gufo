@@ -226,6 +226,8 @@ public:
                                      std::string* error_msg = nullptr);
 
 private:
+  [[nodiscard]] bool RestoreSnapshotPayload(
+      std::span<const std::uint8_t> payload, std::string* error_msg);
   friend class Model;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
 

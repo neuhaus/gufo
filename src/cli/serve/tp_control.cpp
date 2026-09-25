@@ -23,7 +23,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 2;
+constexpr std::uint16_t kVersion = 3;
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
@@ -340,6 +340,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   AppendU32(&payload, config.prefill_chunk_tokens);
   AppendU32(&payload, config.max_draft_tokens);
   AppendU32(&payload, config.use_mtp ? 1U : 0U);
+  AppendU32(&payload, config.allow_cache_reuse ? 1U : 0U);
   AppendU32(&payload, static_cast<std::uint32_t>(config.auth_token.size()));
   payload.insert(payload.end(), config.auth_token.begin(),
                  config.auth_token.end());
@@ -359,6 +360,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   std::uint32_t prefill_chunk = 0;
   std::uint32_t draft = 0;
   std::uint32_t mtp = 0;
+  std::uint32_t cache_reuse = 0;
   std::uint32_t auth_size = 0;
   std::string peer_token;
   if (!ReadU32(peer, &offset, &rank, error) ||
@@ -367,6 +369,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
       !ReadU32(peer, &offset, &prefill_chunk, error) ||
       !ReadU32(peer, &offset, &draft, error) ||
       !ReadU32(peer, &offset, &mtp, error) ||
+      !ReadU32(peer, &offset, &cache_reuse, error) ||
       !ReadU32(peer, &offset, &auth_size, error) ||
       auth_size > kMaxAuthTokenBytes || peer.size() - offset != auth_size) {
     SetError(error, "TP control hello payload is invalid");
@@ -378,7 +381,9 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
       context != config.max_context ||
       prefill_chunk != config.prefill_chunk_tokens ||
       draft != config.max_draft_tokens ||
-      mtp != (config.use_mtp ? 1U : 0U) || peer_token != auth_token_) {
+      mtp != (config.use_mtp ? 1U : 0U) ||
+      cache_reuse != (config.allow_cache_reuse ? 1U : 0U) ||
+      peer_token != auth_token_) {
     SetError(error, "TP control hello configuration mismatch");
     return false;
   }

@@ -571,7 +571,13 @@ public:
     if (incoming.magic != kCollectiveMagic ||
         incoming.version != kCollectiveVersion ||
         incoming.sequence != outgoing.sequence || incoming.bytes != bytes) {
-      SetError(error, "verbs collective sequence or size mismatch");
+      if (error != nullptr) {
+        *error = "verbs collective sequence or size mismatch: outgoing=" +
+                 std::to_string(outgoing.sequence) + "/" +
+                 std::to_string(outgoing.bytes) + " incoming=" +
+                 std::to_string(incoming.sequence) + "/" +
+                 std::to_string(incoming.bytes);
+      }
       return false;
     }
     if (bytes == 0) {

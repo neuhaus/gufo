@@ -73,6 +73,7 @@ int main() {
                         .max_context = 4096,
                         .max_draft_tokens = 7,
                         .use_mtp = true,
+                        .allow_cache_reuse = true,
                         .auth_token = "test-token",
                         .prefill_chunk_tokens = 512};
   TpControlConfig rank1 = rank0;
@@ -128,6 +129,34 @@ int main() {
               received_response.cache_snapshot_bytes ==
                   response.cache_snapshot_bytes,
           "TP control response round trip");
+
+  const auto mismatch_port = FreePort();
+  std::shared_ptr<TpControlChannel> mismatch_client;
+  std::thread mismatch_connector([&] {
+    mismatch_client = TpControlChannel::Connect("127.0.0.1", mismatch_port,
+                                                 &client_error);
+  });
+  auto mismatch_server = TpControlChannel::Listen(mismatch_port, &server_error);
+  mismatch_connector.join();
+  Require(mismatch_server != nullptr && mismatch_client != nullptr,
+          "TP control mismatch pair connects");
+  TpControlConfig mismatch_rank0 = rank0;
+  TpControlConfig mismatch_rank1 = rank1;
+  mismatch_rank1.allow_cache_reuse = false;
+  bool mismatch_server_handshake = false;
+  bool mismatch_client_handshake = false;
+  std::thread mismatch_server_thread([&] {
+    mismatch_server_handshake =
+        mismatch_server->Handshake(mismatch_rank0, &server_error);
+  });
+  std::thread mismatch_client_thread([&] {
+    mismatch_client_handshake =
+        mismatch_client->Handshake(mismatch_rank1, &client_error);
+  });
+  mismatch_server_thread.join();
+  mismatch_client_thread.join();
+  Require(!mismatch_server_handshake && !mismatch_client_handshake,
+          "TP control rejects cache-policy mismatch");
 
   Require(server->port() == port && client->port() == port,
           "TP control service port");
