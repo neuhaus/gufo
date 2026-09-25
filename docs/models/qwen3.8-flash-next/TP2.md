@@ -215,6 +215,26 @@ experimental and must not be rendered into the published benchmark tables.
   The first qualification slice, if pursued, is fixed two-request C2, AR before
   MTP, uncached and non-streaming, with repeated ordering/failure tests and
   per-request hashes; it must not be enabled by a CLI alias alone.
+- C2 qualification is landing as three ordered layers, none of which enables a
+  shared collective or a second session:
+  - Protocol v5 validates a dormant two-member AR-only cohort envelope, canonical
+    execution/cache plan digests, ordered member results, and broker mismatch
+    poisoning.
+  - The scheduler atomically admits exactly two ordered, unique members under one
+    cohort identity, and rejects incomplete, duplicate, third-member, sampled,
+    streaming, cached, continued, cancelled, and deadline-bearing cohorts before
+    any model work. Admitted members still select `serial-c1` execution.
+  - A translation seam converts a validated command into ordered scheduler
+    members and two member results into a strict C2 response, rejecting any
+    member that does not report serial width and zero draft/cache telemetry. A
+    rejected cohort still returns both member envelopes.
+
+  The rank-1 worker dispatches `kCohort2Ar` through those layers under exactly
+  one operation lease scoped to the command sequence, and fails closed when an
+  MTP sidecar is loaded because drafts cannot be represented by the C2 response
+  contract. That path stays dormant: no producer constructs a C2 command, and
+  the scope is bound before admission so a rejection cannot leak a bound scope
+  into the next command.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
   routed source bytes and the device model reports post-conversion resident

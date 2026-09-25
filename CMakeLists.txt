@@ -216,6 +216,7 @@ add_executable(gufo
   src/cli/serve/continuation_disk_store.cpp
   src/cli/serve/text_model_runner.cpp
   src/cli/serve/text_generation_scheduler.cpp
+  src/cli/serve/tp_cohort_plan.cpp
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
 )
