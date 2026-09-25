@@ -23,6 +23,7 @@ struct TpControlConfig {
 };
 
 struct TpControlCommand {
+  /// Response correlation key and C1 RDMA collective scope.
   std::uint64_t sequence{0};
   std::uint32_t max_tokens{0};
   bool cache_prompt{false};
@@ -32,6 +33,7 @@ struct TpControlCommand {
 };
 
 struct TpControlResponse {
+  /// Correlates with the command and its bound C1 collective scope.
   std::uint64_t sequence{0};
   std::vector<std::int32_t> tokens;
   std::uint64_t draft_tokens{0};

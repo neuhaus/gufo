@@ -26,7 +26,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 3;  // adds symmetric cache-policy parity
+constexpr std::uint16_t kVersion = 4;  // operation scope and cache-policy parity
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;

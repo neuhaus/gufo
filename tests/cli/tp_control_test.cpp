@@ -131,6 +131,31 @@ int main() {
                   response.cache_snapshot_bytes,
           "TP control response round trip");
 
+  TpControlCommand zero_scope_command{
+      .sequence = 0,
+      .max_tokens = 1,
+      .cache_prompt = false,
+      .cache_prefix_tokens = 0,
+      .prompt_tokens = {13},
+      .client_id = "zero-scope",
+  };
+  TpControlCommand received_zero_scope;
+  Require(server->SendCommand(zero_scope_command, &server_error),
+          server_error);
+  Require(client->ReceiveCommand(&received_zero_scope, &client_error),
+          client_error);
+  Require(received_zero_scope.sequence == 0,
+          "TP control preserves a zero operation scope");
+  const TpControlResponse zero_scope_response{
+      .sequence = 0, .tokens = {14}, .error = {}};
+  TpControlResponse received_zero_scope_response;
+  Require(client->SendResponse(zero_scope_response, &client_error),
+          client_error);
+  Require(server->ReceiveResponse(&received_zero_scope_response, &server_error),
+          server_error);
+  Require(received_zero_scope_response.sequence == 0,
+          "TP control response preserves a zero operation scope");
+
   const auto mismatch_port = FreePort();
   std::shared_ptr<TpControlChannel> mismatch_client;
   std::thread mismatch_connector([&] {

@@ -1,3 +1,6 @@
+// TP=2 probe: --tp-rank 0|1 --tp-world-size 2
+//              --tp-bootstrap-host HOST --tp-bootstrap-port PORT
+//              --tp-operation-id N (same on both ranks)
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -9,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "src/core/sampling.hpp"
@@ -21,11 +25,50 @@ namespace q = gufo::models::qwen38_flash_next;
 
 namespace {
 
+#ifdef GUFO_ENABLE_TP2_RDMA
+class OperationGuard {
+ public:
+  OperationGuard(std::shared_ptr<q::rocm::Communicator> communicator,
+                 std::uint64_t scope_id)
+      : communicator_(std::move(communicator)), scope_id_(scope_id) {}
+
+  ~OperationGuard() {
+    if (!active_) {
+      return;
+    }
+    try {
+      std::string error;
+      (void)communicator_->EndOperation(scope_id_, &error);
+    } catch (...) {
+    }
+  }
+
+  [[nodiscard]] bool Begin(std::string* error) {
+    if (!communicator_->BeginOperation(scope_id_, error)) {
+      return false;
+    }
+    active_ = true;
+    return true;
+  }
+
+ private:
+  std::shared_ptr<q::rocm::Communicator> communicator_;
+  const std::uint64_t scope_id_;
+  bool active_{false};
+};
+#endif
+
 void Fail(const std::string& message) {
   std::fprintf(stderr, "%s\n", message.c_str());
 }
 
 bool ParseUint(std::string_view text, std::uint32_t* value) {
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), *value);
+  return error == std::errc{} && end == text.data() + text.size();
+}
+
+bool ParseUint64(std::string_view text, std::uint64_t* value) {
   const auto [end, error] =
       std::from_chars(text.data(), text.data() + text.size(), *value);
   return error == std::errc{} && end == text.data() + text.size();
@@ -43,6 +86,10 @@ int main(int argc, char** argv) {
   std::uint32_t world_size = 1;
   std::uint32_t device = 0;
   std::uint32_t gid = 0;
+  std::uint64_t operation_id = 1;
+#ifndef GUFO_ENABLE_TP2_RDMA
+  (void)operation_id;
+#endif
   std::uint16_t port = 18515;
   float temperature = 0.0F;
   std::int64_t seed = 7;
@@ -112,6 +159,11 @@ int main(int argc, char** argv) {
         return 2;
       }
       port = static_cast<std::uint16_t>(parsed);
+    } else if (arg == "--tp-operation-id") {
+      if (!ParseUint64(next(), &operation_id)) {
+        Fail("--tp-operation-id requires an unsigned integer");
+        return 2;
+      }
     } else if (arg == "--tp-bootstrap-host") {
       bootstrap_host = next();
     } else {
@@ -132,6 +184,7 @@ int main(int argc, char** argv) {
 
   std::shared_ptr<q::rocm::Communicator> communicator;
 #ifdef GUFO_ENABLE_TP2_RDMA
+  std::unique_ptr<OperationGuard> operation;
   if (world_size == 2) {
     std::string error;
     const q::rocm::IbrverbsConfig config{
@@ -145,6 +198,11 @@ int main(int argc, char** argv) {
     communicator = q::rocm::CreateIbrverbsCommunicator(config, &error);
     if (!communicator) {
       Fail("RDMA communicator failed: " + error);
+      return 1;
+    }
+    operation = std::make_unique<OperationGuard>(communicator, operation_id);
+    if (!operation->Begin(&error)) {
+      Fail("TP operation scope bind failed: " + error);
       return 1;
     }
   }

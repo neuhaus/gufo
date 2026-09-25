@@ -42,7 +42,9 @@ build/gpu-tp2/tests/models/qwen38_flash_next/qwen38_flash_next_tp_probe \
 
 The loader discovers the remaining target shards beside the first shard. The
 lower-level `qwen38_flash_next_gpu_probe` remains available for prefill/logit-dump
-comparisons.
+comparisons. Both TP probes accept `--tp-operation-id N`; pass the same value on
+both ranks for a normal run. A deliberate rank mismatch is a negative identity
+probe and must fail before producing model output.
 
 ## C1 serving qualification
 
@@ -114,7 +116,8 @@ non-empty `control_token`:
 
 Set `cache_reuse` to `true` only for the controlled live-prefix/snapshot
 experiment. It enables symmetric rank-local live-prefix reuse plus one
-retained immutable boundary through the v3 control handshake. Snapshot bytes
+retained immutable boundary through the v4 control handshake (the prior
+qualification was v3). Snapshot bytes
 stay in each rank's host memory; no snapshot payload is sent over TCP or
 RDMA. The default `false` setting preserves the uncached C1 boundary.
 
@@ -195,16 +198,20 @@ experimental and must not be rendered into the published benchmark tables.
   and does not yet support streaming, cancellation, sampled decoding, or
   concurrent requests. Rank 0 now owns one control-response reader and routes
   final frames by command sequence; unknown or duplicate sequences poison the
-  channel rather than being delivered to the wrong request. This is a response-
-  ownership foundation only; it does not enable C2 or bind RDMA collectives to
-  request identities.
+  channel rather than being delivered to the wrong request. The C1 path also
+  binds each RDMA collective to that command sequence and a per-collective
+  operation ordinal; a scope, operation, size, or acknowledgement mismatch fails
+  closed. This remains a response- and operation-ownership foundation only; it
+  does not enable C2.
 - Serialized/distributed disk snapshots, arbitrary historical-prefix indexes,
   and vision remain rejected. Only the stable prompt boundary and current live
   frontier are retained by this experimental C1 slice.
 - C>1 is intentionally rejected before communicator/model setup. Merely
-  changing `--sessions` is unsafe: a future cohort implementation must add
-  request/operation identity, an ordered rank-local execution plan, and
-  explicit cache-plan parity before enabling physical batched collectives.
+  changing `--sessions` is unsafe: a future cohort implementation must add a
+  cohort identity and ordered member plan, an ordered rank-local execution
+  plan, and explicit cache-plan parity before enabling physical batched
+  collectives. A single member request sequence is not a valid shared C2
+  collective scope.
   The first qualification slice, if pursued, is fixed two-request C2, AR before
   MTP, uncached and non-streaming, with repeated ordering/failure tests and
   per-request hashes; it must not be enabled by a CLI alias alone.

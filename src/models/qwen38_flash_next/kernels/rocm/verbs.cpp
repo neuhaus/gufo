@@ -17,6 +17,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -36,7 +37,7 @@ namespace {
 constexpr std::uint32_t kWireMagic = 0x47554654U;  // "GUFT"
 constexpr std::uint32_t kWireVersion = 3;
 constexpr std::uint32_t kCollectiveMagic = 0x47554348U;  // "GUCH"
-constexpr std::uint32_t kCollectiveVersion = 3;
+constexpr std::uint32_t kCollectiveVersion = 4;
 constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
 constexpr std::size_t kBufferBytes = 64U << 20;
 constexpr std::uintptr_t kSendAddress = 0x0000700000000000ULL;
@@ -317,9 +318,20 @@ struct Wire {
 struct CollectiveHeader {
   std::uint32_t magic{kCollectiveMagic};
   std::uint32_t version{kCollectiveVersion};
-  std::uint64_t sequence{0};
+  std::uint64_t scope_id{0};
+  std::uint64_t operation_id{0};
   std::uint64_t bytes{0};
 };
+
+struct CollectiveAck {
+  std::uint32_t magic{kReadyMagic};
+  std::uint32_t version{kCollectiveVersion};
+  std::uint64_t scope_id{0};
+  std::uint64_t operation_id{0};
+};
+
+static_assert(sizeof(CollectiveHeader) == 32);
+static_assert(sizeof(CollectiveAck) == 24);
 
 class Ibrverbs final : public Communicator {
 public:
@@ -531,6 +543,48 @@ public:
     return static_cast<int>(config_.device_index);
   }
 
+  [[nodiscard]] bool BeginOperation(std::uint64_t scope_id,
+                                    std::string* error) override {
+    std::lock_guard lock(mutex_);
+    if (qp_ == nullptr || control_ == nullptr) {
+      SetError(error, "verbs communicator is not initialized");
+      return false;
+    }
+    if (poisoned_) {
+      SetError(error, "verbs communicator is poisoned");
+      return false;
+    }
+    if (bound_scope_.has_value()) {
+      poisoned_ = true;
+      SetError(error, "another verbs operation scope is already bound");
+      return false;
+    }
+    bound_scope_ = scope_id;
+    return true;
+  }
+
+  [[nodiscard]] bool EndOperation(std::uint64_t scope_id,
+                                  std::string* error) override {
+    std::lock_guard lock(mutex_);
+    if (poisoned_) {
+      SetError(error, "verbs communicator is poisoned");
+      return false;
+    }
+    if (!bound_scope_.has_value()) {
+      SetError(error, "verbs operation scope is not bound");
+      return false;
+    }
+    if (*bound_scope_ != scope_id) {
+      poisoned_ = true;
+      SetError(error, "verbs operation scope end mismatch: bound=" +
+                           std::to_string(*bound_scope_) + " requested=" +
+                           std::to_string(scope_id));
+      return false;
+    }
+    bound_scope_.reset();
+    return true;
+  }
+
   [[nodiscard]] bool AllReduceSum(float* data, std::size_t bytes,
                                  hipStream_t stream,
                                  std::string* error) override {
@@ -543,14 +597,31 @@ public:
       SetError(error, "verbs control channel is not initialized");
       return false;
     }
+    if (poisoned_) {
+      SetError(error, "verbs communicator is poisoned");
+      return false;
+    }
+    if (!bound_scope_.has_value()) {
+      poisoned_ = true;
+      SetError(error, "verbs collective has no bound operation scope");
+      return false;
+    }
     if (bytes > kBufferBytes || bytes % sizeof(float) != 0 ||
         (bytes != 0 && data == nullptr)) {
+      poisoned_ = true;
       SetError(error, "all-reduce buffer is invalid");
       return false;
     }
-    const std::uint64_t sequence = sequence_++;
+    if (next_operation_ == std::numeric_limits<std::uint64_t>::max()) {
+      poisoned_ = true;
+      SetError(error, "verbs collective operation sequence exhausted");
+      return false;
+    }
+    const std::uint64_t scope_id = *bound_scope_;
+    const std::uint64_t operation_id = next_operation_;
     const CollectiveHeader outgoing{
-        .sequence = sequence,
+        .scope_id = scope_id,
+        .operation_id = operation_id,
         .bytes = bytes,
     };
     CollectiveHeader incoming{};
@@ -561,31 +632,39 @@ public:
         (hipStreamSynchronize(stream) != hipSuccess ||
          hipMemcpy(send_buffer_, data, bytes, hipMemcpyDeviceToHost) !=
              hipSuccess)) {
+      poisoned_ = true;
       SetError(error, "HIP device-to-host all-reduce staging failed");
       return false;
     }
     if (!control_->SendAll(&outgoing, sizeof(outgoing), error) ||
         !control_->RecvAll(&incoming, sizeof(incoming), error)) {
+      poisoned_ = true;
       return false;
     }
     if (incoming.magic != kCollectiveMagic ||
         incoming.version != kCollectiveVersion ||
-        incoming.sequence != outgoing.sequence || incoming.bytes != bytes) {
+        incoming.scope_id != outgoing.scope_id ||
+        incoming.operation_id != outgoing.operation_id ||
+        incoming.bytes != bytes) {
+      poisoned_ = true;
       if (error != nullptr) {
-        *error = "verbs collective sequence or size mismatch: outgoing=" +
-                 std::to_string(outgoing.sequence) + "/" +
+        *error = "verbs collective identity or size mismatch: outgoing=" +
+                 std::to_string(outgoing.scope_id) + "/" +
+                 std::to_string(outgoing.operation_id) + "/" +
                  std::to_string(outgoing.bytes) + " incoming=" +
-                 std::to_string(incoming.sequence) + "/" +
+                 std::to_string(incoming.scope_id) + "/" +
+                 std::to_string(incoming.operation_id) + "/" +
                  std::to_string(incoming.bytes);
       }
       return false;
     }
     if (bytes == 0) {
-      const std::uint32_t ack = kReadyMagic;
-      std::uint32_t peer_ack = 0;
-      return control_->SendAll(&ack, sizeof(ack), error) &&
-             control_->RecvAll(&peer_ack, sizeof(peer_ack), error) &&
-             peer_ack == kReadyMagic;
+      if (!ExchangeAck(scope_id, operation_id, error)) {
+        poisoned_ = true;
+        return false;
+      }
+      ++next_operation_;
+      return true;
     }
     for (std::size_t offset = 0; offset < bytes; offset += kBufferBytes) {
       const std::size_t count = std::min(kBufferBytes, bytes - offset);
@@ -604,16 +683,19 @@ public:
       wr.wr.rdma.rkey = remote_rkey_;
       if (completion_channel_ != nullptr && !completion_armed_) {
         if (ibv_req_notify_cq(cq_, 0) != 0) {
+          poisoned_ = true;
           SetError(error, "ibv_req_notify_cq failed");
           return false;
         }
         completion_armed_ = true;
       }
       if (ibv_post_send(qp_, &wr, nullptr) != 0) {
+        poisoned_ = true;
         SetError(error, "ibv_post_send failed");
         return false;
       }
       if (!PollCompletion(offset, error)) {
+        poisoned_ = true;
         return false;
       }
       auto* local = reinterpret_cast<float*>(
@@ -629,26 +711,51 @@ public:
     // Receiving the peer acknowledgement means that its read of this send
     // window is complete. The result window is independent, so the local
     // host-to-device copy below can proceed without racing the peer.
-    const std::uint32_t ack = kReadyMagic;
-    std::uint32_t peer_ack = 0;
-    if (!control_->SendAll(&ack, sizeof(ack), error) ||
-        !control_->RecvAll(&peer_ack, sizeof(peer_ack), error) ||
-        peer_ack != kReadyMagic) {
-      if (error != nullptr && error->empty()) {
-        *error = "verbs collective acknowledgement failed";
-      }
+    if (!ExchangeAck(scope_id, operation_id, error)) {
+      poisoned_ = true;
       return false;
     }
     if (hipMemcpy(data, result_buffer_, bytes, hipMemcpyHostToDevice) !=
             hipSuccess ||
         hipStreamSynchronize(stream) != hipSuccess) {
+      poisoned_ = true;
       SetError(error, "HIP host-to-device all-reduce staging failed");
+      return false;
+    }
+    ++next_operation_;
+    return true;
+  }
+
+private:
+  [[nodiscard]] bool ExchangeAck(std::uint64_t scope_id,
+                                 std::uint64_t operation_id,
+                                 std::string* error) {
+    const CollectiveAck outgoing{
+        .scope_id = scope_id,
+        .operation_id = operation_id,
+    };
+    CollectiveAck incoming{};
+    if (!control_->SendAll(&outgoing, sizeof(outgoing), error) ||
+        !control_->RecvAll(&incoming, sizeof(incoming), error)) {
+      return false;
+    }
+    if (incoming.magic != kReadyMagic ||
+        incoming.version != kCollectiveVersion ||
+        incoming.scope_id != scope_id ||
+        incoming.operation_id != operation_id) {
+      if (error != nullptr) {
+        *error =
+            "verbs collective acknowledgement identity mismatch: expected=" +
+            std::to_string(scope_id) + "/" +
+            std::to_string(operation_id) + " incoming=" +
+            std::to_string(incoming.scope_id) + "/" +
+            std::to_string(incoming.operation_id);
+      }
       return false;
     }
     return true;
   }
 
-private:
   [[nodiscard]] bool PollCompletion(std::uint64_t expected,
                                     std::string* error) {
     const auto deadline = std::chrono::steady_clock::now() + kCollectiveTimeout;
@@ -721,7 +828,7 @@ private:
       return false;
     }
     if (completion.wr_id != expected) {
-      SetError(error, "verbs completion sequence mismatch");
+      SetError(error, "verbs completion chunk mismatch");
       return false;
     }
     if (completion_channel_ != nullptr) {
@@ -800,7 +907,10 @@ private:
   std::uint64_t remote_send_address_{0};
   std::uint32_t remote_rkey_{0};
   std::unique_ptr<Socket> control_;
-  std::uint64_t sequence_{0};
+  std::optional<std::uint64_t> bound_scope_;
+  // Monotonic for the communicator lifetime; scope_id supplies request identity.
+  std::uint64_t next_operation_{0};
+  bool poisoned_{false};
   mutable std::mutex mutex_;
 };
 

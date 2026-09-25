@@ -5,6 +5,7 @@
 //           [--batch T] [--context N] [--dump logits.bin]
 // TP=2 probe: --tp-rank 0|1 --tp-world-size 2
 //              --tp-bootstrap-host HOST --tp-bootstrap-port PORT
+//              --tp-operation-id N (same on both ranks)
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
 //                      [--depth N] (default: 0, 4096, 32768)
@@ -19,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
@@ -46,6 +48,39 @@ void AuditMtpCosts(q::rocm::Executor& executor,
                    std::uint32_t concurrency);
 
 namespace {
+
+#ifdef GUFO_ENABLE_TP2_RDMA
+class OperationGuard {
+ public:
+  OperationGuard(std::shared_ptr<q::rocm::Communicator> communicator,
+                 std::uint64_t scope_id)
+      : communicator_(std::move(communicator)), scope_id_(scope_id) {}
+
+  ~OperationGuard() {
+    if (!active_) {
+      return;
+    }
+    try {
+      std::string error;
+      (void)communicator_->EndOperation(scope_id_, &error);
+    } catch (...) {
+    }
+  }
+
+  [[nodiscard]] bool Begin(std::string* error) {
+    if (!communicator_->BeginOperation(scope_id_, error)) {
+      return false;
+    }
+    active_ = true;
+    return true;
+  }
+
+ private:
+  std::shared_ptr<q::rocm::Communicator> communicator_;
+  const std::uint64_t scope_id_;
+  bool active_{false};
+};
+#endif
 
 struct Stats {
   std::uint32_t argmax_a;
@@ -100,6 +135,10 @@ int main(int argc, char** argv) {
   std::uint16_t tp_bootstrap_port = 18515;
   std::uint32_t tp_device = 0;
   std::uint32_t tp_gid = 0;
+  std::uint64_t tp_operation_id = 1;
+#ifndef GUFO_ENABLE_TP2_RDMA
+  (void)tp_operation_id;
+#endif
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto next = [&]() -> std::string {
@@ -164,6 +203,15 @@ int main(int argc, char** argv) {
         tp_device = parsed;
       } else {
         tp_gid = parsed;
+      }
+    } else if (arg == "--tp-operation-id") {
+      const auto value = next();
+      const auto [end, ec] = std::from_chars(
+          value.data(), value.data() + value.size(), tp_operation_id);
+      if (ec != std::errc{} || end != value.data() + value.size()) {
+        std::fprintf(stderr,
+                     "--tp-operation-id requires an unsigned integer\n");
+        return 2;
       }
     } else if (arg == "--tp-bootstrap-host") {
       tp_bootstrap_host = next();
@@ -251,6 +299,9 @@ int main(int argc, char** argv) {
   }
   std::optional<q::distributed::TpPartition> partition;
   std::shared_ptr<q::rocm::Communicator> communicator;
+#ifdef GUFO_ENABLE_TP2_RDMA
+  std::unique_ptr<OperationGuard> operation;
+#endif
   if (tp_world_size == 2) {
     partition = q::distributed::TpPartition::Create(
         c.num_experts, tp_rank, tp_world_size, &error);
@@ -271,6 +322,13 @@ int main(int argc, char** argv) {
         q::rocm::CreateIbrverbsCommunicator(config, &error);
     if (!communicator) {
       std::fprintf(stderr, "RDMA communicator failed: %s\n", error.c_str());
+      return 1;
+    }
+    operation = std::make_unique<OperationGuard>(communicator,
+                                                  tp_operation_id);
+    if (!operation->Begin(&error)) {
+      std::fprintf(stderr, "TP operation scope bind failed: %s\n",
+                   error.c_str());
       return 1;
     }
 #else

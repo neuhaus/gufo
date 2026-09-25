@@ -23,7 +23,8 @@ struct IbrverbsConfig {
 /// reads and an event-driven completion channel when available; the
 /// bootstrap endpoint remains as a small ordered control/ack channel. Both
 /// processes map identical fixed send, receive, and result host IOVA
-/// windows.
+/// windows. Callers must bind the same control scope before model execution;
+/// every collective carries and validates its operation ordinal.
 [[nodiscard]] std::shared_ptr<Communicator> CreateIbrverbsCommunicator(
     const IbrverbsConfig& config, std::string* error_msg);
 
