@@ -3142,15 +3142,16 @@ struct InferenceBackend::Impl {
     if (current->control != nullptr) {
       const bool use_cache_reuse =
           current->tp_allow_cache_reuse && cache_prompt;
+      // Without cache reuse both ranks run uncached with no prefix, so a
+      // prefix computed for tool calls or unpreserved reasoning is dropped
+      // rather than refused.
       const std::size_t worker_cache_prefix_tokens =
           use_cache_reuse ? cache_prefix_tokens : 0;
       if (!sampling.can_use_unmodified_argmax() || context != nullptr ||
-          (cache_prefix_tokens != 0 && !use_cache_reuse) ||
           !stop_sequences.empty() ||
           max_tokens > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument(
-            "TP2 requires greedy text without stop sequences and an explicitly "
-            "enabled cache-reuse path");
+            "TP2 requires greedy text without stop sequences");
       }
       std::vector<std::int32_t> worker_prompt;
       worker_prompt.reserve(prompt_tokens.size());
@@ -4216,16 +4217,18 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   if (state->control != nullptr) {
     const bool use_cache_reuse =
         state->tp_allow_cache_reuse && request.cache_prompt;
+    // Without cache reuse both ranks run uncached with no prefix, so a prefix
+    // computed for tool calls or unpreserved reasoning is dropped rather than
+    // refused.
     const std::size_t worker_cache_prefix_tokens =
         use_cache_reuse ? prompt->cache_prefix_tokens : 0;
     if (stream_output || !sampling_config.can_use_unmodified_argmax() ||
         prompt->context != nullptr ||
-        (prompt->cache_prefix_tokens != 0 && !use_cache_reuse) ||
         !request.stop_sequences.empty() ||
         max_tokens > std::numeric_limits<std::uint32_t>::max()) {
       throw std::invalid_argument(
-          "TP2 start_chat requires one greedy request without stop sequences "
-          "and an explicitly enabled cache-reuse path");
+          "TP2 start_chat requires one greedy, non-streaming text request "
+          "without stop sequences");
     }
     std::vector<std::int32_t> worker_prompt;
     worker_prompt.reserve(prompt->tokens.size());
