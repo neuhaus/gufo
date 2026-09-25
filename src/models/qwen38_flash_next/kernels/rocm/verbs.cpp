@@ -363,7 +363,8 @@ public:
       SetError(error, "ibv_alloc_pd failed");
       return false;
     }
-    cq_ = ibv_create_cq(context_, 16, nullptr, nullptr, 0);
+    completion_channel_ = ibv_create_comp_channel(context_);
+    cq_ = ibv_create_cq(context_, 16, nullptr, completion_channel_, 0);
     if (cq_ == nullptr) {
       SetError(error, "ibv_create_cq failed");
       return false;
@@ -595,6 +596,13 @@ public:
       wr.opcode = IBV_WR_RDMA_READ;
       wr.wr.rdma.remote_addr = remote_send_address_ + offset;
       wr.wr.rdma.rkey = remote_rkey_;
+      if (completion_channel_ != nullptr && !completion_armed_) {
+        if (ibv_req_notify_cq(cq_, 0) != 0) {
+          SetError(error, "ibv_req_notify_cq failed");
+          return false;
+        }
+        completion_armed_ = true;
+      }
       if (ibv_post_send(qp_, &wr, nullptr) != 0) {
         SetError(error, "ibv_post_send failed");
         return false;
@@ -636,32 +644,88 @@ public:
 
 private:
   [[nodiscard]] bool PollCompletion(std::uint64_t expected,
-                                    std::string* error) const {
+                                    std::string* error) {
     const auto deadline = std::chrono::steady_clock::now() + kCollectiveTimeout;
     ibv_wc completion {};
-    while (std::chrono::steady_clock::now() < deadline) {
+    if (completion_channel_ != nullptr) {
+      const auto remaining = deadline - std::chrono::steady_clock::now();
+      if (remaining.count() <= 0) {
+        SetError(error, "verbs all-reduce completion timed out");
+        return false;
+      }
+      const auto remaining_ms = std::max<std::int64_t>(
+          1, std::chrono::duration_cast<std::chrono::milliseconds>(remaining)
+                 .count());
+      pollfd event_fd{.fd = completion_channel_->fd,
+                      .events = POLLIN,
+                      .revents = 0};
+      int poll_result;
+      do {
+        poll_result = ::poll(&event_fd, 1, static_cast<int>(remaining_ms));
+      } while (poll_result < 0 && errno == EINTR);
+      if (poll_result == 0) {
+        SetError(error, "verbs all-reduce completion timed out");
+        return false;
+      }
+      if (poll_result < 0) {
+        SetError(error, "verbs completion poll failed");
+        return false;
+      }
+      ibv_cq* event_cq = nullptr;
+      void* event_context = nullptr;
+      int event_result;
+      do {
+        event_result = ibv_get_cq_event(completion_channel_, &event_cq,
+                                         &event_context);
+      } while (event_result != 0 && errno == EINTR);
+      if (event_result != 0 || event_cq != cq_) {
+        SetError(error, "verbs completion event failed");
+        return false;
+      }
+      (void)event_context;
+      ibv_ack_cq_events(cq_, 1);
       const int result = ibv_poll_cq(cq_, 1, &completion);
-      if (result < 0) {
-        SetError(error, "ibv_poll_cq failed");
+      if (result != 1) {
+        SetError(error, "verbs completion CQ poll failed");
         return false;
       }
-      if (result == 0) {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-        continue;
+    } else {
+      bool received = false;
+      while (std::chrono::steady_clock::now() < deadline) {
+        const int result = ibv_poll_cq(cq_, 1, &completion);
+        if (result < 0) {
+          SetError(error, "ibv_poll_cq failed");
+          return false;
+        }
+        if (result == 0) {
+          std::this_thread::sleep_for(std::chrono::microseconds(50));
+          continue;
+        }
+        received = true;
+        break;
       }
-      if (completion.status != IBV_WC_SUCCESS) {
-        SetError(error, "verbs all-reduce read failed with status " +
-                            std::to_string(completion.status));
+      if (!received) {
+        SetError(error, "verbs all-reduce completion timed out");
         return false;
       }
-      if (completion.wr_id != expected) {
-        SetError(error, "verbs completion sequence mismatch");
-        return false;
-      }
-      return true;
     }
-    SetError(error, "verbs all-reduce completion timed out");
-    return false;
+    if (completion.status != IBV_WC_SUCCESS) {
+      SetError(error, "verbs all-reduce read failed with status " +
+                          std::to_string(completion.status));
+      return false;
+    }
+    if (completion.wr_id != expected) {
+      SetError(error, "verbs completion sequence mismatch");
+      return false;
+    }
+    if (completion_channel_ != nullptr) {
+      if (ibv_req_notify_cq(cq_, 0) != 0) {
+        SetError(error, "ibv_req_notify_cq failed");
+        return false;
+      }
+      completion_armed_ = true;
+    }
+    return true;
   }
 
   void Cleanup() noexcept {
@@ -693,6 +757,10 @@ private:
       result_registered_ = false;
     }
     result_buffer_ = nullptr;
+    if (completion_channel_ != nullptr) {
+      (void)ibv_destroy_comp_channel(completion_channel_);
+      completion_channel_ = nullptr;
+    }
     if (cq_ != nullptr) {
       ibv_destroy_cq(cq_);
       cq_ = nullptr;
@@ -711,6 +779,8 @@ private:
   ibv_context* context_{nullptr};
   ibv_pd* pd_{nullptr};
   ibv_cq* cq_{nullptr};
+  ibv_comp_channel* completion_channel_{nullptr};
+  bool completion_armed_{false};
   ibv_qp* qp_{nullptr};
   ibv_mr* send_mr_{nullptr};
   ibv_mr* recv_mr_{nullptr};

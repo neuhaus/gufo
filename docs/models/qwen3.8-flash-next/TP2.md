@@ -89,7 +89,8 @@ multiple concurrent requests yet.
   ordered communicator.
 - Host-staged synchronous RDMA reads use identical fixed IOVA windows for
   send, receive, and result data, with a small ordered TCP control/ack
-  channel; HIP graph capture is disabled.
+  channel; an RDMA completion channel is used when available, with bounded
+  CQ polling as a provider fallback. HIP graph capture is disabled.
   The probe fails safely if a fixed staging address is already occupied.
 - The initial host sum changes reduction order, so distributed logits are
   compared with an explicit tolerance rather than claimed bit-identical.
