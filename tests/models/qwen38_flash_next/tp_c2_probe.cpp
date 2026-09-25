@@ -1698,7 +1698,12 @@ int main(int argc, char** argv) {
       // `Handshake` compares all eight fields exactly
       // (tp_control.cpp:671-680). Rank 0 still loads no sidecar: it is the AR
       // lockstep driver and this mode asserts that no collective is issued.
-      .max_draft_tokens = mtp_draft_tokens,
+      // The handshake field is NOT the same number as the load() argument.
+      // A worker reports `has_mtp ? speculative_config.max_draft_tokens : 0`
+      // (inference_backend.cpp:3848): it passes 7 to `load()` even without a
+      // sidecar, because Model::Load rejects zero, but presents 0 on the
+      // wire. Rank 0 must mirror the wire value, not the load value.
+      .max_draft_tokens = expect_worker_mtp ? mtp_draft_tokens : 0,
       .use_mtp = expect_worker_mtp,
       .allow_cache_reuse = false,
       .auth_token = control_token,
