@@ -238,9 +238,24 @@ experimental and must not be rendered into the published benchmark tables.
   once on every path — including a member failure, which would otherwise leave
   a scope bound and fail-stop the next C1 request.
 
-  Not yet exercised on hardware: no C2 command has run end to end, because a
-  driver would have to act as a full rank-0 peer (RDMA bootstrap plus control
-  handshake) and execute both members in lockstep with the rank-1 worker.
+  Not yet exercised for failure injection: peer cancel, member failure, cleanup
+  failure and the MTP refusal are covered by hosted tests only, and no C2
+  command has run with a prompt longer than one prefill chunk.
+
+- The dormant C2 path HAS now run end to end on hardware, three consecutive
+  times, via `qwen38_flash_next_tp_c2_probe` (rank 0 on `fuzzy`, rank 1 on
+  `misty`). `gufo serve` cannot host the worker: TP=2 forces `--max-pending 1`
+  while `SubmitCohort` needs `queued + 2 <= max_pending_requests`, so a cohort
+  is always refused at admission. The probe therefore hosts a real
+  `InferenceBackend` with `max_pending_requests = 2`, runner pool capacity 1 and
+  no MTP, and relaxes nothing in production. Per run: both digests matched, the
+  cohort was admitted, member 0 then member 1 executed serially in one operation
+  scope, and the ordered two-member response agreed token-for-token with rank 0's
+  local greedy output. Each member issued 8 forwards and 384 collectives
+  (48 layers), where 8 published tokens cost 7 decode advances because
+  `final_token_advance_required` is false on the distributed runner. Still
+  unproven: batched/physical C2, any performance benefit, and failure injection
+  on hardware.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
   routed source bytes and the device model reports post-conversion resident

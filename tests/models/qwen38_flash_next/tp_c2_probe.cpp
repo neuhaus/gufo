@@ -230,6 +230,14 @@ max_pending_requests = 2 because gufo serve forces --max-pending 1 for TP=2.
 Limits and hazards:
   * Wrap BOTH roles in an external timeout. The RDMA collective timeout is
     30 s, but the control response read waits up to 24 h.
+  * The listener is NOT retryable: rank 0's bootstrap Listen polls once for
+    30 s and then fails, while rank 1's Connect retries until its own 30 s
+    deadline. Start rank 0 FIRST and start rank 1 within that window, or the
+    rendezvous cannot form.
+  * Both containers need `--network host`. Without it each role gets its own
+    network namespace and rank 0's 0.0.0.0 bootstrap listener is unreachable,
+    which surfaces only as a 30 s accept timeout on rank 0 and an
+    "Operation now in progress" connect failure on rank 1.
   * The RDMA adapter maps fixed IOVA windows, so the two roles must run on
     separate hosts with no other RDMA process on either.
   * Each prompt must fit one prefill chunk (<= PrefillCapacity, which is
