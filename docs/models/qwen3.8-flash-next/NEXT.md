@@ -40,6 +40,26 @@ spike does not depend on the step 1 decision. Measure cross-rank token agreement
 and throughput against serial C2. Nothing yet shows that C2 is useful, so that
 measurement decides whether steps 1 and 3–5 are worth building.
 
+Status: the spike exists as `--batched-w2` in `qwen38_flash_next_tp_c2_probe`.
+It builds and passes the format gate, and it is **committed but not yet run on
+hardware** — treat it as unverified until a two-host run says otherwise. It
+loads the model on both ranks over the engine with the communicator attached,
+branches before the control wire on both sides, and runs one identical program:
+two live sessions, per-member prefill, then a two-row `EvaluateBatch` per decode
+step. Each rank prints its per-member tokens, a checksum, and the exact member
+set included in every batched step, so the harness can check **schedule**
+agreement as well as token agreement; a member that stops early drops out of
+later batches, and a rank disagreement there would diverge the byte counts.
+The scope id is a constant both sides bind by construction, so a run is only
+comparable when both ranks pass the flag.
+
+The numerics precondition has been measured, on one host, for the one operation
+that is actually batched on this path: the single-token advance is token-identical
+to serial (`TP2.md`, the single-host batched-advance entry; `plan=batched-w2
+batch_width=2` confirmed in the log, `plan=serial-c1` control, all three paths
+hashing alike). Batched decode remains unmeasured, and there is no AllReduce in
+that test, so the distributed reduction order is still open.
+
 ### 1. Carry the execution width — DECISION NEEDED
 
 Correcting an earlier overstatement in this document: `batched-w2` does **not**
@@ -98,10 +118,38 @@ live bug.
 
 ### 2. Advertise and implement batched plans for the distributed runner
 
-`SupportedPlans` advertises serial-only for distributed (inference_backend.cpp),
-and `AdvanceBatch` / `DecodeBatch` throw for `distributed_ && size > 1`. Both
-need real implementations, plus the result reporting that
-`physical_execution_width` and `execution_plan` already carry.
+Correcting an earlier overstatement in this document: **neither entry point
+needs a new batched implementation.** Both already have one.
+
+- `AdvanceBatch` below its guard already calls `QwenFlashNextSession::EvaluateBatch`
+  (`inference_backend.cpp:2765-2775`), which reaches `EvaluateBatchImpl` and a
+  single `ForwardBatch` across all N sessions. The only blocker is the
+  `distributed_ && advances.size() > 1` throw at `:2761`.
+- `DecodeBatch` reaches `Session::DecodeBatch` -> `RunIsolatedBatch` ->
+  `DecodeBatchImpl`, which also ends in one `ForwardBatch` across N sessions.
+  "Isolated" refers to per-session attention state, proposal distributions and
+  RNG streams staying private, not to serial execution. Its MTP loop breaks
+  immediately when a request is not speculative, so **the batched path is not
+  MTP-coupled**.
+
+So the distributed work is dispatch, not implementation: advertise `kBatched`
+under `distributed_` (`:2542`), lift the two throws (`:2761`, `:2799`), and
+settle the `!use_mtp_` fallback at `:2802`, which sends width 2 to the serial
+base loop whenever MTP is off.
+
+That last one is the real design question and it is **not** independent of
+step 3's MTP decision. A C2 AR cohort refuses MTP permanently by contract
+(`tp_cohort_worker.cpp` `kMtpRefusal`, zero draft telemetry per member), yet
+the only route to a batched decode runs through the MTP-gated dispatch. Either
+a non-MTP width-2 AR decode route is built, or the C2 response contract grows
+draft fields. The second option is listed under evidence gaps as an open
+question; it is load-bearing here, not a side issue.
+
+**Prefill has no batch form at all.** `Prefill` is per-state
+(`text_model_runner.hpp:262`) and neither the runner nor the engine offers a
+batched equivalent, so a width-2 program chunks member 0 and then member 1.
+Any plan that assumes batched prefill is wrong, including any speedup estimate
+that counts it.
 
 ### 3. Cohort-level operation scope
 
@@ -216,6 +264,10 @@ The supported baseline remains Q4 UD-Q4_K_XL plus a shared-Q8 MTP sidecar.
 
 - No batched or physical C2 exists. Everything above concerns the dormant serial
   contract only.
+- `--batched-w2` has never been executed. Its presence in the probe is a
+  mechanism, not a result: it compiles and is format-clean, and nothing in this
+  document should be read as evidence that a batched advance works across two
+  ranks until a two-host log says so.
 - No performance claim has been measured for C2. Nothing here demonstrates that
   C2 is useful, only that the serial contract is correct.
 - Distributed logits are compared with an explicit tolerance, not bit-identity:
