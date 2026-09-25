@@ -243,6 +243,50 @@ int main() {
   Require(!broker.RegisterPendingResponse(14, &server_error),
           "TP broker rejects registrations after poisoning");
 
+  const auto interrupt_port = FreePort();
+  std::shared_ptr<TpControlChannel> interrupt_client;
+  std::thread interrupt_connector([&] {
+    interrupt_client = TpControlChannel::Connect("127.0.0.1", interrupt_port,
+                                                  &client_error);
+  });
+  auto interrupt_server = TpControlChannel::Listen(interrupt_port, &server_error);
+  interrupt_connector.join();
+  Require(interrupt_server != nullptr && interrupt_client != nullptr,
+          "TP interrupt pair connects");
+  bool interrupt_server_handshake = false;
+  bool interrupt_client_handshake = false;
+  std::thread interrupt_server_thread([&] {
+    interrupt_server_handshake =
+        interrupt_server->Handshake(rank0, &server_error);
+  });
+  std::thread interrupt_client_thread([&] {
+    interrupt_client_handshake =
+        interrupt_client->Handshake(rank1, &client_error);
+  });
+  interrupt_server_thread.join();
+  interrupt_client_thread.join();
+  Require(interrupt_server_handshake && interrupt_client_handshake,
+          "TP interrupt pair handshakes");
+
+  TpResponseBroker interrupt_broker(interrupt_server, 1);
+  Require(interrupt_broker.RegisterPendingResponse(21, &server_error),
+          server_error);
+  bool interrupt_wait_returned = false;
+  bool interrupt_wait_ok = false;
+  std::string interrupt_wait_error;
+  std::thread interrupt_waiter([&] {
+    TpControlResponse response;
+    interrupt_wait_ok = interrupt_broker.WaitForResponse(
+        21, &response, &interrupt_wait_error);
+    interrupt_wait_returned = true;
+  });
+  interrupt_broker.FailAll("test response reader interruption");
+  interrupt_waiter.join();
+  Require(interrupt_wait_returned && !interrupt_wait_ok &&
+              interrupt_wait_error.find("test response reader interruption") !=
+                  std::string::npos,
+          "TP broker failure wakes a blocked response waiter");
+
   Require(server->port() == port && client->port() == port,
           "TP control service port");
   std::puts("PASS: TP control handshake and framed worker messages");
