@@ -294,3 +294,22 @@ experimental and must not be rendered into the published benchmark tables.
   routed source bytes and the device model reports post-conversion resident
   bytes. The larger target must pass that local-memory fit check before it is
   promoted to a serving target.
+- Batched single-token advance was compared against serial advance on ONE host,
+  Q4 UD-Q4_K_XL, greedy, 64 new tokens, two prompts of 2106 and 78 prompt
+  tokens. `gufo serve -j 2` selected `plan=batched-w2 batch_width=2` with both
+  requests co-resident (`resident_at_admission=2`, 427 ms queue wait), and the
+  `-j 1` control logged `plan=serial-c1 batch_width=1`. All three paths --
+  `gufo prompt`, `serve -j 1`, `serve -j 2` -- produced identical
+  `reasoning_content`: sha256 `e83f2652...` (282 chars) and `731fb60a...`
+  (353 chars). Batching the advance therefore does not perturb greedy tokens
+  here. Scope, stated narrowly because it is narrow: the advance is the ONLY
+  operation batched on this path. `Prefill` is per-state
+  (`text_model_runner.hpp:262`) and has no batch form in the runner or the
+  engine, so prefill ran serially in every arm and this result says nothing
+  about prefill. `DecodeBatch` fell back to the serial base loop because
+  `use_mtp_` was false (`inference_backend.cpp:2802`), so batched decode is
+  untested. Single host, so no AllReduce and no distributed reduction order; 64
+  greedy tokens, all of them `reasoning_content`; one run per prompt. Reference
+  numbers only, not a like-for-like comparison: `prefill_tps=950.1` at width 2,
+  and `cache_snapshot_bytes` 172425656 and 121428488 per resident session,
+  which bounds how wide a batch can ever be.
