@@ -47,6 +47,22 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_tp_probe PRIVATE
     gufo_qwen38_flash_next)
 
+  # Dormant C2 cohort probe. Two roles, two hosts, one binary. rank0 is the
+  # RDMA and control peer with a lockstep driver; rank1 hosts the real
+  # InferenceBackend C2 worker, so the same serving sources the session test
+  # links are compiled in here too.
+  add_executable(qwen38_flash_next_tp_c2_probe EXCLUDE_FROM_ALL
+    tp_c2_probe.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/tp_cohort_plan.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/tp_cohort_worker.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
+  target_link_libraries(qwen38_flash_next_tp_c2_probe PRIVATE gufo_logging
+    gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_tp_control hip::host)
+
   add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp
     mtp_audit.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE
