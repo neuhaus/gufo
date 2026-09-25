@@ -217,6 +217,7 @@ add_executable(gufo
   src/cli/serve/text_model_runner.cpp
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/tp_cohort_plan.cpp
+  src/cli/serve/tp_cohort_worker.cpp
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
 )
@@ -357,6 +358,14 @@ if (BUILD_TESTING)
   target_link_libraries(tp_cohort_plan_test PRIVATE gufo_tp_control gufo_core)
   add_test(NAME tp_cohort_plan_test COMMAND tp_cohort_plan_test)
   set_tests_properties(tp_cohort_plan_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 10)
+
+  add_executable(tp_cohort_worker_test
+    tests/cli/tp_cohort_worker_test.cpp
+    src/cli/serve/tp_cohort_worker.cpp
+    src/cli/serve/tp_cohort_plan.cpp)
+  target_link_libraries(tp_cohort_worker_test PRIVATE gufo_tp_control gufo_core)
+  add_test(NAME tp_cohort_worker_test COMMAND tp_cohort_worker_test)
+  set_tests_properties(tp_cohort_worker_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 10)
 
   add_executable(json_test tests/core/json_test.cpp)
   target_link_libraries(json_test PRIVATE gufo_core)

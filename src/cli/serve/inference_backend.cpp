@@ -24,7 +24,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/tp_control.hpp"
-#include "src/cli/serve/tp_cohort_plan.hpp"
+#include "src/cli/serve/tp_cohort_worker.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
@@ -123,165 +123,81 @@ class TpOperationLease {
   std::mutex mutex_;
 };
 
-/// What one worker-loop command does to the surrounding receive loop.
-enum class TpWorkerLoopStep {
-  /// A wire-valid response was sent; keep receiving commands.
-  kContinue,
-  /// The control channel or the operation scope is unusable; stop the worker.
-  kStop,
+/// Adapts one scheduler cohort to the C2 worker seam.
+///
+/// The cohort owns its members, so the handles borrow stable request addresses
+/// and the admitted members stay alive for every `Wait` and `Cancel` the seam
+/// performs.
+class SchedulerCohortSubmission final : public TpCohortSubmission {
+ public:
+  explicit SchedulerCohortSubmission(TextGenerationScheduler::Cohort cohort)
+      : cohort_(std::move(cohort)) {
+    for (std::size_t index = 0; index < kCohort2MemberCount; ++index) {
+      handles_[index] =
+          std::make_unique<MemberHandle>(&cohort_.members()[index]);
+    }
+  }
+
+  SchedulerCohortSubmission(const SchedulerCohortSubmission&) = delete;
+  SchedulerCohortSubmission& operator=(const SchedulerCohortSubmission&) =
+      delete;
+  SchedulerCohortSubmission(SchedulerCohortSubmission&&) = delete;
+  SchedulerCohortSubmission& operator=(SchedulerCohortSubmission&&) = delete;
+  ~SchedulerCohortSubmission() override = default;
+
+  [[nodiscard]] TpCohortMemberHandle& Member(std::size_t index) override {
+    return *handles_[index];
+  }
+
+ private:
+  class MemberHandle final : public TpCohortMemberHandle {
+   public:
+    explicit MemberHandle(TextGenerationScheduler::Request* request)
+        : request_(request) {}
+
+    [[nodiscard]] TextGenerationBackend::Result Wait() override {
+      return request_->Wait({});
+    }
+
+    void Cancel() override { request_->Cancel(); }
+
+   private:
+    TextGenerationScheduler::Request* request_;
+  };
+
+  TextGenerationScheduler::Cohort cohort_;
+  std::array<std::unique_ptr<MemberHandle>, kCohort2MemberCount> handles_;
 };
 
-/// Copies the command's own cohort identity into a plan used for failure
-/// responses.
-///
-/// `ReceiveCommand` already accepted the C2 envelope, so the sequence, cohort
-/// ID, plan digests and the two ordered member IDs are wire-valid here. The
-/// copy still bounds the member index because it runs on the rejection path,
-/// where the plan seam refused the command.
-[[nodiscard]] TpCohortPlan CohortIdentityFromCommand(
-    const TpControlCommand& command) {
-  TpCohortPlan plan{
-      .sequence = command.sequence,
-      .cohort_id = command.cohort_id,
-      .execution_plan_digest = command.execution_plan_digest,
-      .cache_plan_digest = command.cache_plan_digest,
-  };
-  for (std::size_t index = 0; index < kCohort2MemberCount; ++index) {
-    if (index < command.members.size()) {
-      plan.member_ids[index] = command.members[index].member_id;
-    }
-  }
-  return plan;
-}
+/// Adapts the command-sequence operation scope to the C2 worker seam. The lease
+/// owns its scope state, so the seam only sees one bind and one release.
+class TpOperationScopeLease final : public TpCohortLease {
+ public:
+  TpOperationScopeLease(
+      const std::shared_ptr<models::qwen38_flash_next::rocm::Communicator>&
+          communicator,
+      std::uint64_t sequence)
+      : operation_(
+            std::make_unique<TpOperationLease>(communicator, sequence)) {}
 
-/// Reports one C2 cohort rejection to rank 0. A rejected cohort is a
-/// translation or local-precondition error, not a worker fault, so the worker
-/// keeps serving; only a lost control channel stops it.
-[[nodiscard]] TpWorkerLoopStep SendTpCohortFailure(
-    const std::shared_ptr<TpControlChannel>& control, const TpCohortPlan& plan,
-    const std::string& reason, std::string* error) {
-  std::string control_error;
-  if (!control->SendResponse(BuildCohortFailureResponse(plan, reason),
-                             &control_error)) {
-    SetError(error, "TP worker response send failed: " + control_error);
-    return TpWorkerLoopStep::kStop;
-  }
-  return TpWorkerLoopStep::kContinue;
-}
+  TpOperationScopeLease(const TpOperationScopeLease&) = delete;
+  TpOperationScopeLease& operator=(const TpOperationScopeLease&) = delete;
+  TpOperationScopeLease(TpOperationScopeLease&&) = delete;
+  TpOperationScopeLease& operator=(TpOperationScopeLease&&) = delete;
+  ~TpOperationScopeLease() override = default;
 
-/// Runs one dormant `kCohort2Ar` command on the rank-1 worker loop.
-///
-/// The cohort is admitted as one ordered pair and executed as two serial C1
-/// members under exactly one operation lease scoped to the command sequence.
-/// No shared C2 collective is bound and no member may report a parallel plan,
-/// so this path stays dormant: the coordinator sends no `kCohort2Ar` command,
-/// and the response seam rejects any member that is not serial. MTP drafts
-/// cannot be represented by the C2 response contract, so a loaded draft
-/// sidecar fails closed before the lease is opened.
-[[nodiscard]] TpWorkerLoopStep RunTpCohortCommand(
-    const TpControlCommand& command,
-    const std::shared_ptr<TextGenerationScheduler>& scheduler,
-    const std::shared_ptr<TpControlChannel>& control,
-    const std::shared_ptr<models::qwen38_flash_next::rocm::Communicator>&
-        communicator,
-    bool use_mtp, std::string* error) {
-  std::string cohort_error;
-  auto plan = BuildCohortPlan(command, &cohort_error);
-  if (!plan.has_value()) {
-    return SendTpCohortFailure(control, CohortIdentityFromCommand(command),
-                               cohort_error, error);
-  }
-  if (use_mtp) {
-    return SendTpCohortFailure(
-        control, *plan,
-        "C2 cohort AR is not supported while the MTP sidecar is loaded", error);
-  }
-  auto members = BuildCohortMembers(command, &cohort_error);
-  if (!members.has_value()) {
-    return SendTpCohortFailure(control, *plan, cohort_error, error);
-  }
-  std::vector<TextGenerationScheduler::CohortMemberRequest> admissions;
-  admissions.reserve(members->size());
-  for (auto& member : *members) {
-    admissions.push_back(std::move(member));
-  }
-  // One lease spans the whole cohort: the C2 members share the command
-  // sequence scope, so a per-member lease would open and close the same
-  // collective twice. The scope is bound before admission, exactly like C1, so
-  // a queued member can never reach a runner with an unbound scope.
-  TpOperationLease operation(communicator, command.sequence);
-  std::string operation_error;
-  if (!operation.Begin(&operation_error)) {
-    const auto response = BuildCohortFailureResponse(
-        *plan, "TP worker operation scope bind failed: " + operation_error);
-    std::string control_error;
-    if (!control->SendResponse(response, &control_error)) {
-      SetError(error, "TP worker response send failed: " + control_error);
-      return TpWorkerLoopStep::kStop;
-    }
-    // The scope could not be bound, so rank 0 can never be answered: the
-    // worker stops exactly as the C1 path does.
-    SetError(error, response.error);
-    return TpWorkerLoopStep::kStop;
+  [[nodiscard]] bool Begin(std::string* error) override {
+    return operation_->Begin(error);
   }
 
-  std::optional<TextGenerationScheduler::Cohort> cohort;
-  try {
-    cohort = scheduler->SubmitCohort(std::move(admissions));
-  } catch (const std::exception& exception) {
-    // Admission refused the cohort before either member reached a runner, but
-    // the lease is already bound, so it is released before the worker keeps
-    // serving. A leaked scope would poison the next command's Begin().
-    const std::string reason = exception.what();
-    if (!operation.End(&operation_error)) {
-      SetError(error, "TP worker operation scope cleanup failed: " +
-                          operation_error);
-      return TpWorkerLoopStep::kStop;
-    }
-    return SendTpCohortFailure(control, *plan, reason, error);
+  [[nodiscard]] bool End(std::string* error) override {
+    return operation_->End(error);
   }
 
-  std::array<TextGenerationBackend::Result, kCohort2MemberCount> results;
-  std::size_t member_index = 0;
-  try {
-    for (; member_index < kCohort2MemberCount; ++member_index) {
-      results[member_index] = cohort->members()[member_index].Wait({});
-    }
-  } catch (const std::exception& exception) {
-    // The member that threw is finished; cancel its peer so a rejected cohort
-    // never leaves a runner decoding behind a sent C2 error.
-    if (member_index + 1 < kCohort2MemberCount) {
-      cohort->members()[member_index + 1].Cancel();
-    }
-    return SendTpCohortFailure(control, *plan, exception.what(), error);
-  }
+ private:
+  std::unique_ptr<TpOperationLease> operation_;
+};
 
-  cohort.reset();
-  const auto translation = BuildCohortResponse(*plan, results, &cohort_error);
-  const auto& response = translation.response.has_value()
-                             ? *translation.response
-                             : translation.failure;
-  std::string control_error;
-  if (!control->SendResponse(response, &control_error)) {
-    SetError(error, "TP worker response send failed: " + control_error);
-    return TpWorkerLoopStep::kStop;
-  }
-  if (!operation.End(&operation_error)) {
-    // The cohort response is already on the wire; the local error carries the
-    // same poison the C1 tail appends before it stops the worker.
-    auto poisoned = translation.error;
-    if (!poisoned.empty()) {
-      poisoned += "; ";
-    }
-    poisoned += "TP worker operation scope cleanup failed: " + operation_error;
-    if (poisoned.size() > (1U << 20)) {
-      poisoned.resize(1U << 20);
-    }
-    SetError(error, std::move(poisoned));
-    return TpWorkerLoopStep::kStop;
-  }
-  return TpWorkerLoopStep::kContinue;
-}
 struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
 };
@@ -3977,9 +3893,34 @@ bool InferenceBackend::run_worker(std::string* error) {
     if (command.kind == TpControlCommandKind::kCohort2Ar) {
       // Dormant C2 slice: the cohort runs as two ordered serial C1 members in
       // one operation scope, and the coordinator sends no such command yet.
-      if (RunTpCohortCommand(command, state->scheduler, state->control,
-                             state->communicator, state->tp_use_mtp,
-                             error) == TpWorkerLoopStep::kStop) {
+      using TpCohortAdmissions =
+          std::vector<TextGenerationScheduler::CohortMemberRequest>;
+      TpCohortWorkerHooks hooks;
+      hooks.submit = [scheduler = state->scheduler](TpCohortAdmissions admitted,
+                                                    std::string* error)
+          -> std::unique_ptr<TpCohortSubmission> {
+        try {
+          return std::make_unique<SchedulerCohortSubmission>(
+              scheduler->SubmitCohort(std::move(admitted)));
+        } catch (const std::exception& exception) {
+          SetError(error, exception.what());
+          return nullptr;
+        }
+      };
+      hooks.send = [control = state->control](
+                       const TpControlResponse& response, std::string* error) {
+        std::string control_error;
+        if (!control->SendResponse(response, &control_error)) {
+          SetError(error, "TP worker response send failed: " + control_error);
+          return TpWorkerLoopStep::kStop;
+        }
+        return TpWorkerLoopStep::kContinue;
+      };
+      if (RunTpCohortCommand(
+              command, state->tp_use_mtp,
+              std::make_unique<TpOperationScopeLease>(state->communicator,
+                                                      command.sequence),
+              std::move(hooks), error) == TpWorkerLoopStep::kStop) {
         return false;
       }
       continue;
