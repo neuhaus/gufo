@@ -73,6 +73,7 @@ class Session:
         depths: list[int] | None = None,
         modes: list[str] | None = None,
         context: int | None = None,
+        request_transport: str | None = None,
     ):
         self.config = config
         self.target = target
@@ -89,6 +90,9 @@ class Session:
         self.depths = depths
         self.modes = modes
         self.context = context
+        if request_transport not in {None, "sse", "json"}:
+            raise ValueError(f"unsupported request transport: {request_transport}")
+        self.request_transport = request_transport
         self.tokenizer_calibration: dict[str | None, tuple[int, float]] = {}
         self._rank_fingerprints: dict[str, dict[str, Any]] | None = None
 
@@ -124,8 +128,19 @@ class Session:
     def tp2_enabled(self) -> bool:
         return self.tp2_config is not None
 
+    @property
+    def stream_requests(self) -> bool:
+        if self.request_transport == "json":
+            return False
+        if self.request_transport == "sse":
+            if self.tp2_enabled:
+                raise RuntimeError("TP2 requests must use the JSON transport")
+            return True
+        return not self.tp2_enabled
+
     def check_tp2_scope(
         self, table: TableSpec, *, depths: list[int] | None = None,
+        users: int | None = None,
     ) -> None:
         if not self.tp2_enabled:
             return
@@ -139,10 +154,10 @@ class Session:
                 "TP2 benchmark currently supports only single-user depth 0; "
                 "distributed snapshot/state transfer is required for cached prefixes"
             )
-        if table.kind == "multi":
+        if table.kind == "multi" and users != 1:
             raise RuntimeError(
-                "TP2 benchmark currently supports single-user tables only; "
-                "the corpus runner has not yet been qualified for TP2"
+                "TP2 benchmark currently supports C1 only; distributed "
+                "concurrent decode is not qualified"
             )
 
     def _checked_tp2_config(self) -> dict[str, Any]:
@@ -492,7 +507,7 @@ class Session:
             timeout_seconds=REQUEST_TIMEOUT, client_id=CLIENT_ID, concurrency=1,
             repetition=1, request_index=index, endpoint_profile=self.profile,
             cache_prompt=self.cache_prompt if cache_prompt == "default" else cache_prompt, messages=messages,
-            extra_body=extra_body, stream=not self.tp2_enabled,
+            extra_body=extra_body, stream=self.stream_requests,
         )
         if use_log:
             from ds4.server_metrics import request_metrics
@@ -844,9 +859,12 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
     if not keys:
         print(f"{table.id}: nothing to do")
         return
-    session.check_tp2_scope(table)
+    session.check_tp2_scope(table, users=max(keys))
     matched_prompt = spec.get("prompt_tokens")
     prefill_first = bool(spec.get("prefill_first", False))
+    if session.tp2_enabled:
+        # The current TP2 path has no distributed prefix snapshot/replay.
+        prefill_first = False
     if matched_prompt:
         task = spec["workload"]
         case_ids = {f"synthetic_{task}_pp{matched_prompt}"}
@@ -911,11 +929,14 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                         fingerprint=session.fingerprint or {}, source_revision=session.source["revision"],
                         source_dirty=session.source["dirty"], suite_bytes=suite_bytes,
                         corpus_layout=spec.get("corpus_layout", "distinct"), endpoint_profile=session.profile,
-                        cache_prompt=(True if prefill_first else
-                                      (False if not spec.get("cache_prompt", False) else None)),
+                        cache_prompt=(False if session.tp2_enabled else
+                                      (True if prefill_first else
+                                       (False if not spec.get("cache_prompt", False) else None))),
                         prefill_first=prefill_first,
                         pin_slots=prefill_first and session.target == "reference" and session.reference_kind != "ds4",
                         preparation_tokens=0 if session.target == "reference" and session.reference_kind == "ds4" else 1,
+                        stream=session.stream_requests,
+                        build_mode=session.source.get("buildMode", "nix-release"),
                         reference=reference,
                         notes=[note for note in (
                             session.reference_version(mode), " ".join(public_command(server.command)),

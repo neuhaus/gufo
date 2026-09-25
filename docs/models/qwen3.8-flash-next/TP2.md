@@ -124,10 +124,23 @@ python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
   run --target gufo --table single-mtp --depths 0 --context 4096 --mode mtp
 ```
 
+For the C1 corpus path, use an experiment configuration whose selected
+`multi-ar`/`multi-mtp` concurrency is `[1]`; the driver forces
+`prefill_first=false` and `cache_prompt=false`:
+
+```sh
+python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
+  --gufo build/gpu-tp2/gufo --config /tmp/bench-tp2-c1-multi.json \
+  --artifacts-dir /tmp/gufo-tp2-c1-multi --gguf "$MODEL" --mtp "$MTP" \
+  run --target gufo --table multi-ar --context 4096 --mode ar
+```
+
 The driver uses the JSON non-streaming request profile because the current TP2
 server rejects streaming. It records a topology block, both rank fingerprints,
 redacts the control token and bootstrap address, and rejects loading, memory,
-image, concurrent, and nonzero-depth tables before launch. These artifacts are
+image, C>1 concurrent, and nonzero-depth tables before launch. C1 `multi-ar`
+and `multi-mtp` cells are supported only with forced uncached requests; the
+current server cannot replay a distributed prepared prefix. These artifacts are
 experimental and must not be rendered into the published benchmark tables.
 
 ## Current boundaries

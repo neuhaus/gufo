@@ -656,6 +656,7 @@ def _run_round(
     run_nonce: str,
     endpoint_profile: str = "gufo",
     cache_prompt: bool | None = None,
+    stream: bool = True,
 ) -> RoundObservation:
     start_gate = threading.Barrier(concurrency + 1)
 
@@ -678,6 +679,7 @@ def _run_round(
             start_gate=start_gate,
             endpoint_profile=endpoint_profile,
             cache_prompt=cache_prompt,
+            stream=stream,
         )
 
     with concurrent.futures.ThreadPoolExecutor(
@@ -703,6 +705,7 @@ def _run_corpus_round(
     endpoint_profile: str = "gufo",
     cache_prompt: bool | None = None,
     pin_slots: bool = False,
+    stream: bool = True,
 ) -> RoundObservation:
     if len(cases) != concurrency:
         raise ValueError("corpus round must contain exactly C prompt cases")
@@ -730,6 +733,7 @@ def _run_corpus_round(
             endpoint_profile=endpoint_profile,
             cache_prompt=cache_prompt,
             extra_body={"id_slot": index} if pin_slots else None,
+            stream=stream,
         )
 
     with concurrent.futures.ThreadPoolExecutor(
@@ -1178,6 +1182,8 @@ def run_corpus_benchmark(
     prefill_first: bool = False,
     pin_slots: bool = False,
     preparation_tokens: int = 1,
+    stream: bool = True,
+    build_mode: str = "nix-release",
 ) -> dict[str, Any]:
     if not model:
         raise ValueError("model must not be empty")
@@ -1227,6 +1233,7 @@ def run_corpus_benchmark(
                 endpoint_profile=endpoint_profile,
                 cache_prompt=cache_prompt,
                 pin_slots=pin_slots,
+                stream=stream,
             )
 
         rounds: list[RoundObservation] = []
@@ -1244,7 +1251,7 @@ def run_corpus_benchmark(
                         timeout_seconds=timeout_seconds, concurrency=concurrency,
                         repetition=-(repetition + 1), group_index=group_index,
                         endpoint_profile=endpoint_profile, cache_prompt=True,
-                        pin_slots=pin_slots,
+                        pin_slots=pin_slots, stream=stream,
                     )
                     if any(sample.completion_tokens != preparation_tokens for sample in prepared.samples):
                         raise RuntimeError("prompt preparation did not complete")
@@ -1271,6 +1278,7 @@ def run_corpus_benchmark(
                         endpoint_profile=endpoint_profile,
                         cache_prompt=cache_prompt,
                         pin_slots=pin_slots,
+                        stream=stream,
                     )
                 )
                 if prefill_first:
@@ -1326,13 +1334,16 @@ def run_corpus_benchmark(
         "source": {
             "revision": source_revision,
             "dirty": source_dirty,
-            "buildMode": "nix-release",
+            "buildMode": build_mode,
         },
         "model": {"id": model},
         "workload": {
             "id": workload_id,
             "mode": "corpus",
-            "transport": "openai-chat-completions-sse",
+            "transport": (
+                "openai-chat-completions-sse" if stream
+                else "openai-chat-completions-json"
+            ),
             "suiteSha256": hashlib.sha256(suite_bytes).hexdigest(),
             "promptCount": len(cases),
             "caseIds": [case.identifier for case in cases],

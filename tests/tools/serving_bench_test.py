@@ -261,6 +261,23 @@ check(non_streaming.completion_sha256 ==
 check(non_streaming.decode_tokens_per_second == 200.0,
       "non-streaming terminal timings are parsed")
 
+serving_bench.urllib.request.urlopen = fake_json_urlopen
+try:
+    json_corpus = serving_bench.run_corpus_benchmark(
+        base_url="https://private.example", model="test-model",
+        cases=[serving_bench.PromptCase("json", "structured", "return JSON")],
+        workload_id="json-corpus-v1", max_tokens=2, temperature=0.0,
+        concurrency_levels=[1], warmup_rounds=0, repetitions=1,
+        timeout_seconds=5.0, fingerprint=fingerprint,
+        source_revision="a" * 40, source_dirty=False, suite_bytes=b"json",
+        stream=False, build_mode="container-gpu-tp2",
+    )
+finally:
+    serving_bench.urllib.request.urlopen = original_urlopen
+check(json_corpus["workload"]["transport"] == "openai-chat-completions-json"
+      and json_corpus["source"]["buildMode"] == "container-gpu-tp2",
+      "corpus reports retain JSON transport and container build identity")
+
 corpus_rounds = []
 original_corpus_round = serving_bench._run_corpus_round
 
@@ -690,6 +707,22 @@ check(
                  ["podman", "run", "a b"])[-1] == "exec podman run 'a b'",
     "remote TP2 commands are shell-quoted exactly once",
 )
+cleanup_events = []
+cleanup_local = Server([], "/ready", Path("/unused"))
+cleanup_local.process = MagicMock()
+cleanup_remote_process = MagicMock()
+cleanup_server = Tp2Server(
+    cleanup_local, ["remote"], remote_host="misty",
+    remote_log_path=Path("/unused-rank1"),
+    local_cleanup_command=["podman", "rm", "-f", "rank0"],
+    remote_cleanup_command=["podman", "rm", "-f", "rank1"],
+)
+cleanup_server.remote_process = cleanup_remote_process
+with patch("gufo.model_bench.servers.subprocess.run", side_effect=lambda command, **kwargs: cleanup_events.append(("run", command[0])) or MagicMock()), \
+     patch("gufo.model_bench.servers._stop_process", side_effect=lambda process: cleanup_events.append(("stop", "remote" if process is cleanup_remote_process else "local"))):
+    cleanup_server.stop()
+check(cleanup_events == [("run", "ssh"), ("stop", "remote"), ("run", "podman"), ("stop", "local")],
+      "TP2 cleanup removes remote and local containers before reaping clients")
 
 
 def fake_urlopen_diverging(request, timeout):

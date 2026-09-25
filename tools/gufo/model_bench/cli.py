@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--mode", action="append", default=[], help="restrict to a mode: ar or the speculative mode")
     run.add_argument("--context", type=int, default=None,
                      help="override the single-user tables' context capacity (e.g. to fit a reference server in RAM)")
+    run.add_argument("--request-transport", choices=("sse", "json"), default=None,
+                     help="override the HTTP request transport (TP2 requires json)")
 
     render = sub.add_parser("render", help="rewrite marked tables in BENCHMARKS.md from artifacts")
     render.add_argument("--table", action="append", default=[])
@@ -130,6 +132,7 @@ def cmd_run(config: BenchConfig, args: argparse.Namespace) -> int:
         repetitions=args.repetitions, fresh=args.fresh,
         depths=[int(d) for d in args.depths.split(",")] if args.depths else None,
         modes=args.mode or None, context=args.context,
+        request_transport=args.request_transport,
     )
     session.fingerprint = session.runtime_fingerprint()
     wanted = _table_ids(args.table)
