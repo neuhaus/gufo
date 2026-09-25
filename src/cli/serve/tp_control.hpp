@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TP_CONTROL_HPP_
 #define GUFO_SERVER_TP_CONTROL_HPP_
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -22,9 +23,22 @@ struct TpControlConfig {
   std::uint32_t prefill_chunk_tokens{512};
 };
 
-struct TpControlCommand {
-  /// Response correlation key and C1 RDMA collective scope.
-  std::uint64_t sequence{0};
+enum class TpControlCommandKind : std::uint8_t {
+  kSingle = 1,
+  /// Control-plane contract only; no scheduler execution path consumes C2 yet.
+  kCohort2Ar = 2,
+};
+
+enum class TpControlResponseKind : std::uint8_t {
+  kSingle = 1,
+  /// Response envelope for the dormant C2 control contract.
+  kCohort2Ar = 2,
+};
+
+using TpPlanDigest = std::array<std::uint8_t, 32>;
+
+struct TpControlMemberRequest {
+  std::uint64_t member_id{0};
   std::uint32_t max_tokens{0};
   bool cache_prompt{false};
   std::uint32_t cache_prefix_tokens{0};
@@ -32,8 +46,34 @@ struct TpControlCommand {
   std::string client_id;
 };
 
+struct TpControlMemberResponse {
+  std::uint64_t member_id{0};
+  std::vector<std::int32_t> tokens;
+  std::uint64_t draft_tokens{0};
+  std::uint64_t draft_accepted_tokens{0};
+  std::uint32_t cached_prompt_tokens{0};
+  std::uint64_t cache_snapshot_bytes{0};
+};
+
+struct TpControlCommand {
+  /// Response correlation key. For C1 this remains the collective scope.
+  std::uint64_t sequence{0};
+  // Fixed one-member C1 fields. kCohort2Ar leaves these empty and uses members.
+  std::uint32_t max_tokens{0};
+  bool cache_prompt{false};
+  std::uint32_t cache_prefix_tokens{0};
+  std::vector<std::int32_t> prompt_tokens;
+  std::string client_id;
+  // Versioned cohort envelope. C1 defaults to one member and sequence scope.
+  TpControlCommandKind kind{TpControlCommandKind::kSingle};
+  std::uint64_t cohort_id{0};
+  TpPlanDigest execution_plan_digest{};
+  TpPlanDigest cache_plan_digest{};
+  std::vector<TpControlMemberRequest> members;
+};
+
 struct TpControlResponse {
-  /// Correlates with the command and its bound C1 collective scope.
+  /// Response broker correlation key. C1 worker fields remain source-compatible.
   std::uint64_t sequence{0};
   std::vector<std::int32_t> tokens;
   std::uint64_t draft_tokens{0};
@@ -41,11 +81,38 @@ struct TpControlResponse {
   std::uint32_t cached_prompt_tokens{0};
   std::uint64_t cache_snapshot_bytes{0};
   std::string error;
+  TpControlResponseKind kind{TpControlResponseKind::kSingle};
+  std::uint64_t cohort_id{0};
+  TpPlanDigest execution_plan_digest{};
+  TpPlanDigest cache_plan_digest{};
+  std::vector<TpControlMemberResponse> members;
 };
+
+struct TpResponseExpectation {
+  std::uint64_t cohort_id{0};
+  TpPlanDigest execution_plan_digest{};
+  TpPlanDigest cache_plan_digest{};
+  std::vector<std::uint64_t> member_ids;
+};
+
+/// Computes the canonical C1/C2 execution-plan identity. C2 includes member
+/// order, AR width, token budgets and prompt tokens; rank identity is excluded.
+[[nodiscard]] TpPlanDigest ComputeTpExecutionPlanDigest(
+    const TpControlCommand& command);
+
+/// Computes the canonical requested cache plan. The bounded C2 contract only
+/// accepts the all-disabled plan, but C1 retains its existing cache fields.
+[[nodiscard]] TpPlanDigest ComputeTpCachePlanDigest(
+    const TpControlCommand& command);
+
+[[nodiscard]] bool ValidateTpControlCommand(const TpControlCommand& command,
+                                            std::string* error);
+[[nodiscard]] bool ValidateTpControlResponse(const TpControlResponse& response,
+                                             std::string* error);
 
 /// Ordered, versioned TCP control channel for the first TP=2 worker slice.
 /// Tensor payload still uses the RDMA communicator; this channel carries only
-/// prepared prompt commands, responses, and lifecycle handshakes.
+/// prepared prompt/cohort commands, responses, and lifecycle handshakes.
 class TpControlChannel final {
 public:
   [[nodiscard]] static std::shared_ptr<TpControlChannel> Listen(
@@ -118,6 +185,11 @@ public:
 
   [[nodiscard]] bool RegisterPendingResponse(std::uint64_t sequence,
                                              std::string* error);
+  /// Registers one C2 cohort response and validates its envelope before it is
+  /// delivered. The existing overload retains one-member C1 compatibility.
+  [[nodiscard]] bool RegisterPendingResponse(
+      std::uint64_t sequence, const TpResponseExpectation& expectation,
+      std::string* error);
   [[nodiscard]] bool CancelUnsentResponse(std::uint64_t sequence,
                                           std::string* error);
   [[nodiscard]] bool WaitForResponse(std::uint64_t sequence,

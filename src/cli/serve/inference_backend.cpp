@@ -3812,6 +3812,10 @@ bool InferenceBackend::run_worker(std::string* error) {
       SetError(error, "TP worker command receive failed: " + control_error);
       return false;
     }
+    if (command.kind != TpControlCommandKind::kSingle) {
+      SetError(error, "TP C2 control command is not executable");
+      return false;
+    }
     TpControlResponse response{.sequence = command.sequence};
     auto operation = std::make_shared<TpOperationLease>(state->communicator,
                                                         command.sequence);

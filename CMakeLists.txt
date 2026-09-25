@@ -188,7 +188,7 @@ target_compile_features(gufo_logging PUBLIC cxx_std_20)
 add_library(gufo_tp_control STATIC src/cli/serve/tp_control.cpp)
 target_include_directories(gufo_tp_control PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_tp_control PUBLIC cxx_std_20)
-target_link_libraries(gufo_tp_control PUBLIC Threads::Threads)
+target_link_libraries(gufo_tp_control PUBLIC gufo_core Threads::Threads)
 
 add_library(gufo_http STATIC
   src/cli/serve/image_api.cpp

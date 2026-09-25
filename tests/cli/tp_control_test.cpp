@@ -4,21 +4,30 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
 
+using gufo::server::ComputeTpCachePlanDigest;
+using gufo::server::ComputeTpExecutionPlanDigest;
 using gufo::server::TpControlChannel;
 using gufo::server::TpControlCommand;
+using gufo::server::TpControlCommandKind;
 using gufo::server::TpControlConfig;
 using gufo::server::TpControlResponse;
+using gufo::server::TpControlResponseKind;
 using gufo::server::TpResponseBroker;
+using gufo::server::TpResponseExpectation;
+using gufo::server::ValidateTpControlCommand;
+using gufo::server::ValidateTpControlResponse;
 
 void Require(bool condition, const std::string& message) {
   if (!condition) {
@@ -51,6 +60,95 @@ std::uint16_t FreePort() {
   const auto port = ntohs(address.sin_port);
   ::close(fd);
   return port;
+}
+
+TpControlCommand MakeC2Command(std::uint64_t sequence,
+                                std::uint64_t cohort_id) {
+  TpControlCommand command{
+      .sequence = sequence,
+      .kind = TpControlCommandKind::kCohort2Ar,
+      .cohort_id = cohort_id,
+      .members =
+          {
+              {
+                  .member_id = cohort_id + 1,
+                  .max_tokens = 4,
+                  .prompt_tokens = {10, 11, 12},
+                  .client_id = "member-zero",
+              },
+              {
+                  .member_id = cohort_id + 2,
+                  .max_tokens = 6,
+                  .prompt_tokens = {20, 21},
+                  .client_id = "member-one",
+              },
+          },
+  };
+  command.execution_plan_digest = ComputeTpExecutionPlanDigest(command);
+  command.cache_plan_digest = ComputeTpCachePlanDigest(command);
+  return command;
+}
+
+TpControlResponse MakeC2Response(const TpControlCommand& command) {
+  return {
+      .sequence = command.sequence,
+      .kind = TpControlResponseKind::kCohort2Ar,
+      .cohort_id = command.cohort_id,
+      .execution_plan_digest = command.execution_plan_digest,
+      .cache_plan_digest = command.cache_plan_digest,
+      .members =
+          {
+              {
+                  .member_id = command.members[0].member_id,
+                  .tokens = {100, 101},
+              },
+              {
+                  .member_id = command.members[1].member_id,
+                  .tokens = {200, 201, 202},
+              },
+          },
+  };
+}
+
+TpResponseExpectation MakeC2Expectation(const TpControlCommand& command) {
+  return {
+      .cohort_id = command.cohort_id,
+      .execution_plan_digest = command.execution_plan_digest,
+      .cache_plan_digest = command.cache_plan_digest,
+      .member_ids = {command.members[0].member_id,
+                     command.members[1].member_id},
+  };
+}
+
+void RequireC2MembersInOrder(const TpControlCommand& command,
+                             const TpControlResponse& response) {
+  Require(response.sequence == command.sequence &&
+              response.kind == TpControlResponseKind::kCohort2Ar &&
+              response.cohort_id == command.cohort_id &&
+              response.execution_plan_digest ==
+                  command.execution_plan_digest &&
+              response.cache_plan_digest == command.cache_plan_digest &&
+              response.members.size() == command.members.size() &&
+              response.members[0].member_id == command.members[0].member_id &&
+              response.members[1].member_id == command.members[1].member_id &&
+              response.members[0].tokens ==
+                  std::vector<std::int32_t>{100, 101} &&
+              response.members[1].tokens ==
+                  std::vector<std::int32_t>{200, 201, 202},
+          "TP C2 response preserves cohort and member order");
+}
+
+void RequireInvalidCommand(const TpControlCommand& command,
+                           const std::string& message) {
+  std::string error;
+  Require(!ValidateTpControlCommand(command, &error) && !error.empty(), message);
+}
+
+void RequireInvalidResponse(const TpControlResponse& response,
+                            const std::string& message) {
+  std::string error;
+  Require(!ValidateTpControlResponse(response, &error) && !error.empty(),
+          message);
 }
 
 }  // namespace
@@ -100,6 +198,8 @@ int main() {
   TpControlCommand received;
   Require(client->ReceiveCommand(&received, &client_error), client_error);
   Require(received.sequence == command.sequence &&
+              received.kind == TpControlCommandKind::kSingle &&
+              received.cohort_id == command.sequence && received.members.empty() &&
               received.max_tokens == command.max_tokens &&
               received.cache_prompt == command.cache_prompt &&
               received.cache_prefix_tokens == command.cache_prefix_tokens &&
@@ -119,6 +219,9 @@ int main() {
   Require(server->ReceiveResponse(&received_response, &server_error),
           server_error);
   Require(received_response.sequence == response.sequence &&
+              received_response.kind == TpControlResponseKind::kSingle &&
+              received_response.cohort_id == response.sequence &&
+              received_response.members.empty() &&
               received_response.tokens == response.tokens &&
               received_response.draft_tokens == response.draft_tokens &&
               received_response.draft_accepted_tokens ==
@@ -150,8 +253,126 @@ int main() {
           client_error);
   Require(server->ReceiveResponse(&received_zero_scope_response, &server_error),
           server_error);
-  Require(received_zero_scope_response.sequence == 0,
+  Require(received_zero_scope_response.sequence == 0 &&
+              received_zero_scope_response.kind ==
+                  TpControlResponseKind::kSingle &&
+              received_zero_scope_response.cohort_id == 0,
           "TP control response preserves a zero operation scope");
+
+  const auto c2_command = MakeC2Command(20, 1000);
+  std::string validation_error;
+  Require(ValidateTpControlCommand(c2_command, &validation_error),
+          validation_error);
+  Require(ComputeTpExecutionPlanDigest(c2_command) ==
+              c2_command.execution_plan_digest &&
+              ComputeTpCachePlanDigest(c2_command) ==
+                  c2_command.cache_plan_digest,
+          "TP C2 digest helpers are deterministic");
+
+  auto reordered = c2_command;
+  std::swap(reordered.members[0], reordered.members[1]);
+  Require(ComputeTpExecutionPlanDigest(reordered) !=
+                  c2_command.execution_plan_digest &&
+              ComputeTpCachePlanDigest(reordered) !=
+                  c2_command.cache_plan_digest,
+          "TP C2 digests bind member order");
+  auto changed_prompt = c2_command;
+  changed_prompt.members[0].prompt_tokens.push_back(13);
+  Require(ComputeTpExecutionPlanDigest(changed_prompt) !=
+              c2_command.execution_plan_digest &&
+              ComputeTpCachePlanDigest(changed_prompt) ==
+                  c2_command.cache_plan_digest,
+          "TP execution digest binds prompts without changing the cache plan");
+
+  auto malformed = c2_command;
+  malformed.members.pop_back();
+  malformed.execution_plan_digest = ComputeTpExecutionPlanDigest(malformed);
+  malformed.cache_plan_digest = ComputeTpCachePlanDigest(malformed);
+  RequireInvalidCommand(malformed, "TP C2 rejects a one-member cohort");
+  malformed = c2_command;
+  malformed.members[1].member_id = malformed.members[0].member_id;
+  malformed.execution_plan_digest = ComputeTpExecutionPlanDigest(malformed);
+  malformed.cache_plan_digest = ComputeTpCachePlanDigest(malformed);
+  RequireInvalidCommand(malformed, "TP C2 rejects duplicate member IDs");
+  malformed = c2_command;
+  malformed.members.push_back({
+      .member_id = c2_command.cohort_id + 3,
+      .max_tokens = 1,
+      .prompt_tokens = {30},
+      .client_id = "member-extra",
+  });
+  malformed.execution_plan_digest = ComputeTpExecutionPlanDigest(malformed);
+  malformed.cache_plan_digest = ComputeTpCachePlanDigest(malformed);
+  RequireInvalidCommand(malformed, "TP C2 rejects more than two members");
+  malformed = c2_command;
+  malformed.members[1].cache_prompt = true;
+  malformed.execution_plan_digest = ComputeTpExecutionPlanDigest(malformed);
+  malformed.cache_plan_digest = ComputeTpCachePlanDigest(malformed);
+  RequireInvalidCommand(malformed, "TP C2 rejects cache-enabled members");
+  malformed = c2_command;
+  malformed.execution_plan_digest[0] ^= 1U;
+  RequireInvalidCommand(malformed, "TP C2 rejects an execution-plan mismatch");
+  malformed = c2_command;
+  malformed.cache_plan_digest[31] ^= 1U;
+  RequireInvalidCommand(malformed, "TP C2 rejects a cache-plan mismatch");
+
+  const auto c2_response = MakeC2Response(c2_command);
+  validation_error.clear();
+  Require(ValidateTpControlResponse(c2_response, &validation_error),
+          validation_error);
+  auto malformed_response = c2_response;
+  malformed_response.members.pop_back();
+  RequireInvalidResponse(malformed_response,
+                         "TP C2 rejects a one-member response");
+  malformed_response = c2_response;
+  malformed_response.members[1].member_id = malformed_response.members[0].member_id;
+  RequireInvalidResponse(malformed_response,
+                         "TP C2 rejects duplicate response member IDs");
+  malformed_response = c2_response;
+  malformed_response.members[0].draft_tokens = 1;
+  RequireInvalidResponse(malformed_response,
+                         "TP C2 rejects an AR response with draft tokens");
+  malformed_response = c2_response;
+  malformed_response.members[1].cached_prompt_tokens = 1;
+  RequireInvalidResponse(malformed_response,
+                         "TP C2 rejects a cached C2 response");
+  malformed_response = c2_response;
+  malformed_response.execution_plan_digest = {};
+  RequireInvalidResponse(malformed_response,
+                         "TP C2 rejects a missing execution digest");
+
+  auto bad_wire_command = c2_command;
+  bad_wire_command.execution_plan_digest[0] ^= 1U;
+  server_error.clear();
+  Require(!server->SendCommand(bad_wire_command, &server_error) &&
+              server_error.find("digest mismatch") != std::string::npos,
+          "TP channel rejects a C2 digest mismatch before sending");
+  Require(server->SendCommand(c2_command, &server_error), server_error);
+  TpControlCommand received_c2_command;
+  Require(client->ReceiveCommand(&received_c2_command, &client_error),
+          client_error);
+  Require(received_c2_command.sequence == c2_command.sequence &&
+              received_c2_command.kind == TpControlCommandKind::kCohort2Ar &&
+              received_c2_command.cohort_id == c2_command.cohort_id &&
+              received_c2_command.execution_plan_digest ==
+                  c2_command.execution_plan_digest &&
+              received_c2_command.cache_plan_digest ==
+                  c2_command.cache_plan_digest &&
+              received_c2_command.members.size() == 2 &&
+              received_c2_command.members[0].member_id ==
+                  c2_command.members[0].member_id &&
+              received_c2_command.members[1].member_id ==
+                  c2_command.members[1].member_id &&
+              received_c2_command.members[0].prompt_tokens ==
+                  c2_command.members[0].prompt_tokens &&
+              received_c2_command.members[1].prompt_tokens ==
+                  c2_command.members[1].prompt_tokens,
+          "TP C2 command round trip preserves the ordered member plan");
+  Require(client->SendResponse(c2_response, &client_error), client_error);
+  TpControlResponse received_c2_response;
+  Require(server->ReceiveResponse(&received_c2_response, &server_error),
+          server_error);
+  RequireC2MembersInOrder(c2_command, received_c2_response);
 
   const auto mismatch_port = FreePort();
   std::shared_ptr<TpControlChannel> mismatch_client;
@@ -206,7 +427,9 @@ int main() {
 
   TpResponseBroker broker(broker_server, 3);
   Require(broker.RegisterPendingResponse(7, &server_error), server_error);
-  Require(broker.RegisterPendingResponse(9, &server_error), server_error);
+  Require(broker.RegisterPendingResponse(
+              9, MakeC2Expectation(c2_command), &server_error),
+          server_error);
   Require(broker.RegisterPendingResponse(11, &server_error), server_error);
 
   TpControlCommand broker_command{.sequence = 11,
@@ -230,7 +453,8 @@ int main() {
 
   bool responses_sent = false;
   std::thread response_thread([&] {
-    const TpControlResponse nine{.sequence = 9, .tokens = {19}};
+    auto nine = c2_response;
+    nine.sequence = 9;
     const TpControlResponse seven{.sequence = 7, .tokens = {17}};
     const TpControlResponse eleven{.sequence = 11, .tokens = {11}};
     responses_sent = broker_client->SendResponse(nine, &client_error) &&
@@ -249,9 +473,11 @@ int main() {
   response_thread.join();
   Require(responses_sent && seven_ready && nine_ready && eleven_ready &&
               seven_response.tokens == std::vector<std::int32_t>{17} &&
-              nine_response.tokens == std::vector<std::int32_t>{19} &&
               eleven_response.tokens == std::vector<std::int32_t>{11},
-          "TP broker routes out-of-order responses by sequence");
+          "TP broker routes C1 and C2 out-of-order responses by sequence");
+  auto broker_c2_command = c2_command;
+  broker_c2_command.sequence = 9;
+  RequireC2MembersInOrder(broker_c2_command, nine_response);
 
   Require(broker.RegisterPendingResponse(12, &server_error), server_error);
   const TpControlResponse unexpected{.sequence = 13, .tokens = {130}};
@@ -262,6 +488,53 @@ int main() {
           "TP broker fails closed on an unknown response");
   Require(!broker.RegisterPendingResponse(14, &server_error),
           "TP broker rejects registrations after poisoning");
+
+  const auto contract_mismatch_port = FreePort();
+  std::shared_ptr<TpControlChannel> contract_mismatch_client;
+  std::thread contract_connector([&] {
+    contract_mismatch_client = TpControlChannel::Connect(
+        "127.0.0.1", contract_mismatch_port, &client_error);
+  });
+  auto contract_mismatch_server =
+      TpControlChannel::Listen(contract_mismatch_port, &server_error);
+  contract_connector.join();
+  Require(contract_mismatch_server != nullptr && contract_mismatch_client != nullptr,
+          "TP contract mismatch pair connects");
+  bool contract_server_handshake = false;
+  bool contract_client_handshake = false;
+  std::thread contract_server_thread([&] {
+    contract_server_handshake =
+        contract_mismatch_server->Handshake(rank0, &server_error);
+  });
+  std::thread contract_client_thread([&] {
+    contract_client_handshake =
+        contract_mismatch_client->Handshake(rank1, &client_error);
+  });
+  contract_server_thread.join();
+  contract_client_thread.join();
+  Require(contract_server_handshake && contract_client_handshake,
+          "TP contract mismatch pair handshakes");
+
+  TpResponseBroker contract_broker(contract_mismatch_server, 1);
+  auto wrong_expectation = MakeC2Expectation(c2_command);
+  std::swap(wrong_expectation.member_ids[0],
+            wrong_expectation.member_ids[1]);
+  Require(contract_broker.RegisterPendingResponse(31, wrong_expectation,
+                                                  &server_error),
+          server_error);
+  auto mismatched_response = c2_response;
+  mismatched_response.sequence = 31;
+  Require(contract_mismatch_client->SendResponse(mismatched_response,
+                                                  &client_error),
+          client_error);
+  TpControlResponse ignored_contract;
+  Require(!contract_broker.WaitForResponse(31, &ignored_contract,
+                                           &server_error) &&
+              server_error.find("cohort contract mismatch") !=
+                  std::string::npos,
+          "TP broker rejects a C2 member-order mismatch");
+  Require(!contract_broker.RegisterPendingResponse(32, &server_error),
+          "TP broker remains poisoned after a C2 contract mismatch");
 
   const auto interrupt_port = FreePort();
   std::shared_ptr<TpControlChannel> interrupt_client;
@@ -310,6 +583,6 @@ int main() {
 
   Require(server->port() == port && client->port() == port,
           "TP control service port");
-  std::puts("PASS: TP control handshake and framed worker messages");
+  std::puts("PASS: TP control handshake, C1/C2 envelopes, and broker routing");
   return 0;
 }
