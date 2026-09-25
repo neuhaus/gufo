@@ -147,8 +147,8 @@ The qualified d4096 probe reused 4095 cached prompt tokens and prefilled 2043
 new tokens. A paired historical-branch probe also restored the older stable
 prompt boundary after a live continuation; both ranks reported the same
 cached-token count, and MTP retained its draft acceptance. Clean-source MTP
-d4096 measured 32.57 tok/s mixed and 39.49 tok/s repetitive; these remain
-experimental results, not published cells.
+d4096 measured 31.68 tok/s mixed and 39.07 tok/s repetitive in the fresh
+post-v3 run; these remain experimental results, not published cells.
 
 For the C1 corpus path, use an experiment configuration whose selected
 `multi-ar`/`multi-mtp` concurrency is `[1]`; the driver forces
