@@ -56,6 +56,7 @@
 | One-tile-ahead LDS fragment prefetch (dense and routed WMMA) | Rejected: exact output, but the explicit double buffer raised register use (dense 221 → 253 VGPRs; the 128-token pair reached 256 with spills) and every GEMM slowed 3–14%. |
 | hipBLASLt F16 dense projections | Rejected: the pinned library reaches 19–26 TFLOPS on the 2048-token dense shapes against 30–34 TFLOPS for the Q8→F16 WMMA kernels; `tools/qwen-flash/dense_blaslt_sweep.hip` reproduces the sweep. |
 | Side-stream inject/shared-expert overlap | Rejected: exact output and real kernel overlap in the trace, but the co-running kernels slowed each other and interleaved wall-clock runs were 0.5–0.9% slower. |
+| TP2 Q8 paired load probe | The Q8 PLE host path is now supported and a one-token host reference step passes. TP2 Q8 loads at about 71,647 MiB GPU allocation per rank, but long-context AR ranks diverge numerically (`TP worker token mismatch` in HTTP and differing 128-token probe text). The six Q8 shard and MTP-sidecar SHA-256 hashes match on both hosts, so this is not a copy-integrity issue. Full Q8 serving remains unqualified. |
 
 Separate d32K pp2048 profiling attributes 29.1% of kernel time to MoE, 34.9%
 to dense projections and 12.6% to attention/indexing. Final-tile catch-up
