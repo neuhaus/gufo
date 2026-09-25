@@ -12,11 +12,11 @@ void SetError(std::string* error_msg, std::string message) {
   }
 }
 
-bool CheckedAdd(std::size_t* total, std::size_t value,
-                const char* label, std::string* error_msg) {
+bool CheckedAdd(std::size_t* total, std::size_t value, const char* label,
+                std::string* error_msg) {
   if (*total > std::numeric_limits<std::size_t>::max() - value) {
-    SetError(error_msg, std::string("TP routed weight plan overflows in ") +
-                            label);
+    SetError(error_msg,
+             std::string("TP routed weight plan overflows in ") + label);
     return false;
   }
   *total += value;
@@ -68,9 +68,10 @@ bool AddLayerRouted(const LayerWeights& layer, const TpPartition& partition,
 
 }  // namespace
 
-std::optional<RoutedWeightPlan> PlanRoutedBytes(
-    const ModelWeights& weights, const TpPartition& partition,
-    const MtpWeights* mtp_weights, std::string* error_msg) {
+std::optional<RoutedWeightPlan> PlanRoutedBytes(const ModelWeights& weights,
+                                                const TpPartition& partition,
+                                                const MtpWeights* mtp_weights,
+                                                std::string* error_msg) {
   if (error_msg != nullptr) {
     error_msg->clear();
   }
@@ -138,7 +139,7 @@ std::optional<TensorRange> LocalExpertRange(const TensorRef& tensor,
   }
   const std::uint64_t rows = tensor.rows;
   if (rows != 0 && partition.expert_count >
-                        std::numeric_limits<std::uint64_t>::max() / rows) {
+                       std::numeric_limits<std::uint64_t>::max() / rows) {
     SetError(error_msg, "TP expert range row geometry overflows");
     return std::nullopt;
   }
@@ -150,7 +151,7 @@ std::optional<TensorRange> LocalExpertRange(const TensorRef& tensor,
     return std::nullopt;
   }
   if (rows != 0 && partition.expert_begin >
-                        std::numeric_limits<std::uint64_t>::max() / rows) {
+                       std::numeric_limits<std::uint64_t>::max() / rows) {
     SetError(error_msg, "TP expert range offset geometry overflows");
     return std::nullopt;
   }

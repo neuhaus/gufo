@@ -47,7 +47,7 @@ struct TpControlResponse {
 /// Tensor payload still uses the RDMA communicator; this channel carries only
 /// prepared prompt commands, responses, and lifecycle handshakes.
 class TpControlChannel final {
- public:
+public:
   [[nodiscard]] static std::shared_ptr<TpControlChannel> Listen(
       std::uint16_t port, std::string* error);
   [[nodiscard]] static std::shared_ptr<TpControlChannel> Connect(
@@ -75,7 +75,7 @@ class TpControlChannel final {
   [[nodiscard]] std::uint32_t rank() const noexcept;
   [[nodiscard]] std::uint32_t world_size() const noexcept;
 
- private:
+private:
   TpControlChannel(int fd, std::uint32_t rank, std::uint16_t port);
 
   [[nodiscard]] bool SendFrame(std::uint16_t type, std::uint64_t sequence,
@@ -106,7 +106,7 @@ class TpControlChannel final {
 /// control sequence; production construction uses capacity one. This is a
 /// safety foundation for ordered C2 cohorts, not an enablement of C2 itself.
 class TpResponseBroker final {
- public:
+public:
   TpResponseBroker(std::shared_ptr<TpControlChannel> control,
                    std::size_t max_pending_responses);
   ~TpResponseBroker();
@@ -125,7 +125,7 @@ class TpResponseBroker final {
                                      std::string* error);
   void FailAll(std::string reason);
 
- private:
+private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

@@ -20,9 +20,7 @@ struct TpPartition {
   std::uint32_t expert_begin{0};
   std::uint32_t expert_count{0};
 
-  [[nodiscard]] bool distributed() const noexcept {
-    return world_size > 1;
-  }
+  [[nodiscard]] bool distributed() const noexcept { return world_size > 1; }
 
   [[nodiscard]] bool Valid() const noexcept {
     return num_experts != 0 && world_size != 0 && rank < world_size &&

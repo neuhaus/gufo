@@ -410,21 +410,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
-  s.expert_counts =
-      Alloc<std::uint32_t>(a, model.local_experts(), error_msg);
+  s.expert_counts = Alloc<std::uint32_t>(a, model.local_experts(), error_msg);
   {
-    const std::size_t compact =
-        RoutedCompactRows(slots, model.local_experts());
+    const std::size_t compact = RoutedCompactRows(slots, model.local_experts());
     s.routed_bounds =
         Alloc<std::int32_t>(a, model.local_experts() + 1, error_msg);
-    s.routed_cursors =
-        Alloc<std::int32_t>(a, model.local_experts(), error_msg);
+    s.routed_cursors = Alloc<std::int32_t>(a, model.local_experts(), error_msg);
     s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
     s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
-    s.routed_tiles =
-        Alloc<std::int32_t>(
-            a, 3 * RoutedTileCapacity(slots, model.local_experts()),
-            error_msg);
+    s.routed_tiles = Alloc<std::int32_t>(
+        a, 3 * RoutedTileCapacity(slots, model.local_experts()), error_msg);
   }
   s.weights = f32(slots);
   s.gate_e = f32(slots * c.expert_ff);
@@ -451,18 +446,18 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
     void* counts = nullptr;
-    if (!Check(hipHostMalloc(
-                   &counts, model.local_experts() * sizeof(std::uint32_t)),
+    if (!Check(hipHostMalloc(&counts,
+                             model.local_experts() * sizeof(std::uint32_t)),
                "pinned expert counts", error_msg)) {
       return nullptr;
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
-    if (!Check(hipHostMalloc(
-                   &tiles,
-                   3 * RoutedTileCapacity(slots, model.local_experts()) *
-                       sizeof(std::int32_t)),
-               "pinned routed tile map", error_msg)) {
+    if (!Check(
+            hipHostMalloc(&tiles,
+                          3 * RoutedTileCapacity(slots, model.local_experts()) *
+                              sizeof(std::int32_t)),
+            "pinned routed tile map", error_msg)) {
       return nullptr;
     }
     e->tiles_host_ = static_cast<std::int32_t*>(tiles);
@@ -1536,8 +1531,7 @@ bool Executor::AllReduce(float* data, std::size_t rows,
   }
   const std::size_t hidden = config().hidden_size;
   if (rows > std::numeric_limits<std::size_t>::max() / hidden ||
-      rows * hidden >
-          std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+      rows * hidden > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
     if (error_msg != nullptr) {
       *error_msg = "Flash-Next all-reduce byte count overflows";
     }
@@ -1583,11 +1577,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // a second copy of this dense output.
   shexp_half_ready_ = false;
   if (model_->tp_rank() != 0) {
-    if (!Check(hipMemsetAsync(
-                   s_.shexp_out, 0,
-                   static_cast<std::size_t>(n_tokens) * c.hidden_size *
-                       sizeof(float),
-                   stream_),
+    if (!Check(hipMemsetAsync(s_.shexp_out, 0,
+                              static_cast<std::size_t>(n_tokens) *
+                                  c.hidden_size * sizeof(float),
+                              stream_),
                "non-owner shared expert clear", error_msg)) {
       return false;
     }

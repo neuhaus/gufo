@@ -2451,11 +2451,10 @@ __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
     sum = fmaxf(sum, 6.103515625e-5f);
     for (std::uint32_t slot = 0; slot < k; ++slot) {
       const std::uint32_t global = chosen[slot];
-      const bool local = global >= expert_begin &&
-                         global - expert_begin < local_experts;
-      ids[t * k + slot] = local
-                              ? static_cast<std::int32_t>(global - expert_begin)
-                              : -1;
+      const bool local =
+          global >= expert_begin && global - expert_begin < local_experts;
+      ids[t * k + slot] =
+          local ? static_cast<std::int32_t>(global - expert_begin) : -1;
       weights[t * k + slot] = local ? chosen_p[slot] / sum : 0.0f;
     }
   }

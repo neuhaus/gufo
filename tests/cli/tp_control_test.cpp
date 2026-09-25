@@ -1,3 +1,5 @@
+#include "src/cli/serve/tp_control.hpp"
+
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -9,8 +11,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include "src/cli/serve/tp_control.hpp"
 
 namespace {
 
@@ -81,12 +81,10 @@ int main() {
   rank1.rank = 1;
   bool server_handshake = false;
   bool client_handshake = false;
-  std::thread server_handshake_thread([&] {
-    server_handshake = server->Handshake(rank0, &server_error);
-  });
-  std::thread client_handshake_thread([&] {
-    client_handshake = client->Handshake(rank1, &client_error);
-  });
+  std::thread server_handshake_thread(
+      [&] { server_handshake = server->Handshake(rank0, &server_error); });
+  std::thread client_handshake_thread(
+      [&] { client_handshake = client->Handshake(rank1, &client_error); });
   server_handshake_thread.join();
   client_handshake_thread.join();
   Require(server_handshake, server_error);
@@ -140,8 +138,7 @@ int main() {
       .client_id = "zero-scope",
   };
   TpControlCommand received_zero_scope;
-  Require(server->SendCommand(zero_scope_command, &server_error),
-          server_error);
+  Require(server->SendCommand(zero_scope_command, &server_error), server_error);
   Require(client->ReceiveCommand(&received_zero_scope, &client_error),
           client_error);
   Require(received_zero_scope.sequence == 0,
@@ -159,8 +156,8 @@ int main() {
   const auto mismatch_port = FreePort();
   std::shared_ptr<TpControlChannel> mismatch_client;
   std::thread mismatch_connector([&] {
-    mismatch_client = TpControlChannel::Connect("127.0.0.1", mismatch_port,
-                                                 &client_error);
+    mismatch_client =
+        TpControlChannel::Connect("127.0.0.1", mismatch_port, &client_error);
   });
   auto mismatch_server = TpControlChannel::Listen(mismatch_port, &server_error);
   mismatch_connector.join();
@@ -187,8 +184,8 @@ int main() {
   const auto broker_port = FreePort();
   std::shared_ptr<TpControlChannel> broker_client;
   std::thread broker_connector([&] {
-    broker_client = TpControlChannel::Connect("127.0.0.1", broker_port,
-                                               &client_error);
+    broker_client =
+        TpControlChannel::Connect("127.0.0.1", broker_port, &client_error);
   });
   auto broker_server = TpControlChannel::Listen(broker_port, &server_error);
   broker_connector.join();
@@ -197,12 +194,10 @@ int main() {
   bool broker_server_handshake = false;
   bool broker_client_handshake = false;
   std::thread broker_server_thread([&] {
-    broker_server_handshake =
-        broker_server->Handshake(rank0, &server_error);
+    broker_server_handshake = broker_server->Handshake(rank0, &server_error);
   });
   std::thread broker_client_thread([&] {
-    broker_client_handshake =
-        broker_client->Handshake(rank1, &client_error);
+    broker_client_handshake = broker_client->Handshake(rank1, &client_error);
   });
   broker_server_thread.join();
   broker_client_thread.join();
@@ -223,8 +218,8 @@ int main() {
   TpControlCommand received_command;
   bool command_received = false;
   std::thread command_thread([&] {
-    command_received = broker_client->ReceiveCommand(&received_command,
-                                                     &client_error);
+    command_received =
+        broker_client->ReceiveCommand(&received_command, &client_error);
   });
   const bool command_sent =
       broker_server->SendCommand(broker_command, &server_error);
@@ -245,12 +240,12 @@ int main() {
   TpControlResponse seven_response;
   TpControlResponse nine_response;
   TpControlResponse eleven_response;
-  const bool seven_ready = broker.WaitForResponse(
-      7, &seven_response, &server_error);
-  const bool nine_ready = broker.WaitForResponse(
-      9, &nine_response, &server_error);
-  const bool eleven_ready = broker.WaitForResponse(
-      11, &eleven_response, &server_error);
+  const bool seven_ready =
+      broker.WaitForResponse(7, &seven_response, &server_error);
+  const bool nine_ready =
+      broker.WaitForResponse(9, &nine_response, &server_error);
+  const bool eleven_ready =
+      broker.WaitForResponse(11, &eleven_response, &server_error);
   response_thread.join();
   Require(responses_sent && seven_ready && nine_ready && eleven_ready &&
               seven_response.tokens == std::vector<std::int32_t>{17} &&
@@ -271,10 +266,11 @@ int main() {
   const auto interrupt_port = FreePort();
   std::shared_ptr<TpControlChannel> interrupt_client;
   std::thread interrupt_connector([&] {
-    interrupt_client = TpControlChannel::Connect("127.0.0.1", interrupt_port,
-                                                  &client_error);
+    interrupt_client =
+        TpControlChannel::Connect("127.0.0.1", interrupt_port, &client_error);
   });
-  auto interrupt_server = TpControlChannel::Listen(interrupt_port, &server_error);
+  auto interrupt_server =
+      TpControlChannel::Listen(interrupt_port, &server_error);
   interrupt_connector.join();
   Require(interrupt_server != nullptr && interrupt_client != nullptr,
           "TP interrupt pair connects");
@@ -301,8 +297,8 @@ int main() {
   std::string interrupt_wait_error;
   std::thread interrupt_waiter([&] {
     TpControlResponse response;
-    interrupt_wait_ok = interrupt_broker.WaitForResponse(
-        21, &response, &interrupt_wait_error);
+    interrupt_wait_ok =
+        interrupt_broker.WaitForResponse(21, &response, &interrupt_wait_error);
     interrupt_wait_returned = true;
   });
   interrupt_broker.FailAll("test response reader interruption");

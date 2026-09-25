@@ -572,8 +572,7 @@ struct TextRunnerPool::Request::Impl {
     if (lease.cache_hit() && !lease.restored_from_disk() &&
         ((lease.cached_tokens() == snapshot_tokens.size() &&
           lease.HasSnapshotFor(snapshot_tokens)) ||
-         (capabilities.preserve_snapshot_prefix &&
-          lease.cached_tokens() != 0 &&
+         (capabilities.preserve_snapshot_prefix && lease.cached_tokens() != 0 &&
           lease.cached_tokens() <= snapshot_tokens.size() &&
           lease.HasSnapshotFor(std::span<const TextRunnerToken>(prompt).first(
               lease.cached_tokens()))))) {

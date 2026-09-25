@@ -642,11 +642,11 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                               base.ids, base.gate_e, c.expert_ff, c.hidden_size,
                               rows, l.ffn_gate_exps.experts, c.num_experts_used,
                               stream_) != 0 ||
-        qfn_mmq_moe_vec(
-            static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
-            base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,
-            rows * c.num_experts_used, l.ffn_down_exps.experts, 1,
-            stream_) != 0)
+        qfn_mmq_moe_vec(static_cast<int>(l.ffn_down_exps.type),
+                        l.ffn_down_exps.data, base.gate_e, base.ids,
+                        base.down_e, c.hidden_size, c.expert_ff,
+                        rows * c.num_experts_used, l.ffn_down_exps.experts, 1,
+                        stream_) != 0)
       return Fail(error, "batched routed vector projection failed");
     MoeEpilogue(base.down_e, base.weights, base.shexp_out,
                 base.router + c.num_experts, c.num_experts + 1, out, rows,

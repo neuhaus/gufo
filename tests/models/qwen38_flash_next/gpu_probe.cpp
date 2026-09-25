@@ -51,7 +51,7 @@ namespace {
 
 #ifdef GUFO_ENABLE_TP2_RDMA
 class OperationGuard {
- public:
+public:
   OperationGuard(std::shared_ptr<q::rocm::Communicator> communicator,
                  std::uint64_t scope_id)
       : communicator_(std::move(communicator)), scope_id_(scope_id) {}
@@ -75,7 +75,7 @@ class OperationGuard {
     return true;
   }
 
- private:
+private:
   std::shared_ptr<q::rocm::Communicator> communicator_;
   const std::uint64_t scope_id_;
   bool active_{false};
@@ -188,15 +188,14 @@ int main(int argc, char** argv) {
       } else if (arg == "--tp-world-size") {
         tp_world_size = parsed;
       } else if (arg == "--tp-bootstrap-port") {
-        if (parsed == 0 ||
-            parsed > std::numeric_limits<std::uint16_t>::max()) {
+        if (parsed == 0 || parsed > std::numeric_limits<std::uint16_t>::max()) {
           std::fprintf(stderr, "--tp-bootstrap-port is out of range\n");
           return 2;
         }
         tp_bootstrap_port = static_cast<std::uint16_t>(parsed);
       } else if (arg == "--tp-device") {
-        if (parsed > static_cast<std::uint32_t>(
-                         std::numeric_limits<int>::max())) {
+        if (parsed >
+            static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
           std::fprintf(stderr, "--tp-device is out of range\n");
           return 2;
         }
@@ -268,8 +267,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "rank one requires --tp-bootstrap-host\n");
     return 2;
   }
-  if (tp_device > static_cast<std::uint32_t>(
-                       std::numeric_limits<int>::max()) ||
+  if (tp_device > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
       hipSetDevice(static_cast<int>(tp_device)) != hipSuccess) {
     std::fprintf(stderr, "HIP device selection failed\n");
     return 1;
@@ -303,8 +301,8 @@ int main(int argc, char** argv) {
   std::unique_ptr<OperationGuard> operation;
 #endif
   if (tp_world_size == 2) {
-    partition = q::distributed::TpPartition::Create(
-        c.num_experts, tp_rank, tp_world_size, &error);
+    partition = q::distributed::TpPartition::Create(c.num_experts, tp_rank,
+                                                    tp_world_size, &error);
     if (!partition) {
       std::fprintf(stderr, "partition failed: %s\n", error.c_str());
       return 1;
@@ -318,14 +316,12 @@ int main(int argc, char** argv) {
         .device_index = tp_device,
         .gid_index = tp_gid,
     };
-    communicator =
-        q::rocm::CreateIbrverbsCommunicator(config, &error);
+    communicator = q::rocm::CreateIbrverbsCommunicator(config, &error);
     if (!communicator) {
       std::fprintf(stderr, "RDMA communicator failed: %s\n", error.c_str());
       return 1;
     }
-    operation = std::make_unique<OperationGuard>(communicator,
-                                                  tp_operation_id);
+    operation = std::make_unique<OperationGuard>(communicator, tp_operation_id);
     if (!operation->Begin(&error)) {
       std::fprintf(stderr, "TP operation scope bind failed: %s\n",
                    error.c_str());
@@ -391,7 +387,8 @@ int main(int argc, char** argv) {
     options.max_speculative = 8;
   if (communicator) {
     options.all_reduce = [communicator](float* data, std::size_t bytes,
-                                       hipStream_t stream, std::string* error) {
+                                        hipStream_t stream,
+                                        std::string* error) {
       return communicator->AllReduceSum(data, bytes, stream, error);
     };
   }

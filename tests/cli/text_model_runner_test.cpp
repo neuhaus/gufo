@@ -741,11 +741,10 @@ void TestPreserveSnapshotPrefixForDistributedCache() {
   root.Commit();
   const auto captures_after_root = stats->snapshot_captures;
 
-  auto continuation = pool.Acquire(
-      {1, 2, 3, 4, 5, 6}, gufo::sampling::SamplingConfig{}, {}, nullptr,
-      true, 6);
-  Expect(continuation.cache_hit() &&
-             continuation.cached_prompt_tokens() == 4,
+  auto continuation =
+      pool.Acquire({1, 2, 3, 4, 5, 6}, gufo::sampling::SamplingConfig{}, {},
+                   nullptr, true, 6);
+  Expect(continuation.cache_hit() && continuation.cached_prompt_tokens() == 4,
          "distributed continuation reuses the stable historical boundary");
   Expect(continuation.Prefill(2).decode_ready,
          "distributed continuation prefills only its suffix");

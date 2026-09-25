@@ -501,8 +501,7 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--tp-world-size", "N",
                      "Qwen3.8-Flash-Next TP world size (1 or 2)", "TP2",
                      &tp_world_size);
-    parser.AddOption("", "--tp-rank", "N", "TP rank (0 or 1)", "TP2",
-                     &tp_rank);
+    parser.AddOption("", "--tp-rank", "N", "TP rank (0 or 1)", "TP2", &tp_rank);
     parser.AddOption("", "--tp-bootstrap-host", "HOST",
                      "Rank-1 address of the rank-0 RDMA bootstrap", "TP2",
                      &tp_bootstrap_host);
@@ -1191,16 +1190,15 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --tp-rank must be less than --tp-world-size\n";
       return 2;
     }
-    if (tp_world_size == 2 &&
-        (tp_rank == 1 && tp_bootstrap_host.empty())) {
+    if (tp_world_size == 2 && (tp_rank == 1 && tp_bootstrap_host.empty())) {
       std::cerr << "Error: rank one requires --tp-bootstrap-host\n";
       return 2;
     }
     if (tp_bootstrap_port == 0 || tp_bootstrap_port > 65535 ||
         tp_control_port == 0 || tp_control_port > 65535 ||
         tp_bootstrap_port == tp_control_port ||
-        tp_device > static_cast<std::uint32_t>(
-                        std::numeric_limits<int>::max()) ||
+        tp_device >
+            static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
         tp_gid_index > std::numeric_limits<std::uint8_t>::max()) {
       std::cerr << "Error: invalid TP2 network/device options\n";
       return 2;
@@ -1250,14 +1248,13 @@ int RunServe(std::span<const char* const> args) {
                   << '\n';
         return 1;
       }
-      tp_control = tp_rank == 0
-                       ? server::TpControlChannel::Listen(
-                             static_cast<std::uint16_t>(tp_control_port),
-                             &tp_error)
-                       : server::TpControlChannel::Connect(
-                             tp_bootstrap_host,
-                             static_cast<std::uint16_t>(tp_control_port),
-                             &tp_error);
+      tp_control =
+          tp_rank == 0
+              ? server::TpControlChannel::Listen(
+                    static_cast<std::uint16_t>(tp_control_port), &tp_error)
+              : server::TpControlChannel::Connect(
+                    tp_bootstrap_host,
+                    static_cast<std::uint16_t>(tp_control_port), &tp_error);
       if (!tp_control) {
         std::cerr << "Error creating TP2 worker control channel: " << tp_error
                   << '\n';

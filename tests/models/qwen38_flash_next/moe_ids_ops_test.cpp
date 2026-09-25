@@ -17,6 +17,10 @@
 
 namespace {
 
+// The routing kernels live in the model's rocm namespace. The alias is at file
+// scope so every check below can name them, not just CheckRouter.
+namespace q = gufo::models::qwen38_flash_next::rocm;
+
 // The model's routing: 512 experts, top-10 without replacement.
 constexpr int kExperts = 512;
 constexpr int kUsed = 10;
@@ -171,7 +175,6 @@ bool Same(const Maps& a, const Maps& b, const char* what) {
 // Check the router independently of the assignment-map builder: softmax,
 // selection without replacement, lowest-index ties, and renormalization.
 void CheckRouter(int tokens, int experts, int used, int pattern) {
-  namespace q = gufo::models::qwen38_flash_next::rocm;
   const int stride = experts + 1;
   const std::size_t count = static_cast<std::size_t>(tokens) * used;
   constexpr std::int32_t kIdGuard = -771;
@@ -335,8 +338,8 @@ void CheckEmptyLocalPartition() {
   CheckHip(hipMemcpy(d_logits, logits.data(), logits.size() * sizeof(float),
                      hipMemcpyHostToDevice),
            "empty logits upload");
-  q::RouterTopK(d_logits, kExperts + 1, d_ids, d_weights, 1, kExperts, kUsed,
-                0, kExperts / 2, nullptr);
+  q::RouterTopK(d_logits, kExperts + 1, d_ids, d_weights, 1, kExperts, kUsed, 0,
+                kExperts / 2, nullptr);
   CheckHip(hipDeviceSynchronize(), "empty partition router");
   std::vector<std::int32_t> ids(count);
   std::vector<float> weights(count);

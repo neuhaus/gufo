@@ -1,10 +1,10 @@
+#include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <string>
-
-#include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
 
 namespace {
 
@@ -34,7 +34,10 @@ int main() {
   const auto single = TpPartition::Create(512, 0, 1, &error);
   Require(single.has_value(), error.c_str());
   Require(!single->distributed(), "world size one is not distributed");
-  Require(single->LocalExpert(0) == 0 && single->LocalExpert(511) == 0,
+  // A single rank owns all 512 experts, so its local shard is the whole
+  // tensor and the local ID equals the global ID. This is the same
+  // `global - expert_begin` rule the TP=2 cases below exercise.
+  Require(single->LocalExpert(0) == 0 && single->LocalExpert(511) == 511,
           "single-rank mapping");
 
   const auto first = TpPartition::Create(512, 0, 2, &error);

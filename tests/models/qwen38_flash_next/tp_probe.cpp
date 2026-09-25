@@ -27,7 +27,7 @@ namespace {
 
 #ifdef GUFO_ENABLE_TP2_RDMA
 class OperationGuard {
- public:
+public:
   OperationGuard(std::shared_ptr<q::rocm::Communicator> communicator,
                  std::uint64_t scope_id)
       : communicator_(std::move(communicator)), scope_id_(scope_id) {}
@@ -51,7 +51,7 @@ class OperationGuard {
     return true;
   }
 
- private:
+private:
   std::shared_ptr<q::rocm::Communicator> communicator_;
   const std::uint64_t scope_id_;
   bool active_{false};
@@ -104,8 +104,8 @@ int main(int argc, char** argv) {
       const std::string value = next();
       char* end = nullptr;
       temperature = std::strtof(value.c_str(), &end);
-      if (end == value.c_str() || *end != '\0' ||
-          !std::isfinite(temperature) || temperature < 0.0F) {
+      if (end == value.c_str() || *end != '\0' || !std::isfinite(temperature) ||
+          temperature < 0.0F) {
         Fail("--temperature requires a nonnegative number");
         return 2;
       }
@@ -174,8 +174,7 @@ int main(int argc, char** argv) {
   if (model_path.empty() || context == 0 || tokens == 0 ||
       (world_size != 1 && world_size != 2) || rank >= world_size ||
       (world_size == 1 && rank != 0) ||
-      device > static_cast<std::uint32_t>(
-                   std::numeric_limits<int>::max()) ||
+      device > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
       gid > std::numeric_limits<std::uint8_t>::max() ||
       (world_size == 2 && rank == 1 && bootstrap_host.empty())) {
     Fail("invalid TP2 probe arguments");

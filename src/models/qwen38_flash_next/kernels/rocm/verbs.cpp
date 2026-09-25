@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <infiniband/verbs.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -21,8 +22,6 @@
 #include <string>
 #include <thread>
 #include <utility>
-
-#include <infiniband/verbs.h>
 
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
@@ -58,12 +57,10 @@ std::string SystemError(const char* operation) {
   return std::string(operation) + ": " + std::strerror(errno);
 }
 
-bool MapFixedBuffer(std::uintptr_t address, void** buffer,
-                    std::string* error) {
-  void* mapped = ::mmap(reinterpret_cast<void*>(address), kBufferBytes,
-                        PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1,
-                        0);
+bool MapFixedBuffer(std::uintptr_t address, void** buffer, std::string* error) {
+  void* mapped = ::mmap(
+      reinterpret_cast<void*>(address), kBufferBytes, PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
   if (mapped == MAP_FAILED) {
     SetError(error, "fixed RDMA buffer mmap failed: " +
                         std::string(std::strerror(errno)));
@@ -118,8 +115,8 @@ public:
   }
 
   [[nodiscard]] static Socket Listen(const std::string& host,
-                                    std::uint16_t port, std::string* error) {
-    struct addrinfo hints {};
+                                     std::uint16_t port, std::string* error) {
+    struct addrinfo hints{};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
@@ -128,8 +125,8 @@ public:
     const int result = ::getaddrinfo(host.empty() ? nullptr : host.c_str(),
                                      service.c_str(), &hints, &addresses);
     if (result != 0) {
-      SetError(error, "bootstrap getaddrinfo: " +
-                          std::string(::gai_strerror(result)));
+      SetError(error,
+               "bootstrap getaddrinfo: " + std::string(::gai_strerror(result)));
       return {};
     }
     int fd = -1;
@@ -178,14 +175,14 @@ public:
   }
 
   [[nodiscard]] static Socket Connect(const std::string& host,
-                                     std::uint16_t port, std::string* error) {
+                                      std::uint16_t port, std::string* error) {
     if (host.empty()) {
       SetError(error, "rank one requires a bootstrap host");
       return {};
     }
     const auto deadline = std::chrono::steady_clock::now() + kCollectiveTimeout;
     for (;;) {
-      struct addrinfo hints {};
+      struct addrinfo hints{};
       hints.ai_family = AF_INET;
       hints.ai_socktype = SOCK_STREAM;
       const std::string service = std::to_string(port);
@@ -206,14 +203,13 @@ public:
           continue;
         }
         const int flags = ::fcntl(fd, F_GETFL, 0);
-        if (flags < 0 ||
-            ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
           ::close(fd);
           fd = -1;
           continue;
         }
-        bool connected = ::connect(fd, address->ai_addr, address->ai_addrlen) ==
-                         0;
+        bool connected =
+            ::connect(fd, address->ai_addr, address->ai_addrlen) == 0;
         if (!connected && errno == EINPROGRESS) {
           pollfd poll_fd{.fd = fd, .events = POLLOUT, .revents = 0};
           const int poll_result = ::poll(&poll_fd, 1, 1000);
@@ -249,7 +245,7 @@ public:
   }
 
   [[nodiscard]] bool SendAll(const void* data, std::size_t bytes,
-                            std::string* error) const {
+                             std::string* error) const {
     const auto* cursor = static_cast<const std::uint8_t*>(data);
     std::size_t sent = 0;
     while (sent < bytes) {
@@ -267,7 +263,7 @@ public:
   }
 
   [[nodiscard]] bool RecvAll(void* data, std::size_t bytes,
-                            std::string* error) const {
+                             std::string* error) const {
     auto* cursor = static_cast<std::uint8_t*>(data);
     std::size_t received = 0;
     while (received < bytes) {
@@ -286,7 +282,7 @@ public:
 
 private:
   static void SetTimeouts(int fd) noexcept {
-    struct timeval timeout {};
+    struct timeval timeout{};
     timeout.tv_sec = 30;
     timeout.tv_usec = 0;
     (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -345,8 +341,8 @@ public:
     if (config_.world_size != 2 || config_.rank > 1 ||
         config_.bootstrap_port == 0 ||
         config_.gid_index > std::numeric_limits<std::uint8_t>::max() ||
-        config_.device_index > static_cast<std::uint32_t>(
-                                  std::numeric_limits<int>::max())) {
+        config_.device_index >
+            static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
       SetError(error,
                "verbs communicator requires two ranks and a bootstrap port");
       return false;
@@ -382,7 +378,7 @@ public:
       return false;
     }
 
-    ibv_port_attr port {};
+    ibv_port_attr port{};
     if (ibv_query_port(context_, kPort, &port) != 0 ||
         port.state != IBV_PORT_ACTIVE ||
         port.link_layer != IBV_LINK_LAYER_INFINIBAND) {
@@ -406,16 +402,14 @@ public:
       return false;
     }
     result_registered_ = true;
-    send_mr_ = ibv_reg_mr(pd_, send_buffer_, kBufferBytes,
-                          kMemoryAccessFlags);
-    recv_mr_ = ibv_reg_mr(pd_, recv_buffer_, kBufferBytes,
-                          kMemoryAccessFlags);
+    send_mr_ = ibv_reg_mr(pd_, send_buffer_, kBufferBytes, kMemoryAccessFlags);
+    recv_mr_ = ibv_reg_mr(pd_, recv_buffer_, kBufferBytes, kMemoryAccessFlags);
     if (send_mr_ == nullptr || recv_mr_ == nullptr) {
       SetError(error, "ibv_reg_mr for verbs buffers failed");
       return false;
     }
 
-    struct ibv_qp_init_attr init {};
+    struct ibv_qp_init_attr init{};
     init.send_cq = cq_;
     init.recv_cq = cq_;
     init.cap.max_send_wr = 16;
@@ -430,7 +424,7 @@ public:
       return false;
     }
 
-    struct ibv_qp_attr attr {};
+    struct ibv_qp_attr attr{};
     attr.qp_state = IBV_QPS_INIT;
     attr.pkey_index = 0;
     attr.port_num = kPort;
@@ -482,9 +476,8 @@ public:
       return false;
     }
 
-    const auto mtu = static_cast<ibv_mtu>(
-        std::min(static_cast<unsigned>(local.mtu),
-                 static_cast<unsigned>(remote.mtu)));
+    const auto mtu = static_cast<ibv_mtu>(std::min(
+        static_cast<unsigned>(local.mtu), static_cast<unsigned>(remote.mtu)));
     attr = {};
     attr.qp_state = IBV_QPS_RTR;
     attr.path_mtu = mtu;
@@ -498,10 +491,11 @@ public:
     attr.ah_attr.is_global = 1;
     attr.ah_attr.port_num = kPort;
     std::memcpy(&attr.ah_attr.grh.dgid, &remote.sgid, sizeof(remote.sgid));
-    if (ibv_modify_qp(qp_, &attr, IBV_QP_STATE | IBV_QP_AV |
-                                     IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                                     IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
-                                     IBV_QP_MIN_RNR_TIMER) != 0) {
+    if (ibv_modify_qp(qp_, &attr,
+                      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                          IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                          IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) !=
+        0) {
       SetError(error, "ibv_modify_qp RTR failed");
       return false;
     }
@@ -512,10 +506,10 @@ public:
     attr.retry_cnt = 7;
     attr.rnr_retry = 7;
     attr.max_rd_atomic = 1;
-    if (ibv_modify_qp(qp_, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN |
-                                     IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-                                     IBV_QP_RNR_RETRY |
-                                     IBV_QP_MAX_QP_RD_ATOMIC) != 0) {
+    if (ibv_modify_qp(qp_, &attr,
+                      IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
+                          IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+                          IBV_QP_MAX_QP_RD_ATOMIC) != 0) {
       SetError(error, "ibv_modify_qp RTS failed");
       return false;
     }
@@ -577,8 +571,8 @@ public:
     if (*bound_scope_ != scope_id) {
       poisoned_ = true;
       SetError(error, "verbs operation scope end mismatch: bound=" +
-                           std::to_string(*bound_scope_) + " requested=" +
-                           std::to_string(scope_id));
+                          std::to_string(*bound_scope_) +
+                          " requested=" + std::to_string(scope_id));
       return false;
     }
     bound_scope_.reset();
@@ -586,8 +580,8 @@ public:
   }
 
   [[nodiscard]] bool AllReduceSum(float* data, std::size_t bytes,
-                                 hipStream_t stream,
-                                 std::string* error) override {
+                                  hipStream_t stream,
+                                  std::string* error) override {
     std::lock_guard lock(mutex_);
     if (qp_ == nullptr) {
       SetError(error, "verbs communicator is not initialized");
@@ -628,10 +622,9 @@ public:
 
     // Stage before announcing readiness. The peer can then read directly from
     // this send window without a per-chunk TCP data-ready round trip.
-    if (bytes != 0 &&
-        (hipStreamSynchronize(stream) != hipSuccess ||
-         hipMemcpy(send_buffer_, data, bytes, hipMemcpyDeviceToHost) !=
-             hipSuccess)) {
+    if (bytes != 0 && (hipStreamSynchronize(stream) != hipSuccess ||
+                       hipMemcpy(send_buffer_, data, bytes,
+                                 hipMemcpyDeviceToHost) != hipSuccess)) {
       poisoned_ = true;
       SetError(error, "HIP device-to-host all-reduce staging failed");
       return false;
@@ -651,8 +644,8 @@ public:
         *error = "verbs collective identity or size mismatch: outgoing=" +
                  std::to_string(outgoing.scope_id) + "/" +
                  std::to_string(outgoing.operation_id) + "/" +
-                 std::to_string(outgoing.bytes) + " incoming=" +
-                 std::to_string(incoming.scope_id) + "/" +
+                 std::to_string(outgoing.bytes) +
+                 " incoming=" + std::to_string(incoming.scope_id) + "/" +
                  std::to_string(incoming.operation_id) + "/" +
                  std::to_string(incoming.bytes);
       }
@@ -669,11 +662,11 @@ public:
     for (std::size_t offset = 0; offset < bytes; offset += kBufferBytes) {
       const std::size_t count = std::min(kBufferBytes, bytes - offset);
       auto* destination = static_cast<std::uint8_t*>(recv_buffer_) + offset;
-      ibv_sge sge {};
+      ibv_sge sge{};
       sge.addr = reinterpret_cast<std::uint64_t>(destination);
       sge.length = static_cast<unsigned>(count);
       sge.lkey = recv_mr_->lkey;
-      ibv_send_wr wr {};
+      ibv_send_wr wr{};
       wr.wr_id = static_cast<std::uint64_t>(offset);
       wr.sg_list = &sge;
       wr.num_sge = 1;
@@ -746,9 +739,8 @@ private:
       if (error != nullptr) {
         *error =
             "verbs collective acknowledgement identity mismatch: expected=" +
-            std::to_string(scope_id) + "/" +
-            std::to_string(operation_id) + " incoming=" +
-            std::to_string(incoming.scope_id) + "/" +
+            std::to_string(scope_id) + "/" + std::to_string(operation_id) +
+            " incoming=" + std::to_string(incoming.scope_id) + "/" +
             std::to_string(incoming.operation_id);
       }
       return false;
@@ -759,7 +751,7 @@ private:
   [[nodiscard]] bool PollCompletion(std::uint64_t expected,
                                     std::string* error) {
     const auto deadline = std::chrono::steady_clock::now() + kCollectiveTimeout;
-    ibv_wc completion {};
+    ibv_wc completion{};
     if (completion_channel_ != nullptr) {
       const auto remaining = deadline - std::chrono::steady_clock::now();
       if (remaining.count() <= 0) {
@@ -769,9 +761,8 @@ private:
       const auto remaining_ms = std::max<std::int64_t>(
           1, std::chrono::duration_cast<std::chrono::milliseconds>(remaining)
                  .count());
-      pollfd event_fd{.fd = completion_channel_->fd,
-                      .events = POLLIN,
-                      .revents = 0};
+      pollfd event_fd{
+          .fd = completion_channel_->fd, .events = POLLIN, .revents = 0};
       int poll_result;
       do {
         poll_result = ::poll(&event_fd, 1, static_cast<int>(remaining_ms));
@@ -788,8 +779,8 @@ private:
       void* event_context = nullptr;
       int event_result;
       do {
-        event_result = ibv_get_cq_event(completion_channel_, &event_cq,
-                                         &event_context);
+        event_result =
+            ibv_get_cq_event(completion_channel_, &event_cq, &event_context);
       } while (event_result != 0 && errno == EINTR);
       if (event_result != 0 || event_cq != cq_) {
         SetError(error, "verbs completion event failed");
@@ -908,7 +899,8 @@ private:
   std::uint32_t remote_rkey_{0};
   std::unique_ptr<Socket> control_;
   std::optional<std::uint64_t> bound_scope_;
-  // Monotonic for the communicator lifetime; scope_id supplies request identity.
+  // Monotonic for the communicator lifetime; scope_id supplies request
+  // identity.
   std::uint64_t next_operation_{0};
   bool poisoned_{false};
   mutable std::mutex mutex_;

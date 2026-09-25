@@ -26,7 +26,8 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 4;  // operation scope and cache-policy parity
+constexpr std::uint16_t kVersion =
+    4;  // operation scope and cache-policy parity
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
@@ -68,8 +69,7 @@ void AppendU64(std::vector<std::uint8_t>* out, std::uint64_t value) {
 
 bool ReadU32(std::span<const std::uint8_t> data, std::size_t* offset,
              std::uint32_t* value, std::string* error) {
-  if (*offset > data.size() ||
-      data.size() - *offset < sizeof(std::uint32_t)) {
+  if (*offset > data.size() || data.size() - *offset < sizeof(std::uint32_t)) {
     SetError(error, "TP control payload is truncated");
     return false;
   }
@@ -83,8 +83,7 @@ bool ReadU32(std::span<const std::uint8_t> data, std::size_t* offset,
 
 bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
              std::uint64_t* value, std::string* error) {
-  if (*offset > data.size() ||
-      data.size() - *offset < sizeof(std::uint64_t)) {
+  if (*offset > data.size() || data.size() - *offset < sizeof(std::uint64_t)) {
     SetError(error, "TP control payload is truncated");
     return false;
   }
@@ -111,8 +110,8 @@ TpControlChannel::TpControlChannel(int fd, std::uint32_t rank,
   }
 }
 
-std::shared_ptr<TpControlChannel> TpControlChannel::Listen(
-    std::uint16_t port, std::string* error) {
+std::shared_ptr<TpControlChannel> TpControlChannel::Listen(std::uint16_t port,
+                                                           std::string* error) {
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     SetError(error, SystemError("TP control socket"));
@@ -148,8 +147,7 @@ std::shared_ptr<TpControlChannel> TpControlChannel::Listen(
     return nullptr;
   }
   SetOperationTimeouts(peer);
-  return std::shared_ptr<TpControlChannel>(
-      new TpControlChannel(peer, 0, port));
+  return std::shared_ptr<TpControlChannel>(new TpControlChannel(peer, 0, port));
 }
 
 std::shared_ptr<TpControlChannel> TpControlChannel::Connect(
@@ -165,8 +163,8 @@ std::shared_ptr<TpControlChannel> TpControlChannel::Connect(
     hints.ai_socktype = SOCK_STREAM;
     const std::string service = std::to_string(port);
     addrinfo* addresses = nullptr;
-    const int resolve = ::getaddrinfo(host.c_str(), service.c_str(), &hints,
-                                      &addresses);
+    const int resolve =
+        ::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
     if (resolve != 0) {
       SetError(error, "TP control getaddrinfo: " +
                           std::string(::gai_strerror(resolve)));
@@ -400,8 +398,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   if (rank != 1U - config.rank || world != config.world_size ||
       context != config.max_context ||
       prefill_chunk != config.prefill_chunk_tokens ||
-      draft != config.max_draft_tokens ||
-      mtp != (config.use_mtp ? 1U : 0U) ||
+      draft != config.max_draft_tokens || mtp != (config.use_mtp ? 1U : 0U) ||
       cache_reuse != (config.allow_cache_reuse ? 1U : 0U) ||
       peer_token != auth_token_) {
     SetError(error, "TP control hello configuration mismatch");
@@ -463,11 +460,10 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
       !ReadU32(command_prompt_, &offset, &cache_prefix_tokens, error) ||
       !ReadU32(command_prompt_, &offset, &prompt_count, error) ||
       !ReadU32(command_prompt_, &offset, &client_size, error) ||
-      embedded != sequence || max_tokens == 0 ||
-      prompt_count == 0 || prompt_count > kMaxPromptTokens ||
-      cache_prompt > 1 || cache_prefix_tokens > prompt_count ||
-      max_context_ == 0 || prompt_count > max_context_ ||
-      client_size > kMaxClientIdBytes ||
+      embedded != sequence || max_tokens == 0 || prompt_count == 0 ||
+      prompt_count > kMaxPromptTokens || cache_prompt > 1 ||
+      cache_prefix_tokens > prompt_count || max_context_ == 0 ||
+      prompt_count > max_context_ || client_size > kMaxClientIdBytes ||
       command_prompt_.size() - offset !=
           static_cast<std::size_t>(prompt_count) * sizeof(std::int32_t) +
               client_size) {
@@ -653,28 +649,29 @@ struct TpResponseBroker::Impl {
   std::thread reader;
 };
 
-TpResponseBroker::TpResponseBroker(
-    std::shared_ptr<TpControlChannel> control,
-    std::size_t max_pending_responses)
-    : impl_(std::make_unique<Impl>(std::move(control),
-                                   max_pending_responses)) {}
+TpResponseBroker::TpResponseBroker(std::shared_ptr<TpControlChannel> control,
+                                   std::size_t max_pending_responses)
+    : impl_(std::make_unique<Impl>(std::move(control), max_pending_responses)) {
+}
 
-TpResponseBroker::~TpResponseBroker() { impl_.reset(); }
+TpResponseBroker::~TpResponseBroker() {
+  impl_.reset();
+}
 
 bool TpResponseBroker::RegisterPendingResponse(std::uint64_t sequence,
                                                std::string* error) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (impl_->stopping || impl_->poisoned) {
     SetError(error, impl_->failure.empty() ? "TP response broker is stopped"
-                                            : impl_->failure);
+                                           : impl_->failure);
     return false;
   }
   if (impl_->pending.size() >= impl_->capacity) {
     SetError(error, "TP response broker capacity is exhausted");
     return false;
   }
-  if (!impl_->pending.emplace(sequence,
-                              std::make_shared<Impl::Pending>()).second) {
+  if (!impl_->pending.emplace(sequence, std::make_shared<Impl::Pending>())
+           .second) {
     SetError(error, "TP response sequence is already registered");
     return false;
   }
@@ -752,8 +749,12 @@ void TpResponseBroker::FailAll(std::string reason) {
   }
 }
 
-std::uint16_t TpControlChannel::port() const noexcept { return port_; }
-std::uint32_t TpControlChannel::rank() const noexcept { return rank_; }
+std::uint16_t TpControlChannel::port() const noexcept {
+  return port_;
+}
+std::uint32_t TpControlChannel::rank() const noexcept {
+  return rank_;
+}
 std::uint32_t TpControlChannel::world_size() const noexcept {
   return world_size_;
 }

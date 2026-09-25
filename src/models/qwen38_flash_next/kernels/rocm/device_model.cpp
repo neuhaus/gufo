@@ -59,8 +59,8 @@ struct Uploader {
       Fail("weight range geometry is invalid for " + std::string(t.name));
       return d;
     }
-    if (relative_offset > std::numeric_limits<std::uint64_t>::max() -
-                              t.file_offset) {
+    if (relative_offset >
+        std::numeric_limits<std::uint64_t>::max() - t.file_offset) {
       Fail("weight range offset overflow for " + std::string(t.name));
       return d;
     }
@@ -72,8 +72,8 @@ struct Uploader {
     }
     allocations.push_back(ptr);
     bytes += size + kTailMargin;
-    if (!stager.Copy(shard_base + t.shard,
-                     t.file_offset + relative_offset, size, ptr, error)) {
+    if (!stager.Copy(shard_base + t.shard, t.file_offset + relative_offset,
+                     size, ptr, error)) {
       Fail("upload failed for " + std::string(t.name) +
            (error != nullptr ? ": " + *error : std::string()));
       return d;
@@ -365,9 +365,16 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     return nullptr;
   }
   std::vector<Conversion> conversions;
-  Uploader up{*stager,           conversions,     m->allocations_, m->bytes_,
-              m->max_half_cols_, m->max_q8_cols_, error_msg,
-              true,              0,                partition};
+  Uploader up{*stager,
+              conversions,
+              m->allocations_,
+              m->bytes_,
+              m->max_half_cols_,
+              m->max_q8_cols_,
+              error_msg,
+              true,
+              0,
+              partition};
   m->token_embd_ = up.Copy(w.token_embd);
   m->output_ =
       w.output.data == w.token_embd.data ? m->token_embd_ : up.Copy(w.output);
