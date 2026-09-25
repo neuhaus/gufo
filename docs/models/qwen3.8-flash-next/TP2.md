@@ -184,7 +184,9 @@ experimental and must not be rendered into the published benchmark tables.
   compared with an explicit tolerance rather than claimed bit-identical.
 - A rank with no locally selected experts emits a zero routed contribution
   and still participates in the collective.
-- The serving runner marks distributed TP2 as serial-only. The default C1 path
+- The serving runner marks distributed TP2 as serial-only. The CLI rejects
+  `--sessions 2` before creating the communicator or loading weights. The
+  default C1 path
   disables snapshots, forks, prefix reuse, persistence, and batched decode.
   `--tp-cache-reuse` enables symmetric rank-local live-prefix reuse and one
   immutable in-process snapshot/fork boundary; both ranks must use the flag
