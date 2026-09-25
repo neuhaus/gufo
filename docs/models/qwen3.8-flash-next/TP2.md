@@ -238,9 +238,24 @@ experimental and must not be rendered into the published benchmark tables.
   once on every path — including a member failure, which would otherwise leave
   a scope bound and fail-stop the next C1 request.
 
-  Not yet exercised for failure injection: peer cancel, member failure, cleanup
-  failure and the MTP refusal are covered by hosted tests only, and no C2
-  command has run with a prompt longer than one prefill chunk.
+  Two real fault injections are now verified on hardware, both fail-closed:
+  - **Admission refusal** (rank 1 `--worker-max-pending 1`): `SubmitCohort`
+    throws at admission, the seam releases the bound lease and sends a
+    wire-valid C2 error response that still carries both member envelopes.
+    Rank 0 observed `members=2`, error `text generation pending queue is full`
+    and no collective at all — 2 ms from command sent to response.
+  - **Operation-scope mismatch** (rank 0 `--tp-scope-override N`): the first
+    `AllReduceSum` header exchange fails on `scope_id` (`verbs.cpp:644-660`),
+    poisoning both communicators. Rank 0 failed 13 ms after send with
+    `outgoing=99/0/51200 incoming=1/0/51200`; rank 1, which injected nothing,
+    detected the mismatch and then failed its own lease release with
+    `verbs communicator is poisoned`, so the worker stopped instead of
+    degrading quietly. This is the case a fake lease cannot model, and it
+    confirms the exactly-one-`End` contract against a real poisoned
+    communicator.
+
+  Still covered by hosted tests only: peer cancel, member failure and the MTP
+  refusal. No C2 command has run with a prompt longer than one prefill chunk.
 
 - The dormant C2 path HAS now run end to end on hardware, three consecutive
   times, via `qwen38_flash_next_tp_c2_probe` (rank 0 on `fuzzy`, rank 1 on
