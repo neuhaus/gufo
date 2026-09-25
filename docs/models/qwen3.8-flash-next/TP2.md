@@ -201,6 +201,9 @@ experimental and must not be rendered into the published benchmark tables.
   changing `--sessions` is unsafe: a future cohort implementation must add
   request/operation identity, an ordered rank-local execution plan, and
   explicit cache-plan parity before enabling physical batched collectives.
+  The first qualification slice, if pursued, is fixed two-request C2, AR before
+  MTP, uncached and non-streaming, with repeated ordering/failure tests and
+  per-request hashes; it must not be enabled by a CLI alias alone.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
   routed source bytes and the device model reports post-conversion resident
