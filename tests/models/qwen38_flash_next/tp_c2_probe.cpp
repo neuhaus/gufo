@@ -64,9 +64,10 @@
 //     `--max-pending 1` while `SubmitCohort` needs `queued + 2 <= max_pending`,
 //     so a cohort is always refused at admission. `--role rank1` hosts
 //     `InferenceBackend` in-process with `--worker-max-pending` (default 2),
-//     runner pool capacity 1, no MTP, and `--context` equal to rank 0's. The
-//     serving front door's own TP=2 C1 guard is deliberately NOT reproduced
-//     here; see the admission-refusal fault mode below.
+//     runner pool capacity 1, and `--context` equal to rank 0's. It loads no
+//     MTP sidecar unless `--mtp-model` injects one; see the third fault mode.
+//     The serving front door's own TP=2 C1 guard is deliberately NOT
+//     reproduced here; see the admission-refusal fault mode below.
 //   * Rank 1 never validates the C2 contract; it reports what its worker loop
 //     returns. The C2 verdict is always rank 0's exit code.
 //   * Every `[c2-probe]` line is stamped with `t=<ms>ms` elapsed since process
@@ -78,7 +79,7 @@
 //   fakes. A real RDMA failure does not arrive as "lease Begin() returned
 //   false"; it arrives as a 30 s `kCollectiveTimeout` or a header mismatch
 //   inside `AllReduceSum`, which sets `poisoned_` on the communicator
-//   (verbs.cpp:604-608) and surfaces through a different route. These two
+//   (verbs.cpp:604-608) and surfaces through a different route. These three
 //   modes put that route in front of a real worker over a real RDMA pair.
 //
 //   1. ADMISSION REFUSAL (rank 1 `--worker-max-pending 1`)
@@ -116,6 +117,36 @@
 //      makes this mode look like a success, and `N` must differ from
 //      `--sequence` so the override can never be a silent no-op.
 //
+//   3. MTP-SIDECAR REFUSAL (rank 1 `--mtp-model PATH`, rank 0
+//      `--expect-worker-mtp` with `--expect-c2-error`)
+//      `RunTpCohortCommand` refuses a cohort while MTP is loaded BEFORE it
+//      binds the operation scope (tp_cohort_worker.cpp:160-162, `kMtpRefusal`),
+//      so on this path the lease bind and the first collective are dead code.
+//      `Impl::State::tp_use_mtp` comes from `Model::HasMtp`
+//      (inference_backend.cpp:3839) and the handshake then presents
+//      `use_mtp = true` with `max_draft_tokens = N` (inference_backend.cpp:
+//      3841-3846), which rank 0 must mirror field for field or `Handshake`
+//      rejects the pair (tp_control.cpp:671-680).
+//      Rank 0 loads NO sidecar: it is the AR lockstep driver, the point of
+//      the mode is that no collective is issued anywhere, and
+//      `--expect-c2-error` already removes rank 0's own lockstep. It declares
+//      the worker's parity with `--expect-worker-mtp` plus the same
+//      `--draft-tokens` width and loads exactly the AR model of the PASS path.
+//      EXPECTED: rank 1 loads the sidecar, handshakes, logs its ready line
+//      with the draft width and refuses the cohort. The refusal is decided
+//      before `BeginOperation`, so rank 1 binds NO lease and issues NO
+//      collective, and the wire-valid C2 error response (which still carries
+//      BOTH member envelopes, `BuildCohortFailureResponse`) answers within
+//      single-digit milliseconds of the command. Rank 0 finds `error` exactly
+//      "C2 cohort AR is not supported while the MTP sidecar is loaded" and
+//      exits 7, having logged no `prefill complete` and no `member N` line
+//      because the lockstep never ran. Rank 1 keeps serving and exits 0 when
+//      rank 0 closes the channel. The MTP refusal precedes member translation
+//      and admission, so `--worker-max-pending 1` combined with `--mtp-model`
+//      still ends in this refusal rather than in mode 1, and
+//      `--tp-scope-override` is inert here because no collective is issued for
+//      it to poison.
+//
 // EXIT REASONS
 //   0  every C2 contract and token-agreement check passed (rank 0), or the
 //      control channel closed after the cohort (rank 1)
@@ -127,11 +158,14 @@
 //   5  response plan-digest mismatch
 //   6  response member count or member order mismatch
 //   7  the worker answered with a C2 error response; this is the
-//      `--worker-max-pending 1` + `--expect-c2-error` verdict
+//      `--worker-max-pending 1`, `--mtp-model` and `--expect-c2-error` verdict
 //   8  member 0 returned more tokens than its budget
 //   9  member 1 returned more tokens than its budget
 //  10  member 0 tokens disagree with rank 0's local greedy output
 //  11  member 1 tokens disagree with rank 0's local greedy output
+//  12  a C2 error response arrived, but not the MTP sidecar refusal that
+//      `--expect-worker-mtp` asserts; the run still failed closed, but it did
+//      not fail for the injected reason
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -141,6 +175,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -203,6 +238,12 @@ constexpr float kGreedyTemperature = 0.0F;
 /// `RecvAll`). That is the one worker stop that is not a rank-1 failure.
 constexpr std::string_view kPeerClosedChannel =
     "TP control peer closed the channel";
+/// Verbatim copy of the worker's MTP refusal reason (tp_cohort_worker.cpp
+/// `kMtpRefusal`). The third fault mode compares the C2 error against it
+/// EXACTLY, because any refusal answers with the same exit 7: without the
+/// comparison an admission refusal could be read as this mode's verdict.
+constexpr std::string_view kMtpRefusal =
+    "C2 cohort AR is not supported while the MTP sidecar is loaded";
 /// Monotonic origin for every `[c2-probe] t=<ms>ms` stamp. `steady_clock` never
 /// steps, so a difference between two stamps is a real elapsed duration rather
 /// than a wall-clock jump.
@@ -224,6 +265,10 @@ enum ExitReason {
   kMember1BudgetExceeded = 9,
   kMember0TokenMismatch = 10,
   kMember1TokenMismatch = 11,
+  /// A C2 error response arrived, but not the refusal `--expect-worker-mtp`
+  /// asserts. Every refusal shares exit 7, so without this the third mode could
+  /// not tell its own verdict from any other refusal.
+  kC2ErrorReasonMismatch = 12,
 };
 
 /// Milliseconds elapsed since process start.
@@ -272,6 +317,15 @@ Rank-one options:
                           ceiling stays at 1 either way, and the runner pool
                           capacity stays at 1, so this moves nothing but the
                           admission ceiling. rank0 ignores it.
+  --mtp-model PATH        Fault injection: load this real MTP draft sidecar
+                          before the handshake, so the worker's state reports
+                          a draft sidecar and the C2 worker refuses the cohort.
+                          The path must be a readable file. Empty by default,
+                          which is the no-MTP production policy. Production
+                          path: /opt/models/qwen3.8-flash-next/MTP/
+                          mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf. rank0
+                          REFUSES this flag: it drives the AR lockstep and
+                          must load no sidecar.
 
 Peer options (both roles; the values must match or the handshake rejects):
   --model PATH            First GGUF shard (default: production Q4 path)
@@ -282,6 +336,11 @@ Peer options (both roles; the values must match or the handshake rejects):
   --tp-gid-index N        RDMA GID index (default 0)
   --context N             Handshake context; must equal the peer's
                           (default 4096)
+  --draft-tokens N        MTP draft width, 1..7 (default 7). rank1 loads it
+                          with --mtp-model; rank0 declares the worker's
+                          handshake max_draft_tokens with --expect-worker-mtp.
+                          Without one of those two flags it injects no fault
+                          and is refused.
   --help                  This text
 
 Rank-zero options (ignored by rank1):
@@ -301,8 +360,13 @@ Rank-zero options (ignored by rank1):
                           differ from --sequence. rank1 ignores it.
   --expect-c2-error      Fault injection: skip the lockstep member execution and
                           wait only for the worker's response. rank1 ignores it.
+  --expect-worker-mtp     Fault injection: declare that rank 1's handshake
+                          presents a draft sidecar, so rank 0 mirrors
+                          use_mtp=true and the worker's --draft-tokens. Rank 0
+                          still loads NO sidecar and issues no collective; it
+                          requires --expect-c2-error. rank1 ignores it.
 
-Fault-injection modes (both deliberate, both fail closed; neither can pass):
+Fault-injection modes (all deliberate, all fail closed; none can pass):
   1. Admission refusal.
        rank1: --worker-max-pending 1
        rank0: --expect-c2-error
@@ -330,6 +394,27 @@ Fault-injection modes (both deliberate, both fail closed; neither can pass):
      reports a collective/poison error and exits 1, immediately after its first
      prefill collective. It must never report a token mismatch or a PASS, and
      there is deliberately no flag that makes this mode look like a success.
+  3. MTP sidecar refusal.
+       rank1: --mtp-model PATH [--draft-tokens N]
+       rank0: --expect-worker-mtp [--draft-tokens N] --expect-c2-error
+     The worker refuses any C2 cohort while an MTP draft sidecar is loaded, and
+     it decides that BEFORE BeginOperation (tp_cohort_worker.cpp:160-162,
+     kMtpRefusal), so no lease is bound and no collective is issued.
+     EXPECTED: rank 1 loads the sidecar, handshakes, logs its ready line with
+     the draft width and refuses. The C2 error response still carries BOTH
+     member envelopes and arrives within single-digit milliseconds of the
+     command. Rank 0 validates the envelope, the plan digests and the member
+     order, finds error exactly "C2 cohort AR is not supported while the MTP
+     sidecar is loaded" and exits 7, with no "prefill complete" and no
+     "member N" line because the lockstep never ran; rank 1 keeps serving,
+     sees rank 0 close the channel and exits 0.
+     Rank 0 declares the worker's parity instead of loading a sidecar, because
+     the point of the mode is that NO collective is issued anywhere. Rank 1
+     must therefore be started with --mtp-model and rank 0 with
+     --expect-worker-mtp; a disagreement is a handshake rejection, not a
+     verdict. A --worker-max-pending 1 on rank 1 is never reached, because the
+     MTP refusal precedes admission, and --tp-scope-override is inert on rank
+     0 here because the skipped lockstep issues no collective for it to poison.
 
 Peer parity: the handshake compares world_size, max_context,
 prefill_chunk_tokens, max_draft_tokens, use_mtp, allow_cache_reuse and the
@@ -342,6 +427,19 @@ forces --max-pending 1 for TP=2. That serving guard is deliberately NOT
 reproduced here: the probe bypasses the serving front door, so
 --worker-max-pending 1 reaches the scheduler and provokes the refusal instead
 of being rejected.
+
+Handshake parity, all eight fields compared (tp_control.cpp:671-680):
+  field                 pass and modes 1-2         mode 3
+  rank                  0 / 1                       0 / 1
+  world_size            2 / 2                       2 / 2
+  max_context           --context / --context       --context / --context
+  prefill_chunk_tokens  512 / 512                    512 / 512
+  max_draft_tokens      0 / 0                        --draft-tokens, both
+                                                    roles, 7 when unset
+  use_mtp               false / false                true / true
+  allow_cache_reuse     false / false                false / false
+  auth_token            --tp-control-token, both     --tp-control-token,
+                                                    both
 
 Limits and hazards:
   * Wrap BOTH roles in an external timeout. The RDMA collective timeout is
@@ -369,19 +467,26 @@ Limits and hazards:
   * This probe runs the dormant serial C2 plan. It proves the control plane,
     cohort admission, ordered member execution and cross-rank token agreement.
     It proves nothing about batched or faster C2 execution.
-  * The two fault-injection modes above are the only supported ways to make a
-    run fail. Neither relaxes a production guard, and neither can report a
-    PASS: --expect-c2-error only removes rank 0's collectives, and a response
+  * The three fault-injection modes above are the only supported ways to make a
+    run fail. None relaxes a production guard, and none can report a PASS:
+    --expect-c2-error only removes rank 0's collectives, and a response
     without an error in that mode is itself an envelope mismatch (exit 4).
 
 Exit reasons:
   0 pass   1 transport/model/execution failure   2 arguments
   3 reserved (the unimplemented rank-1 role was retired)
   4 envelope mismatch   5 digest mismatch   6 member order mismatch
-  7 worker C2 error response (the --worker-max-pending 1 verdict)
+  7 worker C2 error response (the --worker-max-pending 1 and --mtp-model
+    verdicts)
   8/9 member 0/1 exceeded its token budget
   10/11 member 0/1 tokens disagree with the local greedy output
+  12 a C2 error response arrived, but not the MTP sidecar refusal that
+    --expect-worker-mtp asserts (the mode still failed closed, for another
+    reason: another refusal, or a changed production message)
   the --tp-scope-override verdict is 1 on rank 0 and 1 on rank 1
+  mode 3 also exits 0 on rank 1, like mode 1, and 7 on rank 0; a handshake
+  disagreement (rank 1 --mtp-model without rank 0 --expect-worker-mtp, or
+  mismatched --draft-tokens) is 1, because it fails before any command
   rank1 exits 0 when rank 0 closes the channel after the cohort and 1 on any
   worker failure; the C2 verdict is rank 0's exit code)");
 }
@@ -581,6 +686,18 @@ bool RunMember(const char* role, std::size_t index,
   return true;
 }
 
+/// The rank-one MTP draft sidecar for the third fault mode.
+///
+/// An empty path is the production no-MTP policy, and `draft_tokens` is only
+/// read with a path, so a sidecar-less run always builds the same
+/// `TextSpeculativeConfig` the PASS path has always used.
+struct MtpSidecar {
+  std::string model_path;
+  std::uint32_t draft_tokens{q::kMaxMtpDraftTokens};
+
+  [[nodiscard]] bool loaded() const { return !model_path.empty(); }
+};
+
 /// Hosts the real rank-1 C2 worker and returns a probe exit reason.
 ///
 /// `gufo serve` cannot be reused for this: it forces `--max-pending 1` for
@@ -588,12 +705,17 @@ bool RunMember(const char* role, std::size_t index,
 /// silent C2 error without running a single collective. The probe therefore
 /// builds `InferenceBackend` itself and supplies the policy the cohort needs.
 /// Nothing here relaxes a production guard.
+///
+/// `mtp` is the third fault mode: a real MTP draft sidecar, so the worker's
+/// handshake presents a draft sidecar and `RunTpCohortCommand` refuses the
+/// cohort before it binds a scope. Empty is the production no-MTP policy.
 int RunRank1Worker(const std::string& model_path, std::uint32_t context,
                    std::uint32_t device, std::uint32_t gid,
                    const std::string& bootstrap_host,
                    std::uint16_t bootstrap_port, std::uint16_t control_port,
                    const std::string& control_token,
-                   std::uint32_t worker_max_pending) {
+                   std::uint32_t worker_max_pending, const MtpSidecar& mtp) {
+  const bool mtp_loaded = mtp.loaded();
   std::string error;
 
   // The bootstrap connect blocks for up to 30 s, so announce the target first:
@@ -651,13 +773,28 @@ int RunRank1Worker(const std::string& model_path, std::uint32_t context,
       // its own and the per-client ceiling never blocks the cohort.
       .max_pending_requests_per_client = kWorkerMaxPendingRequestsPerClient,
   };
-  // Defaults: backend kDisabled with an empty draft path, so the model loads
-  // no MTP sidecar, the handshake reports 0 draft tokens and `use_mtp = false`.
-  // The worker refuses a cohort while MTP is loaded (tp_cohort_worker.cpp), and
-  // the C2 response contract cannot carry draft telemetry. `max_draft_tokens`
-  // stays at its default 7 rather than 0: `Model::Load` rejects a zero draft
-  // limit, and the handshake's draft field comes from `has_mtp`, not from it.
-  const server::TextSpeculativeConfig speculative_config{};
+  // Without a sidecar: backend kDisabled with an empty draft path, so the model
+  // loads no MTP sidecar, the handshake reports 0 draft tokens and
+  // `use_mtp = false`. The worker refuses a cohort while MTP is loaded
+  // (tp_cohort_worker.cpp), and the C2 response contract cannot carry draft
+  // telemetry. `max_draft_tokens` stays at its default 7 rather than 0:
+  // `Model::Load` rejects a zero draft limit, and the handshake's draft field
+  // comes from `has_mtp`, not from it.
+  //
+  // With a sidecar, this is exactly what `gufo serve --speculative mtp
+  // --mtp-model <path> --draft-tokens N` builds (serve.cpp:1132-1174): backend
+  // kMtp, the sidecar path, a positive draft limit and min_draft_tokens 1,
+  // which `InferenceBackend::load` requires of Flash-Next MTP
+  // (inference_backend.cpp:3418-3425 and 3790-3797). `max_draft_tokens` is
+  // also the value the handshake presents (inference_backend.cpp:3845), so it
+  // must equal rank 0's --draft-tokens.
+  const server::TextSpeculativeConfig speculative_config{
+      .backend = mtp_loaded ? server::TextSpeculativeBackend::kMtp
+                            : server::TextSpeculativeBackend::kDisabled,
+      .draft_model_path = mtp_loaded ? mtp.model_path : std::string{},
+      .max_draft_tokens = mtp.draft_tokens,
+      .min_draft_tokens = 1,
+  };
   // Default: no directory, so the disk cache is disabled. TP=2 forbids one
   // (serve.cpp) and `BuildCohortMembers` requires uncached members.
   const server::TextDiskCacheConfig disk_cache_config{};
@@ -687,12 +824,36 @@ int RunRank1Worker(const std::string& model_path, std::uint32_t context,
     Warn("rank-1 worker load failed: " + error);
     return kTransportFailure;
   }
+  // The ready line states the worker's speculative posture because it is part
+  // of the handshake, so a reader can tell mode 3 from the PASS path without
+  // cross-referencing the fault banner.
+  std::string mtp_state = "no MTP";
+  if (mtp_loaded) {
+    mtp_state = "MTP draft sidecar " + mtp.model_path + " with " +
+                std::to_string(mtp.draft_tokens) + " draft tokens";
+  }
   Say("rank1",
       "ready: model loaded, TP control handshaken, runner pool capacity " +
           std::to_string(kWorkerSessionCount) + ", max_pending_requests " +
-          std::to_string(worker_max_pending) +
-          ", no MTP; waiting for the C2 command");
-  if (worker_max_pending < 2) {
+          std::to_string(worker_max_pending) + ", " + mtp_state +
+          "; waiting for the C2 command");
+  if (mtp_loaded) {
+    // The refusal is decided before `BuildCohortMembers` and before admission
+    // (tp_cohort_worker.cpp:160-162), so a loaded sidecar decides the outcome
+    // even when `--worker-max-pending 1` is also set, and the two banners can
+    // never both be true at once.
+    Say("rank1",
+        "FAULT INJECTED: --mtp-model " + mtp.model_path + " with " +
+            std::to_string(mtp.draft_tokens) +
+            " draft tokens loads a real MTP draft sidecar, so this worker's "
+            "handshake presents use_mtp=true and max_draft_tokens=" +
+            std::to_string(mtp.draft_tokens) +
+            "; the next kCohort2Ar command must be refused BEFORE "
+            "BeginOperation with error \"C2 cohort AR is not supported while "
+            "the MTP sidecar is loaded\", so rank 1 must bind no lease, issue "
+            "no collective and answer with a wire-valid C2 error response that "
+            "still carries both member envelopes");
+  } else if (worker_max_pending < 2) {
     // `queued_count + 2 <= max_pending_requests` cannot hold, so the next
     // cohort is refused at admission. Announce the injected fault so the log
     // is self-describing and no reader can mistake the refusal for a contract
@@ -745,6 +906,17 @@ int main(int argc, char** argv) {
   /// Rank-zero fault injection: the worker will refuse the cohort at admission,
   /// so issue no lockstep collective and wait only for its response.
   bool expect_c2_error = false;
+  /// Rank-one fault injection: the MTP draft sidecar to load before the
+  /// handshake. Empty is the production no-MTP policy.
+  std::string mtp_model_path;
+  /// MTP draft width, on both roles: rank1 loads it with `--mtp-model`, rank 0
+  /// declares the worker's handshake value with `--expect-worker-mtp`. Unset
+  /// means `kMaxMtpDraftTokens`, which is also what a sidecar-less worker
+  /// passes to `load`.
+  std::optional<std::uint32_t> draft_tokens;
+  /// Rank-zero fault injection: rank 1's handshake presents a draft sidecar,
+  /// so rank 0 mirrors `use_mtp` and the draft width without loading one.
+  bool expect_worker_mtp = false;
   std::uint16_t bootstrap_port = 18515;
   std::uint16_t control_port = 18516;
   std::string bootstrap_host;
@@ -833,6 +1005,23 @@ int main(int argc, char** argv) {
       scope_override = parsed;
     } else if (arg == "--expect-c2-error") {
       expect_c2_error = true;
+    } else if (arg == "--mtp-model") {
+      // An absent or empty value is a missing argument, NOT the no-sidecar
+      // default, so it is refused here instead of silently dropping the fault.
+      mtp_model_path = next();
+      if (mtp_model_path.empty()) {
+        Warn("--mtp-model requires a path to an MTP draft sidecar");
+        return kInvalidArguments;
+      }
+    } else if (arg == "--draft-tokens") {
+      std::uint32_t parsed = 0;
+      if (!ParseUint(next(), &parsed)) {
+        Warn("--draft-tokens requires an unsigned integer");
+        return kInvalidArguments;
+      }
+      draft_tokens = parsed;
+    } else if (arg == "--expect-worker-mtp") {
+      expect_worker_mtp = true;
     } else if (arg == "--context") {
       if (!ParseUint(next(), &context)) {
         Warn("--context requires an unsigned integer");
@@ -931,7 +1120,73 @@ int main(int argc, char** argv) {
            "); an equal override injects no fault and would report a PASS");
       return kInvalidArguments;
     }
+    // The sidecar-refusal mode needs rank 0 to issue no collective at all,
+    // because the whole point of the mode is that rank 1 refuses before
+    // `BeginOperation`. Without `--expect-c2-error` rank 0 would run its
+    // lockstep prefill, which nobody answers, and the run would end in a 30 s
+    // collective timeout with both communicators poisoned instead of the C2
+    // error response this mode exists to observe.
+    if (expect_worker_mtp && !expect_c2_error) {
+      Warn(
+          "--expect-worker-mtp requires --expect-c2-error: the worker refuses "
+          "the cohort before it binds a scope, so rank 0 must issue no "
+          "collective and wait only for the C2 error response");
+      return kInvalidArguments;
+    }
   }
+
+  // Sidecar fault injection, validated on BOTH roles and before any RDMA or
+  // control peer is touched, so a wrong sidecar path or an unpaired parity flag
+  // costs 0 ms instead of a 30 s rendezvous and a model load. Rank 0 refuses
+  // `--mtp-model` outright: it is the AR lockstep driver, the mode exists to
+  // prove that no collective is issued, and a sidecar at rank 0 would also make
+  // its own handshake disagree with the no-MTP model it loaded. The worker's
+  // parity is declared with `--expect-worker-mtp` instead.
+  if (!mtp_model_path.empty() && role == "rank0") {
+    Warn(
+        "--mtp-model is a rank-one option: rank 0 drives the AR lockstep and "
+        "must load no draft sidecar, so declare the worker's parity with "
+        "--expect-worker-mtp --expect-c2-error instead");
+    return kInvalidArguments;
+  }
+  if (!mtp_model_path.empty()) {
+    std::error_code filesystem_error;
+    if (!std::filesystem::is_regular_file(std::filesystem::path(mtp_model_path),
+                                          filesystem_error)) {
+      Warn("--mtp-model is not a readable file: " + mtp_model_path);
+      return kInvalidArguments;
+    }
+  }
+  // `Model::Load` refuses a zero draft limit and caps Flash-Next MTP at
+  // `kMaxMtpDraftTokens` (engine.cpp:111-119), and `Handshake` rejects
+  // `use_mtp` with no draft tokens (tp_control.cpp:618-622), so the width is
+  // checked here rather than after the rendezvous.
+  if (draft_tokens.has_value() &&
+      (*draft_tokens == 0 || *draft_tokens > q::kMaxMtpDraftTokens)) {
+    Warn("--draft-tokens must be between 1 and " +
+         std::to_string(q::kMaxMtpDraftTokens) +
+         "; a zero draft limit is rejected by the model load and more than " +
+         std::to_string(q::kMaxMtpDraftTokens) +
+         " draft tokens by Flash-Next MTP");
+    return kInvalidArguments;
+  }
+  // A width alone injects nothing: rank 1 only loads it with `--mtp-model` and
+  // rank 0 only declares it with `--expect-worker-mtp`. An unpaired width is
+  // refused rather than ignored, for the same reason `--tp-scope-override`
+  // equal to `--sequence` is refused above.
+  const bool sidecar_fault = (role == "rank1" && !mtp_model_path.empty()) ||
+                             (role == "rank0" && expect_worker_mtp);
+  if (draft_tokens.has_value() && !sidecar_fault) {
+    Warn(
+        "--draft-tokens needs --mtp-model (rank1) or --expect-worker-mtp "
+        "(rank0); on this role it injects no fault and changes nothing");
+    return kInvalidArguments;
+  }
+  // The width both roles present in the handshake: rank 1 loads it, rank 0
+  // declares it. Unset keeps `kMaxMtpDraftTokens`, which is also what the
+  // sidecar-less worker has always passed to `load`.
+  const std::uint32_t mtp_draft_tokens =
+      draft_tokens.value_or(q::kMaxMtpDraftTokens);
 
   // Rank 1 owns no cohort: it is rank 0 that builds, sends and validates the
   // command. Everything above is the shared transport and policy validation, so
@@ -944,9 +1199,13 @@ int main(int argc, char** argv) {
           "the RDMA bootstrap and the TP control peer both connect there");
       return kInvalidArguments;
     }
+    const MtpSidecar mtp{
+        .model_path = mtp_model_path,
+        .draft_tokens = mtp_draft_tokens,
+    };
     return RunRank1Worker(model_path, context, device, gid, bootstrap_host,
                           bootstrap_port, control_port, control_token,
-                          worker_max_pending);
+                          worker_max_pending, mtp);
   }
 
   std::string error;
@@ -983,9 +1242,14 @@ int main(int argc, char** argv) {
       .max_context = context,
       // Mandatory for C2: the worker refuses a cohort before binding a scope
       // while MTP is loaded, and the C2 response cannot carry draft
-      // telemetry.
-      .max_draft_tokens = 0,
-      .use_mtp = false,
+      // telemetry. With `--expect-worker-mtp` these two fields instead mirror
+      // rank 1's loaded sidecar (`has_mtp ? max_draft_tokens : 0` and
+      // `use_mtp = has_mtp`, inference_backend.cpp:3841-3846), because
+      // `Handshake` compares all eight fields exactly
+      // (tp_control.cpp:671-680). Rank 0 still loads no sidecar: it is the AR
+      // lockstep driver and this mode asserts that no collective is issued.
+      .max_draft_tokens = mtp_draft_tokens,
+      .use_mtp = expect_worker_mtp,
       .allow_cache_reuse = false,
       .auth_token = control_token,
       .prefill_chunk_tokens = kWorkerPrefillChunkTokens,
@@ -995,14 +1259,24 @@ int main(int argc, char** argv) {
     return kTransportFailure;
   }
   Say("rank0", "TP control handshaken on port " + std::to_string(control_port));
+  if (expect_worker_mtp) {
+    Say("rank0",
+        "FAULT INJECTED: --expect-worker-mtp declares rank 1's handshake, "
+        "which presents use_mtp=true and max_draft_tokens=" +
+            std::to_string(mtp_draft_tokens) +
+            " because that worker loaded a draft sidecar; rank 0 loaded NO "
+            "sidecar and keeps the AR lockstep model, and it must issue no "
+            "collective at all");
+  }
 
   // 3. Load with the communicator attached so the executor installs its
   //    all-reduce callback; a TP=2 model refuses to load without one.
   q::ModelOptions options{
       .max_context = context,
-      // No MTP sidecar and no MTP path.
+      // No MTP sidecar and no MTP path, in every mode: rank 0 never loads the
+      // draft sidecar, not even when it declares the worker's parity above.
       .mtp_model_path = "",
-      .max_draft_tokens = 7,
+      .max_draft_tokens = q::kMaxMtpDraftTokens,
       .vision_model_path = "",
       // The C2 slice is serial: one resident request per rank.
       .decode_concurrency = 1,
@@ -1123,12 +1397,22 @@ int main(int argc, char** argv) {
         "response is awaited, and a response without an error is an envelope "
         "mismatch (exit 4)");
   }
+  if (expect_worker_mtp) {
+    Say("rank0",
+        "FAULT INJECTED: rank 1's worker has a draft sidecar loaded, so the "
+        "next kCohort2Ar command must be refused BEFORE BeginOperation with "
+        "error \"C2 cohort AR is not supported while the MTP sidecar is "
+        "loaded\"; rank 1 must bind no lease and issue no collective, and "
+        "rank 0 must see that error with BOTH member envelopes within "
+        "single-digit milliseconds and exit 7");
+  }
 
   // 6. Lockstep: issue exactly the forwards the worker issues, in order.
   //    `--expect-c2-error` deliberately skips this: the worker refuses the
-  //    cohort at admission and never issues a collective, so a lockstep peer
-  //    would block on the first prefill exchange and wait out the 30 s
-  //    collective timeout instead of reading the C2 error response.
+  //    cohort before it binds a scope -- at admission, or ahead of the bind
+  //    when a draft sidecar is loaded -- and never issues a collective, so a
+  //    lockstep peer would block on the first prefill exchange and wait out
+  //    the 30 s collective timeout instead of reading the C2 error response.
   MemberTrace trace[kMemberCount];
   for (std::size_t index = 0; index < kMemberCount && !expect_c2_error;
        ++index) {
@@ -1237,6 +1521,20 @@ int main(int argc, char** argv) {
                  static_cast<unsigned long long>(response.cohort_id),
                  response.error.c_str());
     std::fflush(stderr);
+    // `--expect-worker-mtp` asserts the refusal REASON, not merely that the
+    // cohort was refused: every refusal answers with this exit code, so an
+    // admission refusal (or a changed production message) must not be able to
+    // read as this mode's verdict. The comparison is exact because the worker
+    // sends `kMtpRefusal` verbatim and no cleanup failure is appended to a
+    // refusal that never bound a scope.
+    if (expect_worker_mtp && response.error != kMtpRefusal) {
+      Warn(
+          "the worker refused the cohort, but not for the injected reason: "
+          "expected \"" +
+          std::string(kMtpRefusal) + "\", got \"" + response.error +
+          "\"; the run still failed closed, so this is not a pass of mode 3");
+      return kC2ErrorReasonMismatch;
+    }
     return kCohortErrorResponse;
   }
   // `--expect-c2-error` asserts that the worker refused the cohort. Rank 0's
