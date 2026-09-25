@@ -942,6 +942,17 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                             session.reference_version(mode), " ".join(public_command(server.command)),
                             "fresh server per concurrency level") if note],
                     )
+                    if session.tp2_enabled:
+                        report["topology"] = {
+                            "id": "tp2",
+                            "worldSize": 2,
+                            "requestTransport": "openai-chat-completions-json",
+                            "limitations": [
+                                "C1 only", "greedy only", "uncached only",
+                                "non-streaming only", "no published benchmark comparison",
+                            ],
+                            "rankFingerprints": session.rank_fingerprints(),
+                        }
                     if session.target == "reference" and session.reference_kind == "ds4":
                         from ds4.server_metrics import cohort_metrics
                         with server.log_path.open("rb") as log:
