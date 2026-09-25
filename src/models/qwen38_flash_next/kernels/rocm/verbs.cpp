@@ -418,7 +418,7 @@ public:
     attr.qp_state = IBV_QPS_INIT;
     attr.pkey_index = 0;
     attr.port_num = kPort;
-    attr.qp_access_flags = 0;
+    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
     if (ibv_modify_qp(qp_, &attr,
                       IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
                           IBV_QP_ACCESS_FLAGS) != 0) {
