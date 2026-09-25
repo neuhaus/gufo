@@ -63,21 +63,71 @@
 //   * `gufo serve` cannot host the rank-1 worker: it forces
 //     `--max-pending 1` while `SubmitCohort` needs `queued + 2 <= max_pending`,
 //     so a cohort is always refused at admission. `--role rank1` hosts
-//     `InferenceBackend` in-process with `max_pending_requests = 2`, runner
-//     pool capacity 1, no MTP, and `--context` equal to rank 0's.
+//     `InferenceBackend` in-process with `--worker-max-pending` (default 2),
+//     runner pool capacity 1, no MTP, and `--context` equal to rank 0's. The
+//     serving front door's own TP=2 C1 guard is deliberately NOT reproduced
+//     here; see the admission-refusal fault mode below.
 //   * Rank 1 never validates the C2 contract; it reports what its worker loop
 //     returns. The C2 verdict is always rank 0's exit code.
+//   * Every `[c2-probe]` line is stamped with `t=<ms>ms` elapsed since process
+//     start, because a 30 s collective timeout and a 30 s model load are
+//     indistinguishable in an unstamped log.
+//
+// FAULT INJECTION (deliberate; every mode fails closed)
+//   The fail-closed C2 paths are otherwise covered only by hosted tests with
+//   fakes. A real RDMA failure does not arrive as "lease Begin() returned
+//   false"; it arrives as a 30 s `kCollectiveTimeout` or a header mismatch
+//   inside `AllReduceSum`, which sets `poisoned_` on the communicator
+//   (verbs.cpp:604-608) and surfaces through a different route. These two
+//   modes put that route in front of a real worker over a real RDMA pair.
+//
+//   1. ADMISSION REFUSAL (rank 1 `--worker-max-pending 1`)
+//      `SubmitCohort` requires `queued_count + 2 <= max_pending_requests`
+//      (text_generation_scheduler.cpp:1515-1519), so 1 refuses the cohort
+//      before either member reaches a runner. The C2 seam catches the submit
+//      exception, releases the operation lease and sends a wire-valid C2 error
+//      response that still carries BOTH member envelopes
+//      (tp_cohort_plan.cpp `MakeCohortEnvelope`). No collective is issued, so
+//      no RDMA traffic and no timeout: the run is fast and deterministic, and
+//      rank 0 exits with the C2-error reason (7) after validating the envelope,
+//      the digests and the member order of a response it did not ask for to
+//      succeed. Rank 0 MUST also be given `--expect-c2-error`, because the
+//      lockstep driver would otherwise issue a prefill collective that nobody
+//      answers and wait out the 30 s collective timeout.
+//
+//      The `gufo serve` guard that rejects `max_pending == 1` for TP=2
+//      (serve.cpp:1210-1219) is NOT replicated. The probe deliberately bypasses
+//      the serving front door and hosts `InferenceBackend` in-process, and
+//      forcing the refusal is the entire point of this mode. Nothing outside
+//      this test binary changes and no production guard is relaxed.
+//
+//   2. OPERATION-SCOPE MISMATCH (rank 0 `--tp-scope-override N`)
+//      Rank 0 binds `communicator->BeginOperation(N)` while still sending a
+//      command whose `sequence` is the normal value, so rank 1's worker binds
+//      `command.sequence` (inference_backend.cpp `TpOperationScopeLease`,
+//      tp_cohort_worker.cpp) and the two scopes disagree. The FIRST
+//      `AllReduceSum` header exchange fails `magic`/`version`/`scope_id`/
+//      `operation_id`/`bytes` validation (verbs.cpp:644-660) and poisons both
+//      communicators, so the run fails closed on both ranks: rank 1's model
+//      execution errors, the member `Wait()` throws, the seam cancels the peer
+//      and the release itself fails on a poisoned communicator, so the worker
+//      stops. Rank 0 reports a collective/poison error and exits 1, never a
+//      token mismatch and never a PASS. There is deliberately NO flag that
+//      makes this mode look like a success, and `N` must differ from
+//      `--sequence` so the override can never be a silent no-op.
 //
 // EXIT REASONS
 //   0  every C2 contract and token-agreement check passed (rank 0), or the
 //      control channel closed after the cohort (rank 1)
-//   1  transport/model/execution failure (RDMA, control, decode)
+//   1  transport/model/execution failure (RDMA, control, decode); this is the
+//      `--tp-scope-override` verdict
 //   2  argument or pre-flight validation failure
 //   3  reserved; retired with the unimplemented rank-1 stub
 //   4  response envelope mismatch (sequence, kind or cohort id)
 //   5  response plan-digest mismatch
 //   6  response member count or member order mismatch
-//   7  the worker answered with a C2 error response
+//   7  the worker answered with a C2 error response; this is the
+//      `--worker-max-pending 1` + `--expect-c2-error` verdict
 //   8  member 0 returned more tokens than its budget
 //   9  member 1 returned more tokens than its budget
 //  10  member 0 tokens disagree with rank 0's local greedy output
@@ -85,6 +135,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -93,6 +144,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -134,7 +186,8 @@ constexpr std::size_t kWorkerSessionCount = 1;
 /// (text_generation_scheduler.cpp:1515-1519), and `gufo serve` hard-codes
 /// `--max-pending 1` for TP=2. Two is the smallest value that admits a cohort;
 /// it is the policy this probe supplies, not a production change.
-constexpr std::size_t kWorkerMaxPendingRequests = 2;
+/// `--worker-max-pending` overrides it so the refusal can be provoked.
+constexpr std::uint32_t kWorkerMaxPendingRequests = 2;
 /// Rank 0 sends one member per distinct client id, so the per-client ceiling
 /// stays at 1 and each member is admitted on its own.
 constexpr std::size_t kWorkerMaxPendingRequestsPerClient = 1;
@@ -150,6 +203,11 @@ constexpr float kGreedyTemperature = 0.0F;
 /// `RecvAll`). That is the one worker stop that is not a rank-1 failure.
 constexpr std::string_view kPeerClosedChannel =
     "TP control peer closed the channel";
+/// Monotonic origin for every `[c2-probe] t=<ms>ms` stamp. `steady_clock` never
+/// steps, so a difference between two stamps is a real elapsed duration rather
+/// than a wall-clock jump.
+const std::chrono::steady_clock::time_point kProbeStart =
+    std::chrono::steady_clock::now();
 
 enum ExitReason {
   kOk = 0,
@@ -168,13 +226,27 @@ enum ExitReason {
   kMember1TokenMismatch = 11,
 };
 
+/// Milliseconds elapsed since process start.
+///
+/// The RDMA collective timeout is 30 s and a model load is also tens of
+/// seconds, so an unstamped lifecycle log cannot attribute a stall to either.
+/// Every lifecycle line therefore carries this stamp, and the absence of a gap
+/// between two stamps is itself the evidence that a phase was fast.
+std::string ElapsedMs() {
+  return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - kProbeStart)
+                            .count());
+}
+
 void Say(const char* role, const std::string& line) {
-  std::printf("[c2-probe %s] %s\n", role, line.c_str());
+  const std::string stamp = ElapsedMs();
+  std::printf("[c2-probe %s t=%sms] %s\n", role, stamp.c_str(), line.c_str());
   std::fflush(stdout);
 }
 
 void Warn(const std::string& line) {
-  std::fprintf(stderr, "[c2-probe] %s\n", line.c_str());
+  const std::string stamp = ElapsedMs();
+  std::fprintf(stderr, "[c2-probe t=%sms] %s\n", stamp.c_str(), line.c_str());
   std::fflush(stderr);
 }
 
@@ -195,6 +267,11 @@ Rank-one options:
   --tp-bootstrap-host HOST  REQUIRED for rank1. Rank 0's address, used for the
                           RDMA bootstrap and for the TP control connect. rank0
                           ignores it and binds the bootstrap to all interfaces.
+  --worker-max-pending N   TextSchedulerPolicy max_pending_requests for the
+                          rank-1 worker, >= 1 (default 2). The per-client
+                          ceiling stays at 1 either way, and the runner pool
+                          capacity stays at 1, so this moves nothing but the
+                          admission ceiling. rank0 ignores it.
 
 Peer options (both roles; the values must match or the handshake rejects):
   --model PATH            First GGUF shard (default: production Q4 path)
@@ -218,6 +295,41 @@ Rank-zero options (ignored by rank1):
   --prompt-1 TEXT         Member 1 prompt (default: a planet question)
   --prompt-file-0 PATH    Read member 0's prompt from a file instead
   --prompt-file-1 PATH    Read member 1's prompt from a file instead
+  --tp-scope-override N   Fault injection: bind collective scope N instead of
+                          --sequence, while still sending a command whose
+                          sequence is --sequence. N must be nonzero and must
+                          differ from --sequence. rank1 ignores it.
+  --expect-c2-error      Fault injection: skip the lockstep member execution and
+                          wait only for the worker's response. rank1 ignores it.
+
+Fault-injection modes (both deliberate, both fail closed; neither can pass):
+  1. Admission refusal.
+       rank1: --worker-max-pending 1
+       rank0: --expect-c2-error
+     SubmitCohort requires queued_count + 2 <= max_pending_requests, so 1
+     refuses the cohort at admission before either member reaches a runner. The
+     seam catches the submit exception, releases the operation lease and sends
+     a wire-valid C2 error response that still carries BOTH member envelopes.
+     No collective is ever issued, so no RDMA traffic and no timeout.
+     EXPECTED: fast and deterministic; rank 0 validates the envelope, the plan
+     digests and the member order, finds a nonempty error and exits 7; rank 1
+     keeps serving, sees rank 0 close the channel and exits 0.
+     rank 0 needs --expect-c2-error because its lockstep driver would
+     otherwise issue a prefill collective that nobody answers and wait out the
+     30 s collective timeout. The C2 verdict stays rank 0's exit code, so
+     rank 1 must also be started with --worker-max-pending 1.
+  2. Operation-scope mismatch.
+       rank0: --tp-scope-override N  (N != --sequence)
+     Rank 0 binds communicator->BeginOperation(N) while the command still
+     carries the normal sequence, so rank 1's worker binds command.sequence
+     and the two scopes disagree. The FIRST AllReduceSum header exchange fails
+     identity validation and poisons both communicators.
+     EXPECTED: the run FAILS on both ranks. Rank 1's model execution errors,
+     the member Wait() throws, the seam cancels the peer and the lease release
+     itself fails on a poisoned communicator, so the worker stops. Rank 0
+     reports a collective/poison error and exits 1, immediately after its first
+     prefill collective. It must never report a token mismatch or a PASS, and
+     there is deliberately no flag that makes this mode look like a success.
 
 Peer parity: the handshake compares world_size, max_context,
 prefill_chunk_tokens, max_draft_tokens, use_mtp, allow_cache_reuse and the
@@ -225,11 +337,18 @@ token EXACTLY, so both roles need the same --model, --context,
 --tp-bootstrap-port, --tp-control-port, --tp-device, --tp-gid-index and
 --tp-control-token. rank1 supplies prefill_chunk_tokens 512 from its prefill
 policy and 0 draft tokens with MTP absent, and runs one runner with
-max_pending_requests = 2 because gufo serve forces --max-pending 1 for TP=2.
+max_pending_requests = --worker-max-pending (default 2) because gufo serve
+forces --max-pending 1 for TP=2. That serving guard is deliberately NOT
+reproduced here: the probe bypasses the serving front door, so
+--worker-max-pending 1 reaches the scheduler and provokes the refusal instead
+of being rejected.
 
 Limits and hazards:
   * Wrap BOTH roles in an external timeout. The RDMA collective timeout is
     30 s, but the control response read waits up to 24 h.
+  * Every [c2-probe] line is stamped t=<ms>ms from process start, so a 30 s
+    collective timeout, a 30 s model load and a 30 s bootstrap poll are
+    distinguishable. Read the gaps, not the line count.
   * The listener is NOT retryable: rank 0's bootstrap Listen polls once for
     30 s and then fails, while rank 1's Connect retries until its own 30 s
     deadline. Start rank 0 FIRST and start rank 1 within that window, or the
@@ -246,18 +365,23 @@ Limits and hazards:
     for 30 s on both sides, then gives up. rank 0 sends the cohort as soon as
     its OWN model is loaded, so rank 1 must be loaded before rank 0's first
     prefill collective, which also times out after 30 s. rank 1 logs
-    "[c2-probe rank1] ready: ..." at that point.
+    "[c2-probe rank1] t=<ms>ms ready: ..." at that point.
   * This probe runs the dormant serial C2 plan. It proves the control plane,
     cohort admission, ordered member execution and cross-rank token agreement.
     It proves nothing about batched or faster C2 execution.
+  * The two fault-injection modes above are the only supported ways to make a
+    run fail. Neither relaxes a production guard, and neither can report a
+    PASS: --expect-c2-error only removes rank 0's collectives, and a response
+    without an error in that mode is itself an envelope mismatch (exit 4).
 
 Exit reasons:
   0 pass   1 transport/model/execution failure   2 arguments
   3 reserved (the unimplemented rank-1 role was retired)
   4 envelope mismatch   5 digest mismatch   6 member order mismatch
-  7 worker C2 error response
+  7 worker C2 error response (the --worker-max-pending 1 verdict)
   8/9 member 0/1 exceeded its token budget
   10/11 member 0/1 tokens disagree with the local greedy output
+  the --tp-scope-override verdict is 1 on rank 0 and 1 on rank 1
   rank1 exits 0 when rank 0 closes the channel after the cohort and 1 on any
   worker failure; the C2 verdict is rank 0's exit code)");
 }
@@ -396,10 +520,13 @@ std::size_t FirstDifference(std::span<const std::int32_t> expected,
 ///
 /// The body mirrors one worker member: `Sync` (one prefill forward), then the
 /// `SelectNext`/`Advance` alternation with the length-limit short circuit.
-bool RunMember(const std::shared_ptr<q::Model>& model,
+/// The prefill boundary is logged separately from the member completion so a
+/// stall can be attributed to the prefill collective rather than to the decode
+/// alternation or to model-load skew.
+bool RunMember(const char* role, std::size_t index,
+               const std::shared_ptr<q::Model>& model,
                std::vector<std::int32_t> prompt, std::uint32_t budget,
-               std::uint32_t context, MemberTrace* trace,
-               std::string* error) {
+               std::uint32_t context, MemberTrace* trace, std::string* error) {
   auto session = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
                                       context, error);
   if (!session) {
@@ -415,6 +542,11 @@ bool RunMember(const std::shared_ptr<q::Model>& model,
     return false;
   }
   trace->prefill_forwards = prefill_chunks;
+  Say(role, "member " + std::to_string(index) +
+                " prefill complete: " + std::to_string(prompt.size()) +
+                "t in " + std::to_string(prefill_chunks) + " forward(s), " +
+                std::to_string(prefill_chunks * model->config().num_layers) +
+                " collectives");
 
   const gufo::sampling::SamplingConfig sampling{
       .temperature = kGreedyTemperature,
@@ -460,7 +592,8 @@ int RunRank1Worker(const std::string& model_path, std::uint32_t context,
                    std::uint32_t device, std::uint32_t gid,
                    const std::string& bootstrap_host,
                    std::uint16_t bootstrap_port, std::uint16_t control_port,
-                   const std::string& control_token) {
+                   const std::string& control_token,
+                   std::uint32_t worker_max_pending) {
   std::string error;
 
   // The bootstrap connect blocks for up to 30 s, so announce the target first:
@@ -509,7 +642,11 @@ int RunRank1Worker(const std::string& model_path, std::uint32_t context,
   const server::TextSchedulerPolicy scheduler_policy{
       // Cohort admission needs this; every other field keeps the production
       // default, so the scheduler behaves exactly as `gufo serve` does.
-      .max_pending_requests = kWorkerMaxPendingRequests,
+      // `--worker-max-pending` moves this ceiling and nothing else: 2 admits
+      // the cohort, 1 provokes the `SubmitCohort` refusal documented in the
+      // file header. The runner pool capacity comes from `kWorkerSessionCount`,
+      // not from this field, so the collective trace is unchanged.
+      .max_pending_requests = worker_max_pending,
       // Rank 0 sends one member per client id, so each member is admitted on
       // its own and the per-client ceiling never blocks the cohort.
       .max_pending_requests_per_client = kWorkerMaxPendingRequestsPerClient,
@@ -533,6 +670,13 @@ int RunRank1Worker(const std::string& model_path, std::uint32_t context,
       .control = control,
       .auth_token = control_token,
   };
+  // `gufo serve` rejects `max_pending == 1` for TP=2 as part of its "TP2
+  // currently requires C1" guard (serve.cpp:1210-1219). That guard is
+  // deliberately NOT reproduced here: the probe bypasses the serving front door
+  // and hosts `InferenceBackend` in-process, so `--worker-max-pending 1`
+  // reaches the scheduler and provokes the real admission refusal. Forcing that
+  // refusal is the entire point of the mode, and nothing here relaxes a
+  // production guard or changes any file outside this test binary.
   server::InferenceBackend backend;
   if (!backend.load(model_path, &error,
                     // Handshake `max_context`; must equal rank 0's --context.
@@ -546,8 +690,20 @@ int RunRank1Worker(const std::string& model_path, std::uint32_t context,
   Say("rank1",
       "ready: model loaded, TP control handshaken, runner pool capacity " +
           std::to_string(kWorkerSessionCount) + ", max_pending_requests " +
-          std::to_string(kWorkerMaxPendingRequests) +
+          std::to_string(worker_max_pending) +
           ", no MTP; waiting for the C2 command");
+  if (worker_max_pending < 2) {
+    // `queued_count + 2 <= max_pending_requests` cannot hold, so the next
+    // cohort is refused at admission. Announce the injected fault so the log
+    // is self-describing and no reader can mistake the refusal for a contract
+    // regression.
+    Say("rank1",
+        "FAULT INJECTED: --worker-max-pending " +
+            std::to_string(worker_max_pending) +
+            " cannot admit a two-member cohort; the next kCohort2Ar command "
+            "must be refused at admission with a C2 error response and no "
+            "collective");
+  }
 
   // 4. The worker loop blocks until rank 0 closes the channel or the worker
   //    fails; the C2 contract itself is only judged by rank 0.
@@ -581,6 +737,14 @@ int main(int argc, char** argv) {
   std::uint32_t context = 4096;
   std::uint32_t device = 0;
   std::uint32_t gid = 0;
+  /// Rank-one admission ceiling; see `--worker-max-pending`.
+  std::uint32_t worker_max_pending = kWorkerMaxPendingRequests;
+  /// Rank-zero fault injection: bind a collective scope that is not the command
+  /// sequence. Unset in every non-fault run.
+  std::optional<std::uint64_t> scope_override;
+  /// Rank-zero fault injection: the worker will refuse the cohort at admission,
+  /// so issue no lockstep collective and wait only for its response.
+  bool expect_c2_error = false;
   std::uint16_t bootstrap_port = 18515;
   std::uint16_t control_port = 18516;
   std::string bootstrap_host;
@@ -655,6 +819,20 @@ int main(int argc, char** argv) {
         Warn("--tp-gid-index requires an unsigned integer");
         return kInvalidArguments;
       }
+    } else if (arg == "--worker-max-pending") {
+      if (!ParseUint(next(), &worker_max_pending)) {
+        Warn("--worker-max-pending requires an unsigned integer");
+        return kInvalidArguments;
+      }
+    } else if (arg == "--tp-scope-override") {
+      std::uint64_t parsed = 0;
+      if (!ParseUint64(next(), &parsed)) {
+        Warn("--tp-scope-override requires an unsigned integer");
+        return kInvalidArguments;
+      }
+      scope_override = parsed;
+    } else if (arg == "--expect-c2-error") {
+      expect_c2_error = true;
     } else if (arg == "--context") {
       if (!ParseUint(next(), &context)) {
         Warn("--context requires an unsigned integer");
@@ -696,6 +874,16 @@ int main(int argc, char** argv) {
     Warn("--cohort-id and --sequence must both be nonzero");
     return kInvalidArguments;
   }
+  // Rank-one policy, validated on BOTH roles so a typo cannot be discovered
+  // only after a 30 s RDMA rendezvous. Zero would additionally be rejected by
+  // the scheduler's own `max_pending_requests == 0` limit, and 1 is the
+  // deliberate admission-refusal fault value, so only zero is refused here.
+  if (worker_max_pending == 0) {
+    Warn(
+        "--worker-max-pending must be at least 1; 1 deliberately refuses a "
+        "two-member cohort at admission and 2 is the admitting default");
+    return kInvalidArguments;
+  }
   if (member_id[0] < kMinMemberId || member_id[1] < kMinMemberId ||
       member_id[0] == member_id[1]) {
     Warn("C2 member ids must be nonzero and distinct");
@@ -716,13 +904,32 @@ int main(int argc, char** argv) {
     return kInvalidArguments;
   }
   // Rank 0 is the only role that builds a cohort, so only rank 0 rejects an
-  // empty prompt.
+  // empty prompt and only rank 0 can inject the scope override.
   if (role == "rank0") {
     for (std::size_t index = 0; index < kMemberCount; ++index) {
       if (prompt[index].empty()) {
         Warn("member " + std::to_string(index) + " has an empty prompt");
         return kInvalidArguments;
       }
+    }
+    // The override must be a real disagreement, never a silent no-op: an
+    // override equal to the command sequence would bind the same scope as the
+    // worker and the run would report a PASS while injecting nothing, which is
+    // exactly the false verdict this fault mode must not be able to produce.
+    // Zero is refused for the same reason: it is the degenerate scope value
+    // that stands for "no scope", and `BeginOperation` models "unbound" as a
+    // null optional rather than as scope 0.
+    if (scope_override.has_value() && *scope_override == 0) {
+      Warn(
+          "--tp-scope-override must be nonzero; the bound scope and the "
+          "command sequence must be two distinct nonzero values");
+      return kInvalidArguments;
+    }
+    if (scope_override.has_value() && *scope_override == sequence) {
+      Warn("--tp-scope-override must differ from --sequence (" +
+           std::to_string(sequence) +
+           "); an equal override injects no fault and would report a PASS");
+      return kInvalidArguments;
     }
   }
 
@@ -738,7 +945,8 @@ int main(int argc, char** argv) {
       return kInvalidArguments;
     }
     return RunRank1Worker(model_path, context, device, gid, bootstrap_host,
-                          bootstrap_port, control_port, control_token);
+                          bootstrap_port, control_port, control_token,
+                          worker_max_pending);
   }
 
   std::string error;
@@ -883,7 +1091,11 @@ int main(int argc, char** argv) {
   // 5. `BeginOperation` is local, so it needs no ordering against the worker's
   //    own bind. The scope stays bound across both members: the C2 members
   //    share the command sequence scope, so one lease spans the whole cohort.
-  OperationScope operation(communicator, command.sequence);
+  //    `--tp-scope-override` binds a DIFFERENT scope while the command keeps
+  //    the normal sequence, so rank 1's worker binds `command.sequence` and the
+  //    first `AllReduceSum` header exchange must fail identity validation.
+  const std::uint64_t bound_scope = scope_override.value_or(command.sequence);
+  OperationScope operation(communicator, bound_scope);
   if (!operation.Begin(&error)) {
     Warn("collective scope bind failed: " + error);
     return kTransportFailure;
@@ -892,16 +1104,46 @@ int main(int argc, char** argv) {
     Warn("C2 command send failed: " + error);
     return kTransportFailure;
   }
-  Say("rank0", "C2 command sent; scope " + std::to_string(command.sequence) +
+  Say("rank0", "C2 command sent; scope " + std::to_string(bound_scope) +
                    " bound for the whole cohort");
+  if (scope_override.has_value()) {
+    Say("rank0",
+        "FAULT INJECTED: rank 0 bound collective scope " +
+            std::to_string(bound_scope) +
+            " while the command carries sequence " +
+            std::to_string(command.sequence) +
+            ", which is the scope rank 1's worker binds; the first "
+            "AllReduceSum header exchange must fail with a verbs identity or "
+            "size mismatch and poison both communicators");
+  }
+  if (expect_c2_error) {
+    Say("rank0",
+        "FAULT INJECTED: --expect-c2-error, so the lockstep members are NOT "
+        "executed and no collective is issued by rank 0; only the worker's "
+        "response is awaited, and a response without an error is an envelope "
+        "mismatch (exit 4)");
+  }
 
   // 6. Lockstep: issue exactly the forwards the worker issues, in order.
+  //    `--expect-c2-error` deliberately skips this: the worker refuses the
+  //    cohort at admission and never issues a collective, so a lockstep peer
+  //    would block on the first prefill exchange and wait out the 30 s
+  //    collective timeout instead of reading the C2 error response.
   MemberTrace trace[kMemberCount];
-  for (std::size_t index = 0; index < kMemberCount; ++index) {
-    if (!RunMember(model, member_prompt[index], budget, context, &trace[index],
-                   &error)) {
+  for (std::size_t index = 0; index < kMemberCount && !expect_c2_error;
+       ++index) {
+    if (!RunMember("rank0", index, model, member_prompt[index], budget, context,
+                   &trace[index], &error)) {
       Warn("member " + std::to_string(index) + " local execution failed: " +
            error);
+      if (scope_override.has_value()) {
+        Warn("collective fault detected as designed: rank 0 bound scope " +
+             std::to_string(bound_scope) +
+             " and rank 1 bound the command sequence " +
+             std::to_string(command.sequence) +
+             ", so the first AllReduceSum header exchange poisoned both "
+             "communicators; this run must fail closed, never pass");
+      }
       return kTransportFailure;
     }
     const std::size_t forwards =
@@ -934,6 +1176,10 @@ int main(int argc, char** argv) {
     Warn("C2 response receive failed: " + error);
     return kTransportFailure;
   }
+  Say("rank0", "C2 response received: members=" +
+                   std::to_string(response.members.size()) + " tokens=[" +
+                   std::to_string(response.tokens.size()) + "] error=" +
+                   (response.error.empty() ? "<empty>" : response.error));
 
   // 8. Verify the response envelope. `ReceiveResponse` already re-validated
   //    the frame, but nothing checks that it answers THIS command.
@@ -979,14 +1225,30 @@ int main(int argc, char** argv) {
       return kMemberOrderMismatch;
     }
   }
-  // A C2 error response is a cohort refusal, not a token disagreement.
+  // A C2 error response is a cohort refusal, not a token disagreement. The
+  // stamped banner carries the elapsed time, so an admission refusal (no
+  // collective, milliseconds) is distinguishable from a refusal that arrived
+  // only after a stalled collective.
   if (!response.error.empty()) {
+    const std::string stamp = ElapsedMs();
     std::fprintf(stderr,
-                 "[c2-probe] C2 ERROR RESPONSE for cohort %llu: %s\n",
+                 "[c2-probe t=%sms] C2 ERROR RESPONSE for cohort %llu: %s\n",
+                 stamp.c_str(),
                  static_cast<unsigned long long>(response.cohort_id),
                  response.error.c_str());
     std::fflush(stderr);
     return kCohortErrorResponse;
+  }
+  // `--expect-c2-error` asserts that the worker refused the cohort. Rank 0's
+  // lockstep run was deliberately skipped, so there is no local trace to
+  // compare and an error-free response is a broken premise, not a pass. The
+  // mode can therefore never reach the PASS line below.
+  if (expect_c2_error) {
+    Warn(
+        "--expect-c2-error was set but the worker answered without an error; "
+        "rank 0 issued no collective, so this response cannot be verified and "
+        "is an envelope mismatch, not a pass");
+    return kEnvelopeMismatch;
   }
 
   // 9. Per-member budget and cross-rank token agreement. The reduction is a
