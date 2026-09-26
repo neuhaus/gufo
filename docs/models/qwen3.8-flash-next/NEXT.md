@@ -26,9 +26,11 @@ documentation.
 
 ## What works
 
-Two-host serving (`fuzzy` rank 0, `misty` rank 1, FDR InfiniBand) of one
-request at a time, Q4 and full Q8, AR and MTP, with sampling, streaming, stop
-sequences, client cancellation and history reuse as on one host. Both hosts
+Two-host serving (`fuzzy` rank 0, `misty` rank 1, FDR InfiniBand), Q4 and full
+Q8, AR and MTP, with sampling, streaming, stop sequences, tool calls, client
+cancellation and history reuse as on one host. One request executes at a time;
+parallel requests queue behind it up to `--max-pending`. One-host serving on
+this branch matches upstream `main` in output and speed. Both hosts
 stay bit-identical; lost peers, scope mismatches and rank disagreement fail the
 request with HTTP 500. Full Q8 needs both hosts; it does not fit one.
 
@@ -76,7 +78,8 @@ What would help, in order of payoff for effort:
 
 ## What does not work yet
 
-- **Concurrency.** One request at a time; see [C2](#next-c2-on-the-executor).
+- **Concurrency.** One request executes at a time; see
+  [C2](#next-c2-on-the-executor).
 - **Q8 quality.** The ranks agree with each other, but full Q8 has not been
   compared with a reference. It needs a CPU or reference-logit comparison,
   since Q8 does not fit one host.
@@ -107,8 +110,8 @@ Not started. The executor retired the dormant C2 worker path, which needed rank
 4. **Per-request failure.** A rank-1 failure now clears rank 0's whole cache,
    which is impossible while other requests hold leases. Invalidate only the
    failed request's state and snapshots instead.
-5. **Limits.** Raise the response broker's capacity and lift the one-session,
-   one-pending, one-connection refusals together.
+5. **Limits.** Raise the response broker's capacity and lift the one-session
+   refusal.
 
 Expected value: the probe measured Q4 TP2 below one host from width 4 (63.2
 against 76.3 tok/s), so C2 mainly serves full Q8, which does not fit one host,
@@ -134,7 +137,9 @@ behind the `Communicator` interface.
 
 ## Verification debt
 
-- The `slow` and `external-model` suites have never run on these branches.
+- The other models' `external-model` tests need weights `fuzzy` and `misty`
+  do not have (Qwen3.8 27B, DeepSeek V4 Flash), so the shared serving changes
+  are covered for them only by the CPU scheduler, runner and cache tests.
 - Four Python tests fail without `numpy`, which the ROCm 7.2.3 dev image lacks;
   they also fail on an unmodified checkout.
 - `LocalExpert` has no production caller. Its test expectation was corrected to

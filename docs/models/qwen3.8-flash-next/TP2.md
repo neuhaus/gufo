@@ -120,8 +120,7 @@ build/gpu-tp2/gufo serve llm \
   --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
   --tp-world-size 2 --tp-rank 0 \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
-  --tp-control-token SHARED_TOKEN \
-  --max-pending 1 --max-pending-per-client 1 --max-connections 1
+  --tp-control-token SHARED_TOKEN
 
 # rank 1: worker only, no public HTTP port
 build/gpu-tp2/gufo serve llm \
@@ -130,8 +129,7 @@ build/gpu-tp2/gufo serve llm \
   --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
   --tp-world-size 2 --tp-rank 1 --tp-bootstrap-host RANK0_ADDRESS \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
-  --tp-control-token SHARED_TOKEN \
-  --max-pending 1 --max-pending-per-client 1 --max-connections 1
+  --tp-control-token SHARED_TOKEN
 ```
 
 For full Q8 use the first `Q8_0` shard; the Q8 PLE loader must be in the build.
@@ -140,12 +138,14 @@ TP2 reuses conversation history as one host does; see
 
 ### Request limits
 
-Sampling, streaming, stop sequences and client cancellation work as on one
-host. The server still refuses:
+Sampling, streaming, stop sequences, tool calls and client cancellation work as
+on one host. One request executes at a time; parallel requests wait for it, up
+to `--max-pending`, and the rest get HTTP 429. The server still refuses:
 
 | Refused | Why |
 | --- | --- |
-| More than one session, pending request or connection; request timeouts | Rank 1 executes one request's calls at a time. |
+| More than one session | Rank 1 executes one request's calls at a time. |
+| Request timeouts | Not qualified under TP2. |
 | Disk cache | Snapshots are rank-local and never serialized. |
 | Vision input | Not implemented for two ranks. |
 
