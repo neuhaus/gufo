@@ -70,10 +70,9 @@ microbenchmarks show why:
   unless communication overlaps compute.
 
 Proposed order for TP2 speed:
-1. Split the shared expert across ranks: each computes half its intermediate
-   dimension and the partial sums ride the existing all-reduce, so it adds no
-   collective. Both ranks already run the shared expert (the Q8 fix below), so
-   the split halves that work and recovers the fix's ~3%.
+1. Done: the shared expert is split across ranks; each computes half its
+   intermediate dimension and the partial sums ride the existing all-reduce.
+   It recovered the Q8 fix's ~3% (see `EXPERIMENTS.md`).
 2. Split the replicated dense projections (true tensor parallelism for
    attention, GDN and HC projections). This is the only change that can make
    TP2 decode clearly faster than one host, and it adds collectives, so the
@@ -288,8 +287,8 @@ Q8 ranks now agree bit for bit on the retained long prompt, and Q8 TP2 serving
 answered a 2,117-token prompt at 23.0 tok/s decode. Still open before Q8 is a
 supported target: a quality check against a reference (Q8 does not fit one
 host, so it needs a CPU or reference-logit comparison), the `slow` and
-`external-model` suites, and the shared-expert split to recover the ~3% the fix
-costs. `Q8.md` in #1 should record the closure.
+`external-model` suites. The shared-expert split recovered the ~3% the fix cost.
+`Q8.md` in #1 should record the closure.
 
 ## 4. Verification debt
 
