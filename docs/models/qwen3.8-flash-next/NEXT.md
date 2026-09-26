@@ -42,15 +42,35 @@ Prefill from 0 to 32K runs at 1,187 tok/s on TP2 against 1,422–1,457 on one
 host. Single-host batched figures are HTTP sums at 2K prompts, so that row is a
 reference rather than a matched control.
 
-Why TP2 is not faster than one host on Q4:
+Why TP2 is not faster than one host on Q4 (profile of 2026-09-26, both ranks):
 
-- Only routed experts are split, and they are about 13% of decode kernel time;
-  dense Q8 GEMVs are 57% and stay replicated.
-- TP2 adds about 3 ms per token: 48 exchanges plus a stream synchronization
-  before each staging copy.
+- Only routed experts are split, about 13% of decode kernel time. Q8 GEMVs are
+  56.5% and replicated: GDN input projections 22.7%, projections back to the
+  hidden size 12.3%, LM head 9.6%, attention QKV 6.3%; hyper-connection
+  projections add about 17%.
+- TP2 adds about 3.9 ms per token of exchange gaps (48 exchanges): a median
+  exchange of about 45 µs, plus waiting for the other rank, whose routed
+  experts take on average 38 µs longer or shorter per layer (about 1.8 ms per
+  token), because whole experts are assigned to one rank.
 - Prefill is capped by the NICs' PCIe Gen3 x4 links (3.27 GB/s one way).
-- From width 4 up, about 10 ms of each step is waiting for the rank whose
-  experts received more rows, although the payload is only 40–80 KiB.
+- At width 8 the exchange gaps are about 8.5 ms per step (177 µs mean per
+  layer). The exchange itself grows to about 115 µs at 80 KiB (95 µs isolated in
+  the microbenchmark) through its serialized steps: stream wait, staging copy,
+  TCP header, RDMA read, GPU add. Expert imbalance stays about 35 µs per layer.
+
+What would help, in order of payoff for effort:
+
+1. Split the LM head by vocabulary: about 1.9 ms per token, and only a small
+   candidate exchange, since rank 0 already chooses the token.
+2. Split every routed expert's intermediate dimension across the ranks, as the
+   shared expert already is, instead of assigning whole experts: removes the
+   imbalance at every width without adding exchanges.
+3. Cheapen the exchange: have the MoE epilogue write the partial straight into
+   the RDMA-registered window (Strix Halo's memory is unified), and replace
+   the TCP header with an InfiniBand send with immediate data.
+4. Split the GDN and attention projections by heads, with the output
+   projections split by input: roughly 6–7 ms per token less work for a second
+   exchange per layer, so it pays most after 3.
 
 ## What does not work yet
 
