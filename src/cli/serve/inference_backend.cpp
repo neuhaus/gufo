@@ -2673,6 +2673,24 @@ public:
           throw std::runtime_error("TP worker step token unavailable: " +
                                    step_error);
         }
+        // Consuming rank 0's token makes the emitted tokens agree by
+        // construction, which would hide a numerical divergence between the
+        // ranks. Under greedy decoding the logits are bit-identical on both
+        // ranks, so rank 1's own choice must equal rank 0's: a copy of the
+        // sampler makes that choice without touching the request's state. The
+        // first disagreement is kept and fails the request at its end, so both
+        // ranks still finish the collective schedule in step.
+        if (sampler.config().can_use_unmodified_argmax()) {
+          sampling::SamplerState own_sampler = sampler;
+          const auto own =
+              static_cast<std::int32_t>(own_sampler.Sample(logits));
+          if (own != token && step_divergence_.empty()) {
+            step_divergence_ = "rank 1 selected token " + std::to_string(own) +
+                               " where rank 0 sent " + std::to_string(token) +
+                               " at step " + std::to_string(step_index_);
+          }
+        }
+        ++step_index_;
       } else {
         token = static_cast<std::int32_t>(sampler.Sample(logits));
         if (step_publisher_ != nullptr) {
@@ -2705,6 +2723,15 @@ public:
     step_publisher_ = std::move(publisher);
     step_consumer_ = std::move(consumer);
     step_sequence_ = sequence;
+    step_index_ = 0;
+    step_divergence_.clear();
+  }
+
+  /// The first step at which rank 1's own greedy choice differed from the
+  /// token rank 0 sent, or empty. Read it before disarming, which clears it.
+  [[nodiscard]] std::string TakeStepDivergence() const {
+    const std::lock_guard<std::mutex> guard(step_mutex_);
+    return std::exchange(step_divergence_, {});
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -3017,46 +3044,42 @@ private:
   std::shared_ptr<server::TpStepConsumer> step_consumer_;
   std::uint64_t step_sequence_{0};
   mutable bool step_final_{false};
+  /// Consumer-side check: the index of the next consumed step, and the first
+  /// disagreement between rank 1's own greedy choice and rank 0's token.
+  mutable std::size_t step_index_{0};
+  mutable std::string step_divergence_;
 };
 #endif
 
 }  // namespace
 
-/// Compare rank 1's reported tokens against rank 0's own, and report the first
-/// divergence without failing the request.
+/// Fails the request unless rank 1 reported exactly rank 0's tokens.
 ///
-/// Under the rank-0 step plan the token originates on rank 0 and rank 1
-/// consumes it, so agreement is expected -- but it is no longer *required* for
-/// correctness, which is the whole point of the plan. A divergence is therefore
-/// telemetry rather than a gate: it is logged with its position and both ids so
-/// a regression is visible, but a request that decoded cleanly is served.
-///
-/// The check is deliberately kept, not deleted. It is the cheapest available
-/// signal that the exchange is still doing what it claims, and it is the thing
-/// that would catch a stale or mis-sequenced step. Returns the first differing
-/// index, or `std::nullopt` when the two agree.
-[[nodiscard]] std::optional<std::size_t> ReportTpTokenDivergence(
-    std::string_view role, std::span<const TextRunnerToken> rank0,
-    std::span<const std::int32_t> rank1) {
+/// Under the rank-0 step plan rank 1 emits the tokens rank 0 sent, so the two
+/// agree by construction whenever the plan carried every token. A difference
+/// therefore means either a token that bypassed the plan -- the MTP decode path
+/// still selects on each rank independently -- or a stale or mis-sequenced
+/// step. Either way the collectives combined partials computed from different
+/// sequences, so the output cannot be trusted and the request fails. The first
+/// differing index and both ids are logged before the failure.
+void RequireTpTokenAgreement(std::string_view role,
+                             std::span<const TextRunnerToken> rank0,
+                             std::span<const std::int32_t> rank1) {
   if (rank0.size() != rank1.size()) {
-    Logger::Warn("tp2",
-                 std::string(role) +
-                     " rank-0 step plan token COUNT divergence: rank 0 " +
-                     std::to_string(rank0.size()) + " tokens, rank 1 " +
-                     std::to_string(rank1.size()));
-    return std::min(rank0.size(), rank1.size());
+    Logger::Warn("tp2", std::string(role) + " token count mismatch: rank 0 " +
+                            std::to_string(rank0.size()) + " tokens, rank 1 " +
+                            std::to_string(rank1.size()));
+    throw std::runtime_error("TP worker token count mismatch");
   }
   for (std::size_t i = 0; i < rank0.size(); ++i) {
     if (static_cast<std::uint32_t>(rank1[i]) != rank0[i]) {
-      Logger::Warn("tp2", std::string(role) +
-                              " rank-0 step plan token divergence at index " +
+      Logger::Warn("tp2", std::string(role) + " token mismatch at index " +
                               std::to_string(i) + ": rank 0 " +
                               std::to_string(rank0[i]) + ", rank 1 " +
                               std::to_string(rank1[i]));
-      return i;
+      throw std::runtime_error("TP worker token mismatch");
     }
   }
-  return std::nullopt;
 }
 
 /// RAII arm of the rank-0 step plan for one request.
@@ -3185,8 +3208,7 @@ struct InferenceBackend::Impl {
           if (!response.error.empty()) {
             throw std::runtime_error("TP worker failed: " + response.error);
           }
-          (void)ReportTpTokenDivergence("start_chat", result.tokens,
-                                        response.tokens);
+          RequireTpTokenAgreement("start_chat", result.tokens, response.tokens);
           if (response.draft_tokens != result.draft_tokens ||
               response.draft_accepted_tokens != result.draft_accepted_tokens ||
               response.cached_prompt_tokens != result.cached_prompt_tokens) {
@@ -3407,8 +3429,7 @@ struct InferenceBackend::Impl {
         if (!response.error.empty()) {
           throw std::runtime_error("TP worker failed: " + response.error);
         }
-        (void)ReportTpTokenDivergence("generate", result.tokens,
-                                      response.tokens);
+        RequireTpTokenAgreement("generate", result.tokens, response.tokens);
         if (response.draft_tokens != result.draft_tokens ||
             response.draft_accepted_tokens != result.draft_accepted_tokens ||
             response.cached_prompt_tokens != result.cached_prompt_tokens ||
@@ -4173,6 +4194,13 @@ bool InferenceBackend::run_worker(std::string* error) {
               .cache_prefix_tokens = command.cache_prefix_tokens,
           });
       const auto result = request.Wait({});
+      if (state->flash_next_runner != nullptr) {
+        if (const auto divergence =
+                state->flash_next_runner->TakeStepDivergence();
+            !divergence.empty()) {
+          throw std::runtime_error("TP rank logits diverged: " + divergence);
+        }
+      }
       response.tokens.reserve(result.tokens.size());
       for (const auto token : result.tokens) {
         if (token > static_cast<tokenization::TokenId>(
