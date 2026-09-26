@@ -2,9 +2,25 @@
 
 Forward plan for the Qwen3.8-Flash-Next TP2 and Q8 work, as of 2026-09-26.
 
-Companion documents: [TP2.md](TP2.md) for the C>1 boundary, `Q8.md` (added by
-[#1](https://github.com/neuhaus/gufo/pull/1)) for the full-Q8 resume handoff,
-[EXPERIMENTS.md](EXPERIMENTS.md) for the evidence log.
+Companion documents: [TP2.md](TP2.md) for the C>1 boundary, [Q8.md](Q8.md) for
+the full-Q8 resume handoff, [EXPERIMENTS.md](EXPERIMENTS.md) for the evidence
+log, and [INTEGRATION.md](INTEGRATION.md) for the freshly verified TP2 + Q8
+baseline and the rank-0 step-plan implementation handoff.
+
+## Verified integration baseline
+
+`codex/tp2-q8-integration` merges TP2 `d71fc6c` and Q8 PLE `426ab78` at
+`0cf273a`. Both hosts built identical release binaries. Eight focused CTests
+passed on each host; Q4/Q8 HTTP AR and MTP, repeated output agreement,
+multi-chunk prefill, invalid-request refusal and real scope mismatch passed.
+Killing rank 1 during Q8 MTP also verified rank 0's C1 response-broker failure
+path: HTTP 500 in 0.354 seconds, then immediate refusal on the poisoned
+communicator. This closes that C1 evidence gap, not C2 or graceful cancellation.
+
+The integration branch is the baseline for the next coding step. The Q8 and
+TP2 PRs stay separate; neither PR branch was rewritten. The rank-0 step plan
+has not been implemented. Independent Q8 quality and the full
+`slow`/`external-model` suites remain open.
 
 ## Where things stand
 
@@ -73,8 +89,9 @@ Order:
 3. Rank-0 step plan, then sampled decoding, streaming, stop sequences and
    cancellation on TP2.
 4. Q8 quality against a reference, and the `slow`/`external-model` suites.
-5. Send TP2 C1 upstream together with the Q8 PLE loader (#1), which is not
-   useful upstream on its own because Q8 needs two hosts.
+5. Submit TP2 C1 and the Q8 PLE loader as two separate upstream PRs, with a
+   shared integration qualification. Q8 PLE is independently host-testable;
+   full-Q8 GPU serving on the available Strix Halo hosts needs both changes.
 6. C2 and higher concurrency later, once it serves concurrent requests; dormant
    code without a caller is hard to justify in review. Park #3 until then.
 
@@ -366,16 +383,16 @@ worker running more than one session must not run the serial contract.
   rather than continuing. Both fail closed. Detection is fast because the
   communicator retains the bootstrap socket as the permanent collective channel,
   so a dead peer yields a TCP reset rather than a 30 s collective-timeout stall.
-  Not covered: rank 0's response-broker `FailAll` path when the worker dies
-  mid-command, and any graceful-shutdown behaviour, since SIGKILL runs no
-  cleanup.
+  Not covered by that cohort probe: rank 0's response-broker `FailAll` path
+  when the worker dies mid-command. The integration run now covers C1 (below).
+  Graceful-shutdown behaviour remains open, since SIGKILL runs no cleanup.
 - **Member failure.** No natural hardware hook. Would need a fault-injection
   point in the scheduler, which is a production change made for testability
   and should be build-gated rather than always compiled in.
-- **Response-broker behaviour when the worker dies.** The peer-kill test killed
-  the driver, so the survivor was the worker. The reverse — worker dies, and
-  rank 0 must abandon its pending response rather than block in
-  `WaitForResponse` — is untested.
+- **Response-broker behaviour when the worker dies.** C1 is now verified by
+  the integration run: killing the Q8 MTP worker made rank 0 leave its pending
+  response wait and return HTTP 500 in 0.354 seconds. The historical C2 probe
+  did not exercise the rank-0 serving broker; that C2 case remains open.
 - **Invalid-cohort rejection on hardware.** Admission, scope and MTP refusals
   are verified. Rejection of sampled/streaming/cached/continued members is
   covered by hosted tests only; note that the control layer may reject some of
@@ -404,7 +421,8 @@ and 8 and reaches 76.2 tok/s aggregate at width 8.
 Still open before Q8 is a supported target: a quality check against a reference
 (Q8 does not fit one host, so it needs a CPU or reference-logit comparison),
 the `slow` and `external-model` suites, and the request restrictions listed
-under "Usability and upstream plan". `Q8.md` in #1 should record the closure.
+under "Usability and upstream plan". The integration branch's `Q8.md` records
+the cross-rank fix and fresh C1 qualification; #1 remains an independent PR.
 
 ## 4. Verification debt
 
