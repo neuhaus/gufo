@@ -246,9 +246,8 @@ public:
   /// for another. Normal completion never sets it, because both ranks stop on
   /// the shared token; it exists so a rank-0 failure unblocks rank 1 instead of
   /// leaving it waiting on a token that is never coming.
-  [[nodiscard]] virtual bool Publish(std::uint64_t sequence,
-                                     std::int32_t token, bool final,
-                                     std::string* error) = 0;
+  [[nodiscard]] virtual bool Publish(std::uint64_t sequence, std::int32_t token,
+                                     bool final, std::string* error) = 0;
 };
 
 class TpStepConsumer {

@@ -15,8 +15,6 @@
 // per second, because the decode loop needs one exchange per token. The
 // latency percentiles say where that ceiling comes from.
 
-#include "src/cli/serve/tp_control.hpp"
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -33,6 +31,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "src/cli/serve/tp_control.hpp"
 
 namespace {
 
@@ -60,10 +60,9 @@ struct Samples {
   std::vector<double> micros;
 
   void Add(std::chrono::steady_clock::time_point start) {
-    micros.push_back(
-        std::chrono::duration<double, std::micro>(
-            std::chrono::steady_clock::now() - start)
-            .count());
+    micros.push_back(std::chrono::duration<double, std::micro>(
+                         std::chrono::steady_clock::now() - start)
+                         .count());
   }
   /// Nearest-rank percentile, so a reported p99 is a measurement that occurred
   /// rather than an interpolation between two that did not.
@@ -90,13 +89,13 @@ struct Samples {
 };
 
 void Report(const char* label, const Samples& samples) {
-  std::printf("  %-22s n=%zu  mean=%8.1f  p50=%8.1f  p99=%8.1f  max=%8.1f  (us)\n",
-              label, samples.micros.size(), samples.Mean(), samples.Percentile(0.50),
-              samples.Percentile(0.99),
-              samples.micros.empty()
-                  ? 0.0
-                  : *std::max_element(samples.micros.begin(),
-                                      samples.micros.end()));
+  std::printf(
+      "  %-22s n=%zu  mean=%8.1f  p50=%8.1f  p99=%8.1f  max=%8.1f  (us)\n",
+      label, samples.micros.size(), samples.Mean(), samples.Percentile(0.50),
+      samples.Percentile(0.99),
+      samples.micros.empty()
+          ? 0.0
+          : *std::max_element(samples.micros.begin(), samples.micros.end()));
 }
 
 }  // namespace
@@ -104,7 +103,8 @@ void Report(const char* label, const Samples& samples) {
 int main(int argc, char** argv) {
   // Enough steps that the tail is measured rather than guessed, few enough
   // that this stays a test-length run.
-  const std::size_t steps = argc > 1 ? std::strtoul(argv[1], nullptr, 10) : 20000;
+  const std::size_t steps =
+      argc > 1 ? std::strtoul(argv[1], nullptr, 10) : 20000;
   if (steps == 0) {
     std::fprintf(stderr, "step count must be positive\n");
     return 2;
@@ -114,8 +114,9 @@ int main(int argc, char** argv) {
   std::string server_error;
   std::string client_error;
   std::shared_ptr<TpControlChannel> client;
-  std::thread connector(
-      [&] { client = TpControlChannel::Connect("127.0.0.1", port, &client_error); });
+  std::thread connector([&] {
+    client = TpControlChannel::Connect("127.0.0.1", port, &client_error);
+  });
   auto server = TpControlChannel::Listen(port, &server_error);
   connector.join();
   if (server == nullptr || client == nullptr) {
@@ -125,19 +126,21 @@ int main(int argc, char** argv) {
   }
 
   const TpControlConfig rank0{.rank = 0,
-                               .world_size = 2,
-                               .max_context = 4096,
-                               .max_draft_tokens = 7,
-                               .use_mtp = false,
-                               .allow_cache_reuse = false,
-                               .auth_token = "latency",
-                               .prefill_chunk_tokens = 512};
+                              .world_size = 2,
+                              .max_context = 4096,
+                              .max_draft_tokens = 7,
+                              .use_mtp = false,
+                              .allow_cache_reuse = false,
+                              .auth_token = "latency",
+                              .prefill_chunk_tokens = 512};
   TpControlConfig rank1 = rank0;
   rank1.rank = 1;
   bool server_ok = false;
   bool client_ok = false;
-  std::thread server_thread([&] { server_ok = server->Handshake(rank0, &server_error); });
-  std::thread client_thread([&] { client_ok = client->Handshake(rank1, &client_error); });
+  std::thread server_thread(
+      [&] { server_ok = server->Handshake(rank0, &server_error); });
+  std::thread client_thread(
+      [&] { client_ok = client->Handshake(rank1, &client_error); });
   server_thread.join();
   client_thread.join();
   if (!server_ok || !client_ok) {
@@ -153,8 +156,9 @@ int main(int argc, char** argv) {
     TpControlStepConsumer consumer(client);
     for (std::size_t i = 0; i < 256; ++i) {
       std::string error;
-      std::thread publish(
-          [&] { (void)publisher.Publish(1, static_cast<std::int32_t>(i), false, &error); });
+      std::thread publish([&] {
+        (void)publisher.Publish(1, static_cast<std::int32_t>(i), false, &error);
+      });
       std::int32_t token = 0;
       bool final = false;
       (void)consumer.Consume(1, &token, &final, 30s, &error);
@@ -188,8 +192,8 @@ int main(int argc, char** argv) {
       std::int32_t token = 0;
       bool final = false;
       std::string error;
-      if (!consumer.Consume(1, &token, &final, 30s, &error) || token !=
-          static_cast<std::int32_t>(i)) {
+      if (!consumer.Consume(1, &token, &final, 30s, &error) ||
+          token != static_cast<std::int32_t>(i)) {
         failure = "consume: " + error;
         failed.store(true);
         return;
@@ -199,8 +203,8 @@ int main(int argc, char** argv) {
   });
   publish_thread.join();
   consume_thread.join();
-  const auto wall =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start);
+  const auto wall = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - wall_start);
 
   if (failed.load()) {
     std::fprintf(stderr, "FAIL: %s\n", failure.c_str());

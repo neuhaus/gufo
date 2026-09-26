@@ -32,7 +32,7 @@ namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
 constexpr std::uint16_t kVersion = 6;          // ordered C1/C2 cohort envelopes
-                                        // plus the kStep per-token message
+                                       // plus the kStep per-token message
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
@@ -90,8 +90,8 @@ void ClearReceiveTimeout(int fd) {
 /// read, as opposed to a real I/O error. Only the latter can leave the stream
 /// mid-frame, so only the latter may poison the channel.
 [[nodiscard]] bool IsTimeoutOnly(const std::string* error) {
-  return error != nullptr && error->find("Resource temporarily unavailable") !=
-                             std::string::npos;
+  return error != nullptr &&
+         error->find("Resource temporarily unavailable") != std::string::npos;
 }
 
 void AppendU32(std::vector<std::uint8_t>* out, std::uint32_t value) {
@@ -874,7 +874,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
   const std::size_t expected_members =
       parsed.kind == TpControlCommandKind::kSingle      ? 1
       : parsed.kind == TpControlCommandKind::kCohort2Ar ? kMaxCohortMembers
-                                                         : 0;
+                                                        : 0;
   if (member_count != expected_members) {
     command_prompt_.clear();
     command_prompt_.shrink_to_fit();
@@ -1172,9 +1172,8 @@ bool TpControlChannel::ReceiveResponse(TpControlResponse* response,
   return true;
 }
 
-bool TpControlStepPublisher::Publish(std::uint64_t sequence,
-                                    std::int32_t token, bool final,
-                                    std::string* error) {
+bool TpControlStepPublisher::Publish(std::uint64_t sequence, std::int32_t token,
+                                     bool final, std::string* error) {
   const TpControlCommand command{.sequence = sequence,
                                  .kind = TpControlCommandKind::kStep,
                                  .step_token = token,
@@ -1191,9 +1190,9 @@ bool TpControlStepPublisher::Publish(std::uint64_t sequence,
 }
 
 bool TpControlStepConsumer::Consume(std::uint64_t sequence, std::int32_t* token,
-                                   bool* final,
-                                   std::chrono::milliseconds timeout,
-                                   std::string* error) {
+                                    bool* final,
+                                    std::chrono::milliseconds timeout,
+                                    std::string* error) {
   if (token == nullptr || final == nullptr) {
     SetError(error, "TP step consumer requires token and final outputs");
     return false;

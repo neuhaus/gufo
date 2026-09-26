@@ -20,13 +20,13 @@ namespace {
 using gufo::server::ComputeTpCachePlanDigest;
 using gufo::server::ComputeTpExecutionPlanDigest;
 using gufo::server::TpControlChannel;
-using gufo::server::TpControlStepConsumer;
-using gufo::server::TpControlStepPublisher;
 using gufo::server::TpControlCommand;
 using gufo::server::TpControlCommandKind;
 using gufo::server::TpControlConfig;
 using gufo::server::TpControlResponse;
 using gufo::server::TpControlResponseKind;
+using gufo::server::TpControlStepConsumer;
+using gufo::server::TpControlStepPublisher;
 using gufo::server::TpPlanDigest;
 using gufo::server::TpResponseBroker;
 using gufo::server::TpResponseExpectation;
@@ -793,28 +793,28 @@ int main() {
             "TP command wait is unbounded again after a bounded receive: " +
                 late_error);
     late_sender.join();
-    Require(late.sequence == command.sequence,
-            "TP unbounded command wait returns the command sent after the step");
+    Require(
+        late.sequence == command.sequence,
+        "TP unbounded command wait returns the command sent after the step");
   }
 
   // A bounded receive that expires must fail closed, and must NOT poison the
   // channel: a timeout with nothing read leaves the byte stream intact, so the
-  // next receive is still well defined. Poisoning here is what made the worker's
-  // idle command wait fail with EAGAIN on hardware -- a leaked per-token bound
-  // that ended a path required to wait indefinitely. Nor may the bound leak:
-  // the socket must be back to an unbounded wait.
+  // next receive is still well defined. Poisoning here is what made the
+  // worker's idle command wait fail with EAGAIN on hardware -- a leaked
+  // per-token bound that ended a path required to wait indefinitely. Nor may
+  // the bound leak: the socket must be back to an unbounded wait.
   {
     TpControlCommand expired;
     std::string expired_error;
-    Require(!client->ReceiveCommandWithin(&expired,
-                                          std::chrono::milliseconds(150),
-                                          &expired_error) &&
+    Require(!client->ReceiveCommandWithin(
+                &expired, std::chrono::milliseconds(150), &expired_error) &&
                 !expired_error.empty(),
             "TP bounded receive must fail when the bound expires");
 
     // A later command must still arrive on the same socket. If the timeout had
-    // poisoned the channel this fails; if the bound had leaked it would time out
-    // here instead, since the sender is slower than a 150 ms bound.
+    // poisoned the channel this fails; if the bound had leaked it would time
+    // out here instead, since the sender is slower than a 150 ms bound.
     std::thread late_sender([&] {
       std::this_thread::sleep_for(std::chrono::milliseconds(300));
       (void)server->SendCommand(command, &server_error);
@@ -838,8 +838,8 @@ int main() {
     std::string bridge_client_error;
     std::shared_ptr<TpControlChannel> bridge_client;
     std::thread bridge_connector([&] {
-      bridge_client =
-          TpControlChannel::Connect("127.0.0.1", bridge_port, &bridge_client_error);
+      bridge_client = TpControlChannel::Connect("127.0.0.1", bridge_port,
+                                                &bridge_client_error);
     });
     std::string bridge_server_error;
     auto bridge_server =
@@ -850,10 +850,12 @@ int main() {
     bool bridge_server_handshake = false;
     bool bridge_client_handshake = false;
     std::thread bridge_server_thread([&] {
-      bridge_server_handshake = bridge_server->Handshake(rank0, &bridge_server_error);
+      bridge_server_handshake =
+          bridge_server->Handshake(rank0, &bridge_server_error);
     });
     std::thread bridge_client_thread([&] {
-      bridge_client_handshake = bridge_client->Handshake(rank1, &bridge_client_error);
+      bridge_client_handshake =
+          bridge_client->Handshake(rank1, &bridge_client_error);
     });
     bridge_server_thread.join();
     bridge_client_thread.join();
@@ -867,8 +869,9 @@ int main() {
     // A token published by rank 0 is the token rank 1 decodes, in order.
     for (const std::int32_t token : {11, 22, 33}) {
       std::string publish_error;
-      std::thread publish_thread(
-          [&] { (void)publisher.Publish(exchange, token, false, &publish_error); });
+      std::thread publish_thread([&] {
+        (void)publisher.Publish(exchange, token, false, &publish_error);
+      });
       std::int32_t consumed = 0;
       bool final = true;
       std::string consume_error;
@@ -902,9 +905,8 @@ int main() {
     // otherwise.
     {
       std::string publish_error;
-      std::thread publish_thread([&] {
-        (void)publisher.Publish(exchange, 0, true, &publish_error);
-      });
+      std::thread publish_thread(
+          [&] { (void)publisher.Publish(exchange, 0, true, &publish_error); });
       std::int32_t consumed = 0;
       bool final = false;
       std::string consume_error;
@@ -916,7 +918,8 @@ int main() {
     }
   }
 
-  std::puts("PASS: TP control handshake, C1/C2 envelopes, step messages, "
-            "bounded receive, step bridge, and broker routing");
+  std::puts(
+      "PASS: TP control handshake, C1/C2 envelopes, step messages, "
+      "bounded receive, step bridge, and broker routing");
   return 0;
 }

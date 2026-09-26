@@ -2679,7 +2679,8 @@ public:
           std::string step_error;
           if (!step_publisher_->Publish(step_sequence_, token, false,
                                         &step_error)) {
-            throw std::runtime_error("TP step token send failed: " + step_error);
+            throw std::runtime_error("TP step token send failed: " +
+                                     step_error);
           }
         }
       }
@@ -3027,8 +3028,8 @@ private:
 /// Under the rank-0 step plan the token originates on rank 0 and rank 1
 /// consumes it, so agreement is expected -- but it is no longer *required* for
 /// correctness, which is the whole point of the plan. A divergence is therefore
-/// telemetry rather than a gate: it is logged with its position and both ids so a
-/// regression is visible, but a request that decoded cleanly is served.
+/// telemetry rather than a gate: it is logged with its position and both ids so
+/// a regression is visible, but a request that decoded cleanly is served.
 ///
 /// The check is deliberately kept, not deleted. It is the cheapest available
 /// signal that the exchange is still doing what it claims, and it is the thing
@@ -3038,10 +3039,11 @@ private:
     std::string_view role, std::span<const TextRunnerToken> rank0,
     std::span<const std::int32_t> rank1) {
   if (rank0.size() != rank1.size()) {
-    Logger::Warn("tp2", std::string(role) +
-                            " rank-0 step plan token COUNT divergence: rank 0 " +
-                            std::to_string(rank0.size()) + " tokens, rank 1 " +
-                            std::to_string(rank1.size()));
+    Logger::Warn("tp2",
+                 std::string(role) +
+                     " rank-0 step plan token COUNT divergence: rank 0 " +
+                     std::to_string(rank0.size()) + " tokens, rank 1 " +
+                     std::to_string(rank1.size()));
     return std::min(rank0.size(), rank1.size());
   }
   for (std::size_t i = 0; i < rank0.size(); ++i) {
@@ -3076,12 +3078,11 @@ public:
     }
     if (publish) {
       runner_->SetStepChannel(
-          std::make_shared<TpControlStepPublisher>(std::move(control)),
-          nullptr, sequence);
+          std::make_shared<TpControlStepPublisher>(std::move(control)), nullptr,
+          sequence);
     } else {
       runner_->SetStepChannel(
-          nullptr,
-          std::make_shared<TpControlStepConsumer>(std::move(control)),
+          nullptr, std::make_shared<TpControlStepConsumer>(std::move(control)),
           sequence);
     }
   }
