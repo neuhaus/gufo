@@ -152,8 +152,7 @@ public:
     /// reduced MoE output, in forward order: a device buffer of rows x hidden
     /// floats pending on the given stream. Null in production; probes set it
     /// to compare ranks layer by layer.
-    std::function<void(const float*, std::size_t, hipStream_t)>
-        moe_observer;
+    std::function<void(const float*, std::size_t, hipStream_t)> moe_observer;
   };
 
   /// The two-rank all-reduce over `communicator` for rows of `hidden` floats:

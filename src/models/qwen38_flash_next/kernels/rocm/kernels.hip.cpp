@@ -5875,8 +5875,8 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
 void AddRowsBroadcast(const float* addend, float* residual,
                       std::uint32_t n_tokens, std::uint32_t hidden,
                       std::uint32_t streams, hipStream_t stream) {
-  hipLaunchKernelGGL(AddRowsBroadcastKernel, dim3(n_tokens), dim3(kThreads),
-                     0, stream, addend, residual, hidden, streams);
+  hipLaunchKernelGGL(AddRowsBroadcastKernel, dim3(n_tokens), dim3(kThreads), 0,
+                     stream, addend, residual, hidden, streams);
 }
 
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,

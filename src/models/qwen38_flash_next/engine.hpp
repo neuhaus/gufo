@@ -56,8 +56,7 @@ struct ModelOptions {
   std::shared_ptr<rocm::Communicator> communicator;
   /// Diagnostic observer for MoE inputs and outputs; see Executor::Options. The
   /// stream parameter is a `hipStream_t`, spelled without the HIP headers.
-  std::function<void(const float*, std::size_t, ihipStream_t*)>
-      moe_observer;
+  std::function<void(const float*, std::size_t, ihipStream_t*)> moe_observer;
 };
 
 class Session;

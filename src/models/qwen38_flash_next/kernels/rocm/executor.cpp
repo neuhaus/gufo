@@ -1609,9 +1609,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   if (shexp_half_ready_) {
     shexp_half_ready_ = false;
-    if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out,
-                      n_tokens, l.shexp_down.rows, l.shexp_down.cols,
-                      stream_)) {
+    if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
+                      l.shexp_down.rows, l.shexp_down.cols, stream_)) {
       AssignError(error_msg, "shared expert F16 GEMM failed");
       return false;
     }
@@ -1627,8 +1626,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // replicated state would drift apart (seen with full Q8).
   if (model_->tp_rank() != 0 && !l.shexp_split &&
       !Check(hipMemsetAsync(s_.shexp_out, 0,
-                            static_cast<std::size_t>(n_tokens) *
-                                c.hidden_size * sizeof(float),
+                            static_cast<std::size_t>(n_tokens) * c.hidden_size *
+                                sizeof(float),
                             stream_),
              "non-owner shared expert clear", error_msg)) {
     return false;
@@ -2668,7 +2667,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     return false;
   }
   AddRowsBroadcast(s_.mtp_eproj, s_.mtp_res, n, c.hidden_size, c.hc_count,
-                  stream_);
+                   stream_);
   if (trace && !copy_trace(s_.mtp_res + final_row, trace->fused))
     return false;
   Session::AttentionState attn;

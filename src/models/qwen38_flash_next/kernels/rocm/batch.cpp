@@ -280,7 +280,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         return false;
       }
       AddRowsBroadcast(s_.mtp_eproj, s_.mtp_res, count, c.hidden_size,
-                      c.hc_count, stream_);
+                       c.hc_count, stream_);
       i = end;
     }
     UseScratch(base);
@@ -634,10 +634,10 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   // rank zero, and peers run it only to keep their activation staging state
   // in step, then drop the output (see Executor::Moe).
   if (model_->tp_rank() != 0 && !l.shexp_split &&
-      !Check(hipMemsetAsync(base.shexp_out, 0,
-                            static_cast<std::size_t>(rows) * c.hidden_size *
-                                sizeof(float),
-                            stream_),
+      !Check(hipMemsetAsync(
+                 base.shexp_out, 0,
+                 static_cast<std::size_t>(rows) * c.hidden_size * sizeof(float),
+                 stream_),
              error)) {
     return false;
   }

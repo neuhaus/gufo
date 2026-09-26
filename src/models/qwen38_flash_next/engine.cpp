@@ -195,8 +195,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
           : 1;
   exec.max_speculative = exec.max_logit_rows;
   if (options.communicator) {
-    exec.all_reduce = rocm::Executor::TwoRankAllReduce(options.communicator,
-                                                       c.hidden_size);
+    exec.all_reduce =
+        rocm::Executor::TwoRankAllReduce(options.communicator, c.hidden_size);
   }
   exec.moe_observer = options.moe_observer;
   m->executor_ =

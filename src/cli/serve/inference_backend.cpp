@@ -4223,8 +4223,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
     const std::size_t worker_cache_prefix_tokens =
         use_cache_reuse ? prompt->cache_prefix_tokens : 0;
     if (stream_output || !sampling_config.can_use_unmodified_argmax() ||
-        prompt->context != nullptr ||
-        !request.stop_sequences.empty() ||
+        prompt->context != nullptr || !request.stop_sequences.empty() ||
         max_tokens > std::numeric_limits<std::uint32_t>::max()) {
       throw std::invalid_argument(
           "TP2 start_chat requires one greedy, non-streaming text request "

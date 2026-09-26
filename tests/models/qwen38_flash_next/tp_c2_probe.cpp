@@ -1247,9 +1247,9 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
   if (moe_inputs != nullptr) {
     moe_inputs->armed = false;
     for (std::size_t index = 0; index < moe_inputs->hashes.size(); ++index) {
-      Say(role, "moe-input " + std::to_string(index) + " bytes=" +
-                    std::to_string(moe_inputs->sizes[index]) + " hash=" +
-                    std::to_string(moe_inputs->hashes[index]));
+      Say(role, "moe-input " + std::to_string(index) +
+                    " bytes=" + std::to_string(moe_inputs->sizes[index]) +
+                    " hash=" + std::to_string(moe_inputs->hashes[index]));
     }
   }
   const auto prefill_elapsed = std::chrono::steady_clock::now() - prefill_start;
@@ -1336,8 +1336,8 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
     }
     // The per-step member set is the schedule. It must be identical on both
     // ranks, so it is logged rather than inferred.
-    Say(role, "batched step " + std::to_string(step) + " rows=" +
-                  std::to_string(rows) + " members=" +
+    Say(role, "batched step " + std::to_string(step) +
+                  " rows=" + std::to_string(rows) + " members=" +
                   (included.empty() ? std::string("none") : included) +
                   " logits=" + logit_hashes);
     if (rows == 0) {
@@ -2152,8 +2152,7 @@ int main(int argc, char** argv) {
         Warn("allreduce bench RDMA communicator failed: " + bench_error);
         return kTransportFailure;
       }
-      return RunAllReduceBench("rank1", *communicator, device,
-                               allreduce_bench);
+      return RunAllReduceBench("rank1", *communicator, device, allreduce_bench);
     }
     if (batched_w2 || serial_w2) {
       std::string batched_error;
@@ -2190,11 +2189,11 @@ int main(int argc, char** argv) {
       };
       auto moe_inputs = std::make_shared<MoeInputHashes>();
       if (moe_input_hashes) {
-        batched_options.moe_observer =
-            [moe_inputs](const float* data, std::size_t bytes,
-                         hipStream_t stream) {
-              moe_inputs->Observe(data, bytes, stream);
-            };
+        batched_options.moe_observer = [moe_inputs](const float* data,
+                                                    std::size_t bytes,
+                                                    hipStream_t stream) {
+          moe_inputs->Observe(data, bytes, stream);
+        };
       }
       auto batched_model =
           q::Model::Load(model_path, batched_options, &batched_error);
@@ -2229,9 +2228,9 @@ int main(int argc, char** argv) {
         }
       }
       return RunBatchedW2("rank1", batched_model, batched_prompt, budget,
-                           context, collectives, serial_w2,
-                           moe_input_hashes ? moe_inputs.get() : nullptr,
-                           &batched_error);
+                          context, collectives, serial_w2,
+                          moe_input_hashes ? moe_inputs.get() : nullptr,
+                          &batched_error);
     }
     const MtpSidecar mtp{
         .model_path = mtp_model_path,
@@ -2291,11 +2290,11 @@ int main(int argc, char** argv) {
     };
     auto moe_inputs = std::make_shared<MoeInputHashes>();
     if (moe_input_hashes) {
-      batched_options.moe_observer =
-          [moe_inputs](const float* data, std::size_t bytes,
-                       hipStream_t stream) {
-            moe_inputs->Observe(data, bytes, stream);
-          };
+      batched_options.moe_observer = [moe_inputs](const float* data,
+                                                  std::size_t bytes,
+                                                  hipStream_t stream) {
+        moe_inputs->Observe(data, bytes, stream);
+      };
     }
     auto batched_model = q::Model::Load(model_path, batched_options, &error);
     if (!batched_model) {
@@ -2327,9 +2326,9 @@ int main(int argc, char** argv) {
         return kInvalidArguments;
       }
     }
-    return RunBatchedW2("rank0", batched_model, batched_prompt, budget,
-                         context, collectives, serial_w2,
-                         moe_input_hashes ? moe_inputs.get() : nullptr, &error);
+    return RunBatchedW2("rank0", batched_model, batched_prompt, budget, context,
+                        collectives, serial_w2,
+                        moe_input_hashes ? moe_inputs.get() : nullptr, &error);
   }
 
   // 2. The rank-zero control peer listens; the worker connects and both
