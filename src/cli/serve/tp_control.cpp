@@ -795,7 +795,13 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   }
   std::uint64_t sequence = 0;
   std::vector<std::uint8_t> peer;
-  if (!ReceiveFrame(kHello, &sequence, &peer, error) || sequence != 0) {
+  // Keep the frame error: a peer that died during model load surfaces here as
+  // a receive failure, and reporting only a bad sequence sent looking for a
+  // protocol bug instead of the dead peer that caused it.
+  if (!ReceiveFrame(kHello, &sequence, &peer, error)) {
+    return false;
+  }
+  if (sequence != 0) {
     SetError(error, "TP control hello sequence is invalid");
     return false;
   }
