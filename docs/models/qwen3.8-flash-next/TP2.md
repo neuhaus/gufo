@@ -381,3 +381,56 @@ The third case is the one that needs hardware. A hosted test can prove the
 protocol refuses a malformed step, an out-of-sequence step and an ended exchange,
 but only a two-host run that kills or stalls rank 0 mid-request can prove rank 1
 unblocks rather than waiting out `kStepTokenTimeout` on every later request.
+
+### Rank-0 step plan: prefill previews a token before the plan is armed
+
+The step plan is implemented, hosted-tested, and **still not working on
+hardware**. Two-host bisect on one binary, gated by an env var, with the base
+branch as control:
+
+| Arm | Reordering | Step channel | Result |
+| --- | --- | --- | --- |
+| base `d73562ab` | absent | absent | 27.3 tok/s, `serial-c1` |
+| A `69cfcab1` | on | off | 27.3 tok/s, `serial-c1` |
+| B `69cfcab1` | on | on | **fail, 30.5 s, `bootstrap receive`** |
+
+So the reordering (command before submit) and the own-wait-before-response
+ordering are both correct, and the step channel alone causes the failure. The
+`GUFO_TP2_STEP_PLAN` env gate that made this bisect possible is diagnostic
+scaffolding and must be removed once the channel works.
+
+Traced runs give the mechanism. Rank 0 reaches token selection exactly once
+before anything is armed:
+
+```
+[step-trace] select rank=0 pos=68 pub=0 cons=0
+[step-trace] select rank=1 pos=68 cons=1
+[step-trace] consume FAILED: TP control receive: Resource temporarily unavailable
+```
+
+`pos=68` is the prompt length, and rank 0's line has `pub=0`: the publisher was
+not yet armed. That selection is **`PreviewFirstToken`**, which
+`PrepareFirstSnapshot` (`text_generation_scheduler.cpp:818`) calls on the
+scheduler thread during prefill, and which on Flash-Next simply delegates to
+`SelectNext`. It runs while rank 0 is still prefilling, before the control path
+arms anything.
+
+Two consequences, and the second is the fatal one:
+
+- The prefill preview samples a first token that the prefill path then discards.
+  Under the step plan that sample is local, so it is also a token rank 1 never
+  sees.
+- Rank 0 therefore reaches the decode loop having already produced a token
+  outside the exchange, while rank 1 is armed and blocked in `Consume`. Rank 0's
+  first *published* token is one step out of phase with what rank 1 is waiting
+  for, and the pair never synchronises; rank 1 exhausts `kStepTokenTimeout` and
+  exits, leaving rank 0's prefill collective with no peer until the 30 s
+  `kCollectiveTimeout` in `verbs.cpp`.
+
+The fix is not to reorder the arming again. `PreviewFirstToken` must **not**
+participate in the step exchange: it is a speculative prefill lookahead whose
+result is thrown away, so it must sample locally and must never publish or
+consume. That makes it the one selection point that has to opt out of the plan,
+and it means rank 0's first *published* token is the first token of the real
+decode, which is exactly what rank 1 blocks for. Both roles need this, because
+both ranks run the same prefill preview.
