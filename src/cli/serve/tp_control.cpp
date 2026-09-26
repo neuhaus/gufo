@@ -86,6 +86,14 @@ void ClearReceiveTimeout(int fd) {
   (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof(none));
 }
 
+/// Whether a receive failed purely because the bound expired with nothing
+/// read, as opposed to a real I/O error. Only the latter can leave the stream
+/// mid-frame, so only the latter may poison the channel.
+[[nodiscard]] bool IsTimeoutOnly(const std::string* error) {
+  return error != nullptr && error->find("Resource temporarily unavailable") !=
+                             std::string::npos;
+}
+
 void AppendU32(std::vector<std::uint8_t>* out, std::uint32_t value) {
   for (unsigned shift = 0; shift < 32; shift += 8) {
     out->push_back(static_cast<std::uint8_t>(value >> shift));
@@ -974,13 +982,20 @@ bool TpControlChannel::ReceiveCommandWithin(TpControlCommand* command,
   const timeval window{bounded / 1000, (bounded % 1000) * 1000};
   (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &window, sizeof(window));
   const bool received = ReceiveCommand(command, error);
+  // ALWAYS restore the unbounded wait, on failure as well as success. A leaked
+  // SO_RCVTIMEO does not just fail this step: it makes the worker's idle
+  // command wait time out too, so the peer exits with EAGAIN on a path that
+  // must wait indefinitely. The step plan depends on this, because every
+  // consume is a bounded receive on the same socket the command loop uses.
+  ClearReceiveTimeout(fd_);
   if (!received) {
-    receive_poisoned_.store(true, std::memory_order_release);
+    // Only a failure that may have landed mid-frame poisons the channel. A
+    // receive that timed out with nothing at all leaves the stream intact.
+    if (!IsTimeoutOnly(error)) {
+      receive_poisoned_.store(true, std::memory_order_release);
+    }
     return false;
   }
-  // Back to waiting as long as the server stays idle: a per-token bound must
-  // not leak into the next command wait.
-  ClearReceiveTimeout(fd_);
   return true;
 }
 

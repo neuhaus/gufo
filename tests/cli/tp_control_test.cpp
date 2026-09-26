@@ -789,9 +789,12 @@ int main() {
             "TP unbounded command wait returns the command sent after the step");
   }
 
-  // A bounded receive that expires must fail closed, and must leave the channel
-  // unusable rather than letting a later read reinterpret the tail of a partial
-  // frame. Nothing is sent here, so the bound is reached with an empty stream.
+  // A bounded receive that expires must fail closed, and must NOT poison the
+  // channel: a timeout with nothing read leaves the byte stream intact, so the
+  // next receive is still well defined. Poisoning here is what made the worker's
+  // idle command wait fail with EAGAIN on hardware -- a leaked per-token bound
+  // that ended a path required to wait indefinitely. Nor may the bound leak:
+  // the socket must be back to an unbounded wait.
   {
     TpControlCommand expired;
     std::string expired_error;
@@ -801,19 +804,22 @@ int main() {
                 !expired_error.empty(),
             "TP bounded receive must fail when the bound expires");
 
-    // Poisoned: a further receive fails immediately instead of blocking or
-    // succeeding. If the stream were merely abandoned this would either hang
-    // forever or consume a later frame as if it were whole.
-    std::thread late_sender(
-        [&] { (void)server->SendCommand(command, &server_error); });
-    TpControlCommand after_poison;
-    std::string poison_error;
-    const bool poisoned = client->ReceiveCommandWithin(
-        &after_poison, std::chrono::milliseconds(150), &poison_error);
+    // A later command must still arrive on the same socket. If the timeout had
+    // poisoned the channel this fails; if the bound had leaked it would time out
+    // here instead, since the sender is slower than a 150 ms bound.
+    std::thread late_sender([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      (void)server->SendCommand(command, &server_error);
+    });
+    TpControlCommand after_timeout;
+    std::string after_error;
+    const bool recovered = client->ReceiveCommandWithin(
+        &after_timeout, std::chrono::seconds(10), &after_error);
     late_sender.join();
-    Require(!poisoned && !poison_error.empty(),
-            "TP bounded receive must stay refused after a timeout: " +
-                poison_error);
+    Require(recovered && after_timeout.sequence == command.sequence,
+            "TP bounded receive recovers after a clean timeout, and the bound "
+            "did not leak into the next wait: " +
+                after_error);
   }
 
   // The step bridge needs its own channel pair: the bounded-receive test above
