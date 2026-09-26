@@ -3236,30 +3236,25 @@ struct InferenceBackend::Impl {
         throw std::runtime_error("TP operation scope bind failed: " +
                                  control_error);
       }
-      auto request = current->scheduler->Submit(
-          std::move(prompt_tokens), max_tokens, sampling, {},
-          static_cast<bool>(on_token),
-          TextRequestMetadata{
-              .client_id = client_id,
-              .deadline = std::nullopt,
-              .request_start = request_start,
-              .prompt_context = nullptr,
-              .cache_prompt = use_cache_reuse,
-              .cache_prefix_tokens = worker_cache_prefix_tokens,
-          });
-      if (!current->response_broker->RegisterPendingResponse(sequence,
-                                                             &control_error)) {
-        try {
-          request.Cancel();
-          (void)request.Wait({});
-        } catch (...) {
-        }
-        throw std::runtime_error("TP response registration failed: " +
-                                 control_error);
-      }
+      // The command goes out BEFORE rank 0 submits its own request. The step
+      // plan makes the order load-bearing rather than incidental: an armed
+      // publisher would otherwise let rank 0's first `SelectNext` put a
+      // `kStep` on the wire ahead of the `kSingle` command, and rank 1 would
+      // read the step first and refuse it. Sending first also puts rank 1 in
+      // `Consume` before rank 0 has prefill to do, which is the lockstep this
+      // design intends. See the arming-order note in TP2.md.
       bool send_started = false;
       bool response_received = false;
+      // Declared outside the `try` so the `catch` can reach it: the command is
+      // sent before `Submit`, so a registration or send failure unwinds with
+      // no local request to cancel.
+      std::optional<TextGenerationScheduler::Request> request;
       try {
+        if (!current->response_broker->RegisterPendingResponse(
+                sequence, &control_error)) {
+          throw std::runtime_error("TP response registration failed: " +
+                                   control_error);
+        }
         TpControlCommand command{
             .sequence = sequence,
             .max_tokens = static_cast<std::uint32_t>(max_tokens),
@@ -3274,6 +3269,36 @@ struct InferenceBackend::Impl {
           throw std::runtime_error("TP worker command failed: " +
                                    control_error);
         }
+        // Armed only once rank 1 is committed to start, and only around rank
+        // 0's own decode: an armed publisher outliving the request would send a
+        // step naming a sequence nothing is decoding.
+        auto step_publisher =
+            std::make_shared<TpControlStepPublisher>(current->control);
+        std::optional<TextGenerationScheduler::Request> submitted;
+        if (current->flash_next_runner != nullptr) {
+          current->flash_next_runner->SetStepChannel(step_publisher, nullptr,
+                                                     sequence);
+        }
+        struct StepDisarm {
+          std::shared_ptr<QwenFlashNextTextRunner> runner;
+          ~StepDisarm() {
+            if (runner != nullptr) {
+              runner->SetStepChannel(nullptr, nullptr, 0);
+            }
+          }
+        } disarm{current->flash_next_runner};
+        submitted = current->scheduler->Submit(
+            std::move(prompt_tokens), max_tokens, sampling, {},
+            static_cast<bool>(on_token),
+            TextRequestMetadata{
+                .client_id = client_id,
+                .deadline = std::nullopt,
+                .request_start = request_start,
+                .prompt_context = nullptr,
+                .cache_prompt = use_cache_reuse,
+                .cache_prefix_tokens = worker_cache_prefix_tokens,
+            });
+        request = std::move(submitted);
         TpControlResponse response;
         if (!current->response_broker->WaitForResponse(sequence, &response,
                                                        &control_error)) {
@@ -3284,7 +3309,7 @@ struct InferenceBackend::Impl {
         if (!response.error.empty()) {
           throw std::runtime_error("TP worker failed: " + response.error);
         }
-        result = request.Wait(on_token);
+        result = request->Wait(on_token);
         if (response.tokens.size() != result.tokens.size()) {
           throw std::runtime_error("TP worker token count mismatch");
         }
@@ -3319,16 +3344,25 @@ struct InferenceBackend::Impl {
         }
         return result;
       } catch (...) {
-        try {
-          request.Cancel();
-          (void)request.Wait({});
-        } catch (...) {
+        // `request` may not exist: the command is now sent before `Submit`, so
+        // a failure to register or to send happens with no local request to
+        // cancel. The `StepDisarm` above has already restored independent
+        // sampling, so rank 0 is not left publishing into a dead exchange.
+        if (request.has_value()) {
+          try {
+            request->Cancel();
+            (void)request->Wait({});
+          } catch (...) {
+          }
         }
         if (!send_started) {
           std::string cancel_error;
           (void)current->response_broker->CancelUnsentResponse(sequence,
                                                                &cancel_error);
         } else if (!response_received) {
+          // Rank 1 was told to start and may be blocked in `Consume` holding
+          // the request open. `FailAll` discards its eventual reply so it is
+          // not correlated to whatever request runs next.
           current->response_broker->FailAll(
               "TP request failed before a correlated response arrived");
         }
@@ -4024,6 +4058,28 @@ bool InferenceBackend::run_worker(std::string* error) {
         prompt_tokens.push_back(static_cast<TextRunnerToken>(token));
       }
       sampling::SamplingConfig greedy;
+      // Rank 0's token is authoritative: arm a consumer so this request's
+      // `SelectNext` takes rank 0's token instead of sampling its own, and the
+      // stop test then runs on that shared token, so both ranks stop together.
+      // Rank 1 starts before rank 0 and blocks in `Consume` through rank 0's
+      // prefill, and rank 0 holds its publisher armed until this request's
+      // response is sent, so the two windows nest. Disarming restores
+      // independent sampling on every exit, so a consumer never outlives the
+      // request that armed it.
+      auto step_consumer =
+          std::make_shared<TpControlStepConsumer>(state->control);
+      struct StepDisarm {
+        std::shared_ptr<QwenFlashNextTextRunner> runner;
+        ~StepDisarm() {
+          if (runner != nullptr) {
+            runner->SetStepChannel(nullptr, nullptr, 0);
+          }
+        }
+      } disarm{state->flash_next_runner};
+      if (state->flash_next_runner != nullptr) {
+        state->flash_next_runner->SetStepChannel(nullptr, step_consumer,
+                                                 command.sequence);
+      }
       auto request = state->scheduler->Submit(
           std::move(prompt_tokens), command.max_tokens, greedy, {}, false,
           TextRequestMetadata{
