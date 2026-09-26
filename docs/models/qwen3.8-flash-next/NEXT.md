@@ -64,14 +64,35 @@ rank 1, enables sampling, stop sequences, cancellation and streaming, removes
 the requirement for bit-identical logits that the Q8 bug showed is fragile, and
 is the per-step agreement that concurrency needs (section 1, step 3).
 
+**The rank-0 step plan is implemented and verified on two hosts.** Rank 0 samples
+and publishes each token as a `kStep` control command; rank 1 consumes it in
+`SelectNext` instead of sampling, so its stop test runs on the shared token and
+both ranks stop together with no separate stop message. Measured on `fuzzy`/
+`misty` at 27.44 tok/s, `serial-c1`, with 64 tokens published and 64 consumed and
+byte-identical output to the step-plan-off control — so the mechanism is proven,
+not inferred. The per-token exchange costs ~1.9 us one-way (loopback lower
+bound), about 0.005% of a 26 tok/s token, so lockstep is not a throughput tax;
+see [TP2.md](TP2.md) for the exchange cost, the arming order, and the four
+bugs two-host runs found.
+
+What is **not** done is lifting the restrictions the plan unblocks. The
+`TP2 requires greedy text without stop sequences` guard still refuses sampling,
+stop sequences and streaming, and the end-of-run token comparison is still
+enforced. That comparison is deliberate for now: it is the check that would
+catch a regression in the plan, and demoting it to telemetry is a separate,
+deliberate step rather than something to fold in silently.
+
 Order:
 1. Open an upstream issue asking whether two-host InfiniBand TP is wanted: it
    adds a libibverbs dependency and hardware upstream likely cannot test, so the
    build gate (`GUFO_ENABLE_TP2_RDMA`) must stay off by default.
 2. Move the production fixes from `claude/c2-spike-serial` into #2 and condense
    #2 into a short, reviewable series.
-3. Rank-0 step plan, then sampled decoding, streaming, stop sequences and
-   cancellation on TP2.
+3. ~~Rank-0 step plan.~~ **Done and verified on two hosts** (above). Next:
+   demote the end-of-run token comparison to telemetry, then lift the
+   restrictions one at a time -- stop sequences first, since the stop decision
+   has to travel on the wire, then sampled decoding, then streaming and
+   cancellation.
 4. Q8 quality against a reference, and the `slow`/`external-model` suites.
 5. Send TP2 C1 upstream together with the Q8 PLE loader (#1), which is not
    useful upstream on its own because Q8 needs two hosts.
