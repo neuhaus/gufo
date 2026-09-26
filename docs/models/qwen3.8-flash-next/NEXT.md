@@ -37,41 +37,52 @@ the measurements below.
 Q4 UD-Q4_K_XL, rank 0 `fuzzy`, rank 1 `misty`, FDR InfiniBand, 2026-09-26.
 TP2 figures come from `qwen38_flash_next_tp_c2_probe` and are development
 measurements, not published cells; single-host figures are from
-[BENCHMARKS.md](BENCHMARKS.md).
+[BENCHMARKS.md](BENCHMARKS.md). "Now" includes the GPU-side add and deferred
+ack described below.
 
-| Workload | One host | TP2 |
-|---|---|---|
-| Decode, one stream, short context | 26.0 tok/s | 26.5 tok/s |
-| Decode, two streams, short context | 45.7 tok/s | 44.1 tok/s batched, 26.5 serial |
-| Prefill from 0 to 32K tokens | 1,422–1,457 tok/s | 1,070 tok/s |
-| Decode at depth 32K, one stream | 24.3 tok/s | 24.1–24.5 tok/s |
+| Workload | One host | TP2 before | TP2 now |
+|---|---|---|---|
+| Decode, one stream, short context | 26.0 tok/s | 26.5 tok/s | 26.9 tok/s |
+| Decode, two streams, short context | 45.7 tok/s | 44.1 tok/s batched | 44.8 tok/s batched |
+| Prefill from 0 to 32K tokens | 1,422–1,457 tok/s | 1,070 tok/s | 1,187 tok/s |
+| Decode at depth 32K, one stream | 24.3 tok/s | 24.1–24.5 tok/s | 24.9 tok/s |
 
-For Q4, TP2 is a capacity path, not a speed path. The second host halves the
-routed-expert work, which is about 35% of prefill kernel time, and the saving is
-spent elsewhere:
+For Q4, TP2 is a capacity path, not yet a speed path. Profiles and
+microbenchmarks show why:
 
-- Decode collectives are cheap. An all-reduce of one 10 KiB row takes 49 µs at
-  p50 (`--allreduce-bench`), so the 48 per token cost about 2.4 ms of ~38 ms.
-  The loss is structural: every `AllReduceSum` synchronizes the stream and TP2
-  runs eagerly without HIP graphs, which exposes launch latency at each of the
-  48 layers. The retained profile shows the ranks GPU-busy only 54–62%, with the
-  largest gaps at host and launch boundaries.
-- Prefill collectives are expensive. A 512-row (5 MiB) all-reduce takes 4.5 ms,
-  about 1.2 GB/s on a 56 Gb/s link, because it stages through host memory and
-  sums on one CPU thread. That adds about 215 ms to every 512-token chunk.
+- **Decode is dominated by replicated dense work.** Dense Q8 GEMVs take 57% of
+  decode kernel time and routed experts about 13%, and only the routed experts
+  are split. Halving them can save about 7% at best.
+- **What TP2 adds to a decode token is now about 3 ms:** the exchange itself
+  (p50 41 µs inside decode, 48 per token, including waiting for the slower
+  rank) and the stream synchronization before each staging copy. Rank 1 waits
+  about 0.9 ms per token longer, because only rank 0 computes the shared
+  expert. The ~4 ms of 2–3 µs gaps between the ~1,780 kernels per token occur on
+  one host too.
+- **Graphs are not the missing piece.** A temporary single-host build with
+  graphs disabled decoded at 26.39±0.55 against 26.73±0.12 tok/s. The TP2 loss
+  came from the per-layer synchronization, not from eager launches.
+- **Prefill is bound by the NIC's PCIe link.** Both ConnectX-3 cards run at PCIe
+  Gen3 x4: `perftest` measures 3.27 GB/s one way and 5.41 GB/s in both
+  directions, so a 5 MiB exchange cannot go below about 1.9 ms. The 512-row
+  all-reduce now takes 2.9 ms (4.5 ms before), almost all of it the RDMA read.
+  At that floor TP2 prefill would reach about 1,310 tok/s, still below one host,
+  unless communication overlaps compute.
 
 Proposed order for TP2 speed:
-1. Prefill: reduce on the GPU and stop staging through host memory, or at least
-   overlap the copy, the RDMA read and the sum in chunks.
-2. Decode: make the collective stream-ordered, so the GPU hands each partial to
-   a host proxy thread with `hipStreamWriteValue` and waits with
-   `hipStreamWaitValue`, and the host never blocks per layer. The forward can
-   then be graph-captured again. Measure single-host decode with graphs disabled
-   first, to size the gain.
-3. Physical C2 (section 1) is feasible: the spike batched two streams with
-   identical tokens and schedules on both ranks, 1.67× over serial. On Q4 it only
-   matches one host until 1 and 2 land. For full Q8, which needs two hosts, it
-   is worth building once Q8 is qualified.
+1. Split the shared expert across ranks: each computes half its intermediate
+   dimension and the partial sums ride the existing all-reduce, so it adds no
+   collective. Removes rank 0's extra work and the rank-1 wait.
+2. Split the replicated dense projections (true tensor parallelism for
+   attention, GDN and HC projections). This is the only change that can make
+   TP2 decode clearly faster than one host, and it adds collectives, so the
+   exchange latency matters again.
+3. Prefill: overlap the exchange of one half-chunk with the compute of the
+   other, since the link itself is at its limit. A Gen4 x4 NIC would halve the
+   transfer time.
+4. Physical C2 (section 1) is feasible: the spike batched two streams with
+   identical tokens and schedules on both ranks, 1.67× over serial. On Q4 it
+   matches one host; it matters for full Q8, which needs two hosts.
 
 ## 1. Physical C2 — critical path
 
