@@ -155,6 +155,7 @@ private:
 
   std::shared_ptr<TextModelRunner> inner_;
   std::shared_ptr<TpInstructionSink> sink_;
+  bool multi_token_decode_{false};
   mutable std::mutex mutex_;
   mutable std::uint32_t next_state_id_{0};
   mutable std::uint64_t sequence_{0};

@@ -166,6 +166,7 @@ TpMirroredRunner::TpMirroredRunner(std::shared_ptr<TextModelRunner> inner,
     throw std::invalid_argument(
         "TP2 does not mirror snapshots yet; run without --tp-cache-reuse");
   }
+  multi_token_decode_ = capabilities.multi_token_decode;
 }
 
 void TpMirroredRunner::BeginRequest(std::uint64_t sequence) {
@@ -420,7 +421,7 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
   // token by token: the base implementation selects here, on rank 0 only, and
   // mirrors each `Advance`. Forwarding it to the wrapped runner instead would
   // let its `Advance` bypass this wrapper.
-  if (max_tokens < 2 || !inner_->Descriptor().capabilities.multi_token_decode ||
+  if (max_tokens < 2 || !multi_token_decode_ ||
       !sampler.config().can_use_unmodified_argmax()) {
     return TextModelRunner::DecodeStep(state, max_tokens, sampler);
   }
