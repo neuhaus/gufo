@@ -46,7 +46,7 @@ dead peer host.
 **Rank 1 as executor.** Rank 0 runs the ordinary scheduler and runner pool
 through `TpMirroredRunner`. Just before each call that changes model state, the
 wrapper sends it to rank 1 as a `kInstruction` (state reset, prefill chunk,
-advance, or one greedy multi-token decode cycle); rank 1's `TpExecutor` makes
+advance, or one multi-token decode cycle); rank 1's `TpExecutor` makes
 the same call on the same state, and both ranks meet in the call's exchanges.
 Token selection reads only logits and stays on rank 0, so sampling, stop
 sequences, cancellation and streaming are decided by rank 0's scheduler exactly
@@ -64,10 +64,14 @@ ranks. Rules that the compiler does not enforce:
   which can abort between layers and would strand rank 1 inside an exchange.
   The scheduler cancels between calls, so a long prefill stops at its next
   chunk.
-- Multi-token decoding is one instruction only for greedy requests, whose draft
-  and acceptance decisions are deterministic; the draft-length controller
-  depends only on acceptance history (`mtp_policy.hpp`). Sampled requests decode
-  token by token.
+- A multi-token decode cycle is one instruction. It carries rank 0's sampler
+  draw state (RNG and pending deferred draw) from just before the call, and
+  rank 1's sampler is built like the pool's (the request's sampling
+  configuration, the prompt as history) and accepts the same tokens, so both
+  ranks draw alike and make the same draft and acceptance decisions. The
+  draft-length controller depends only on acceptance history
+  (`mtp_policy.hpp`). A one-token budget selects on rank 0 and mirrors the
+  advance.
 - The wrapper does not mirror snapshots, forks or prefix reuse, so it reports
   none of them and TP2 refuses `--tp-cache-reuse`.
 
