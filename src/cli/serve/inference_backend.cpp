@@ -2344,14 +2344,12 @@ public:
                           std::uint32_t max_context, bool use_mtp,
                           std::uint32_t max_draft_tokens,
                           std::string artifact_fingerprint = {},
-                          std::string mtp_fingerprint = {},
-                          bool allow_distributed_snapshots = false)
+                          std::string mtp_fingerprint = {})
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
         max_draft_tokens_(max_draft_tokens),
-        distributed_(model_->TpWorldSize() > 1),
-        allow_distributed_snapshots_(allow_distributed_snapshots) {
+        distributed_(model_->TpWorldSize() > 1) {
     if (!distributed_ && !artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
@@ -2372,15 +2370,15 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = !distributed_ || allow_distributed_snapshots_,
-                .fork = !distributed_ || allow_distributed_snapshots_,
+                .snapshot = true,
+                .fork = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
                 .batched_multi_token_decode = !distributed_ && use_mtp_,
                 .batched_multi_token_decode_max_width =
                     !distributed_ && use_mtp_ ? 8u : 0u,
-                .prefix_reuse = !distributed_ || allow_distributed_snapshots_,
+                .prefix_reuse = true,
             },
         .persistence = persistence_,
     };
@@ -2405,10 +2403,7 @@ public:
         // Runtime scratch is shared and already allocated at model load;
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes =
-            (!distributed_ || allow_distributed_snapshots_)
-                ? HostSnapshotBudgetBytes()
-                : 0,
+        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -2715,10 +2710,6 @@ public:
 
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       const TextRunnerState& state) const override {
-    if (distributed_ && !allow_distributed_snapshots_) {
-      throw std::invalid_argument(
-          "Qwen3.8-Flash-Next TP2 local snapshots are disabled");
-    }
     const std::uint64_t bytes =
         RequireQwenFlashNextState(state).session().SnapshotBytes();
     if (bytes == 0 || bytes > static_cast<std::uint64_t>(
@@ -2731,10 +2722,6 @@ public:
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
-    if (distributed_ && !allow_distributed_snapshots_) {
-      throw std::invalid_argument(
-          "Qwen3.8-Flash-Next TP2 local snapshots are disabled");
-    }
     const auto& qfn = RequireQwenFlashNextState(state);
     std::string error;
     auto snapshot = qfn.session().SaveSnapshot(&error);
@@ -2747,10 +2734,6 @@ public:
 
   void RestoreOrFork(TextRunnerState& state,
                      const TextRunnerSnapshot& snapshot) const override {
-    if (distributed_ && !allow_distributed_snapshots_) {
-      throw std::invalid_argument(
-          "Qwen3.8-Flash-Next TP2 local snapshots are disabled");
-    }
     const auto* qfn_snapshot =
         dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
     if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
@@ -2841,7 +2824,6 @@ private:
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
   bool distributed_{false};
-  bool allow_distributed_snapshots_{false};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 #endif
@@ -3708,20 +3690,17 @@ bool InferenceBackend::load(
         speculative_config.backend == TextSpeculativeBackend::kMtp,
         speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint,
-        tp_config.allow_cache_reuse);
+        disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     if (tp_world_size > 1) {
       const TpControlConfig control_config{
-          .snapshot_budget_bytes =
-              tp_config.allow_cache_reuse ? HostSnapshotBudgetBytes() : 0,
+          .snapshot_budget_bytes = HostSnapshotBudgetBytes(),
           .rank = tp_rank,
           .world_size = tp_world_size,
           .max_context = max_context,
           .max_draft_tokens = has_mtp ? speculative_config.max_draft_tokens : 0,
           .use_mtp = has_mtp,
-          .allow_cache_reuse = tp_config.allow_cache_reuse,
           .auth_token = tp_config.auth_token,
           .prefill_chunk_tokens =
               static_cast<std::uint32_t>(prefill_policy.decode_active_tokens),

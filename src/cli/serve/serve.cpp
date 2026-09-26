@@ -956,7 +956,6 @@ int RunServe(std::span<const char* const> args) {
     std::uint32_t tp_gid_index = 0;
     std::uint32_t tp_bootstrap_port = 18515;
     std::uint32_t tp_control_port = 18516;
-    bool tp_cache_reuse = false;
     std::string tp_bootstrap_host;
     std::string tp_control_token;
 
@@ -993,9 +992,6 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--tp-control-token", "TOKEN",
                          "Shared token for TP worker authentication", "TP2",
                          &tp_control_token);
-    llm_parser.AddFlag("", "--tp-cache-reuse",
-                       "Enable symmetric live-prefix reuse on both TP2 ranks",
-                       "TP2", &tp_cache_reuse);
     llm_parser.AddOption("", "--tp-device", "N", "HIP device index", "TP2",
                          &tp_device);
     llm_parser.AddOption("", "--tp-gid-index", "N", "InfiniBand GID index",
@@ -1178,10 +1174,6 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --tp-world-size must be 1 or 2\n";
       return 2;
     }
-    if (tp_cache_reuse && tp_world_size != 2) {
-      std::cerr << "Error: --tp-cache-reuse requires --tp-world-size 2\n";
-      return 2;
-    }
     if (tp_world_size == 1 && tp_rank != 0) {
       std::cerr << "Error: single-rank TP requires --tp-rank 0\n";
       return 2;
@@ -1223,7 +1215,6 @@ int RunServe(std::span<const char* const> args) {
         .rank = tp_rank,
         .world_size = tp_world_size,
         .hip_device = static_cast<int>(tp_device),
-        .allow_cache_reuse = tp_cache_reuse,
         .auth_token = tp_control_token,
     };
     std::shared_ptr<models::qwen38_flash_next::rocm::Communicator>

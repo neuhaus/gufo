@@ -68,7 +68,7 @@
 //   samples and would therefore issue one extra forward per member and
 //   desynchronise the trace. A FRESH session per member is what makes the
 //   prefill start from an empty prefix, which is also what the worker does for
-//   an uncached member (`cache_prompt = false`, `allow_cache_reuse = false`),
+//   an uncached member (`cache_prompt = false`),
 //   so `Sync`'s common-prefix skip is zero on both sides and both chunk the
 //   whole prompt.
 //
@@ -541,7 +541,7 @@ Fault-injection modes (all deliberate, all fail closed; none can pass):
      0 here because the skipped lockstep issues no collective for it to poison.
 
 Peer parity: the handshake compares world_size, max_context,
-prefill_chunk_tokens, max_draft_tokens, use_mtp, allow_cache_reuse and the
+prefill_chunk_tokens, max_draft_tokens, use_mtp and the
 token EXACTLY, so both roles need the same --model, --context,
 --tp-bootstrap-port, --tp-control-port, --tp-device, --tp-gid-index and
 --tp-control-token. rank1 supplies prefill_chunk_tokens 512 from its prefill
@@ -561,7 +561,6 @@ Handshake parity, all eight fields compared (tp_control.cpp:671-680):
   max_draft_tokens      0 / 0                        --draft-tokens, both
                                                     roles, 7 when unset
   use_mtp               false / false                true / true
-  allow_cache_reuse     false / false                false / false
   auth_token            --tp-control-token, both     --tp-control-token,
                                                     both
 
@@ -1678,7 +1677,6 @@ int RunRank1Worker(const std::string& model_path, std::uint32_t context,
       .rank = kRank1,
       .world_size = kWorldSize,
       .hip_device = static_cast<int>(device),
-      .allow_cache_reuse = false,
       .communicator = communicator,
       .control = control,
       .auth_token = control_token,
@@ -2395,7 +2393,6 @@ int main(int argc, char** argv) {
       // wire. Rank 0 must mirror the wire value, not the load value.
       .max_draft_tokens = expect_worker_mtp ? mtp_draft_tokens : 0,
       .use_mtp = expect_worker_mtp,
-      .allow_cache_reuse = false,
       .auth_token = control_token,
       .prefill_chunk_tokens = kWorkerPrefillChunkTokens,
   };

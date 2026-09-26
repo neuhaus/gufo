@@ -176,7 +176,6 @@ int main() {
                         .max_context = 4096,
                         .max_draft_tokens = 7,
                         .use_mtp = true,
-                        .allow_cache_reuse = true,
                         .auth_token = "test-token",
                         .prefill_chunk_tokens = 512};
   TpControlConfig rank1 = rank0;
@@ -591,7 +590,7 @@ int main() {
           "TP control mismatch pair connects");
   TpControlConfig mismatch_rank0 = rank0;
   TpControlConfig mismatch_rank1 = rank1;
-  mismatch_rank1.allow_cache_reuse = false;
+  mismatch_rank1.max_draft_tokens = 3;
   bool mismatch_server_handshake = false;
   bool mismatch_client_handshake = false;
   std::thread mismatch_server_thread([&] {
@@ -605,7 +604,7 @@ int main() {
   mismatch_server_thread.join();
   mismatch_client_thread.join();
   Require(!mismatch_server_handshake && !mismatch_client_handshake,
-          "TP control rejects cache-policy mismatch");
+          "TP control rejects a draft-width mismatch");
 
   const auto broker_port = FreePort();
   std::shared_ptr<TpControlChannel> broker_client;

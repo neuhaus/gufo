@@ -22,7 +22,6 @@ struct TpControlConfig {
   std::uint32_t max_context{4096};
   std::uint32_t max_draft_tokens{7};
   bool use_mtp{false};
-  bool allow_cache_reuse{false};
   std::string auth_token;
   std::uint32_t prefill_chunk_tokens{512};
 };
