@@ -220,6 +220,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -244,6 +245,19 @@ constexpr const char* kDefaultModel =
     "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
 /// C2 is fixed at two members (text_generation_scheduler.hpp).
 constexpr std::size_t kMemberCount = 2;
+/// `--width` bound for the two-program modes; the Q8 decode GEMVs take at most
+/// eight rows (MMVQ_MAX_BATCH_SIZE).
+constexpr std::uint32_t kMaxWidth = 8;
+/// Prompts for two-program members beyond the first two, which keep
+/// `--prompt-0`/`--prompt-1` and their defaults.
+constexpr const char* kExtraPrompts[kMaxWidth - kMemberCount] = {
+    "Water boils at sea level at",
+    "The author of Hamlet is",
+    "The speed of light in a vacuum is about",
+    "Photosynthesis converts sunlight into",
+    "The tallest mountain on Earth is",
+    "A binary search on a sorted array runs in",
+};
 /// TP=2 is fixed at two ranks (tp_control.cpp, verbs.cpp).
 constexpr std::uint32_t kWorldSize = 2;
 constexpr std::uint32_t kRank1 = 1;
@@ -387,6 +401,9 @@ Step-2 spike:
                           token agreement and schedule agreement. The scope id
                           is a constant both sides bind by construction, so a
                           run is only comparable when BOTH ranks pass this flag.
+  --width N               Member count for --batched-w2 and --serial-w2, from 2
+                          to 8 (default 2). Members beyond the first two use
+                          fixed built-in prompts. BOTH ranks must pass it.
   --serial-w2             The serial baseline for --batched-w2: the same
                           program, but each decode step advances the included
                           members one at a time. Both modes print decode_ms and
@@ -1190,8 +1207,42 @@ std::string TokenListText(std::span<const std::int32_t> tokens) {
 /// included members one at a time instead of in one two-row forward, so a
 /// batched and a serial run differ only in batching. Both report the decode
 /// time spent in the advances alone, excluding sampling and logging.
+/// Tokenizes the two-program members' prompts: members 0 and 1 from their
+/// options, the rest from `kExtraPrompts`. Every prompt must be nonempty and
+/// fit the context with the token budget.
+bool BatchedPrompts(
+    const q::Model& model, const std::string (&prompt)[kMemberCount],
+    const std::optional<std::uint32_t> (&prompt_tokens)[kMemberCount],
+    std::uint32_t width, std::uint32_t budget, std::uint32_t context,
+    std::vector<std::vector<std::int32_t>>* out) {
+  out->assign(width, {});
+  for (std::size_t index = 0; index < width; ++index) {
+    auto& tokens = (*out)[index];
+    if (index < kMemberCount) {
+      tokens = prompt_tokens[index].has_value()
+                   ? SyntheticPrompt(model, *prompt_tokens[index], index)
+                   : model.Tokenize(prompt[index]);
+    } else {
+      tokens = model.Tokenize(kExtraPrompts[index - kMemberCount]);
+    }
+    if (tokens.empty()) {
+      Warn("batched-w2 member " + std::to_string(index) +
+           " prompt tokenized empty");
+      return false;
+    }
+    if (tokens.size() + budget > static_cast<std::size_t>(context)) {
+      Warn("batched-w2 member " + std::to_string(index) + " prompt has " +
+           std::to_string(tokens.size()) + " tokens, plus --max-tokens " +
+           std::to_string(budget) + ", which exceeds the negotiated context " +
+           std::to_string(context));
+      return false;
+    }
+  }
+  return true;
+}
+
 int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
-                 const std::vector<std::int32_t> (&prompt)[kMemberCount],
+                 std::span<const std::vector<std::int32_t>> prompt,
                  std::uint32_t budget, std::uint32_t context,
                  const std::shared_ptr<CollectiveTrace>& collectives,
                  bool serial, MoeInputHashes* moe_inputs, std::string* error) {
@@ -1200,8 +1251,9 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
   // it so a reader can confirm both sides bound the same value.
   constexpr std::uint64_t kBatchedScope = 1;
 
-  std::array<std::unique_ptr<q::Session>, kMemberCount> session;
-  for (std::size_t index = 0; index < kMemberCount; ++index) {
+  const std::size_t width = prompt.size();
+  std::vector<std::unique_ptr<q::Session>> session(width);
+  for (std::size_t index = 0; index < width; ++index) {
     session[index] = model->CreateSession(
         gufo::core::SessionMode::kAutoregressive, context, error);
     if (!session[index]) {
@@ -1222,8 +1274,8 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
 
   // Prefill stays per-session and per-member: `Prefill` is per-state and has no
   // batch form in the runner or the engine, so a width-2 program chunks member
-  // 0 and then member 1. Only the DECODE advance is batched here.
-  MemberTrace trace[kMemberCount];
+  // 0, then member 1, and so on. Only the DECODE advance is batched here.
+  std::vector<MemberTrace> trace(width);
   // A zero-byte collective is a barrier: the ranks load the model at different
   // speeds, and without it the first prefill collective would bill the slower
   // load to the faster rank's prefill time.
@@ -1236,7 +1288,7 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
     moe_inputs->armed = true;
   }
   collectives->BeginRecording();
-  for (std::size_t index = 0; index < kMemberCount; ++index) {
+  for (std::size_t index = 0; index < width; ++index) {
     if (!session[index]->Sync(prompt[index], error)) {
       (void)collectives->EndRecording();
       Warn(std::string(role) + " member " + std::to_string(index) +
@@ -1255,6 +1307,13 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
   const auto prefill_elapsed = std::chrono::steady_clock::now() - prefill_start;
   const double prefill_ms =
       std::chrono::duration<double, std::milli>(prefill_elapsed).count();
+  std::string prompt_sizes;
+  std::size_t prefill_tokens = 0;
+  for (const auto& member_prompt : prompt) {
+    prompt_sizes += (prompt_sizes.empty() ? "" : "/") +
+                    std::to_string(member_prompt.size());
+    prefill_tokens += member_prompt.size();
+  }
   trace[0].prefill_sizes = collectives->EndRecording();
   const std::size_t num_layers = model->config().num_layers;
   trace[0].prefill_forwards =
@@ -1263,9 +1322,7 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
                 std::to_string(trace[0].prefill_sizes.size()) +
                 " collectives in " + std::to_string(trace[0].prefill_forwards) +
                 " forward(s) of [" + ByteRunsText(trace[0].prefill_sizes) +
-                "] rows, prompt sizes " + std::to_string(prompt[0].size()) +
-                "/" + std::to_string(prompt[1].size()) + " tokens");
-  const std::size_t prefill_tokens = prompt[0].size() + prompt[1].size();
+                "] rows, prompt sizes " + prompt_sizes + " tokens");
   char prefill_timing[128];
   std::snprintf(prefill_timing, sizeof(prefill_timing),
                 "prefill_ms=%.1f prefill_tokens=%zu prefill_tokens_per_s=%.1f",
@@ -1276,9 +1333,11 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
   const gufo::sampling::SamplingConfig sampling{
       .temperature = kGreedyTemperature,
   };
-  gufo::sampling::SamplerState sampler0(sampling);
-  gufo::sampling::SamplerState sampler1(sampling);
-  gufo::sampling::SamplerState* samplers[kMemberCount] = {&sampler0, &sampler1};
+  std::vector<std::unique_ptr<gufo::sampling::SamplerState>> samplers;
+  for (std::size_t index = 0; index < width; ++index) {
+    samplers.push_back(
+        std::make_unique<gufo::sampling::SamplerState>(sampling));
+  }
 
   // Mirrors `RunMember` step for step, with the per-member advance replaced by
   // one batched advance. `RunMember` also stops before evaluating the token
@@ -1291,12 +1350,12 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
   std::size_t forwards = 0;
   std::size_t advanced_tokens = 0;
   for (std::size_t step = 0; step < budget; ++step) {
-    std::array<q::Session::AdvanceRequest, kMemberCount> requests;
-    std::array<std::size_t, kMemberCount> members{};
+    std::vector<q::Session::AdvanceRequest> requests(width);
+    std::vector<std::size_t> members(width);
     std::size_t rows = 0;
     std::string included;
     std::string logit_hashes;
-    for (std::size_t index = 0; index < kMemberCount; ++index) {
+    for (std::size_t index = 0; index < width; ++index) {
       if (!trace[index].stopped_on_token &&
           trace[index].tokens.size() >= budget) {
         trace[index].stopped_on_budget = true;
@@ -1403,7 +1462,7 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
     Warn(std::string(role) + " could not release batched scope: " + *error);
     return kTransportFailure;
   }
-  for (std::size_t index = 0; index < kMemberCount; ++index) {
+  for (std::size_t index = 0; index < width; ++index) {
     Say(role,
         "batched member " + std::to_string(index) +
             " tokens=" + TokenListText(trace[index].tokens) +
@@ -1721,6 +1780,7 @@ int main(int argc, char** argv) {
   std::uint64_t member_id[kMemberCount] = {1, 2};
   std::uint32_t budget = 8;
   std::uint32_t context = 4096;
+  std::uint32_t width = kMemberCount;
   std::uint32_t device = 0;
   std::uint32_t gid = 0;
   /// Rank-one admission ceiling; see `--worker-max-pending`.
@@ -1871,6 +1931,12 @@ int main(int argc, char** argv) {
       batched_w2 = true;
     } else if (arg == "--serial-w2") {
       serial_w2 = true;
+    } else if (arg == "--width") {
+      if (!ParseUint(next(), &width) || width < kMemberCount ||
+          width > kMaxWidth) {
+        Warn("--width requires a member count from 2 to 8");
+        return kInvalidArguments;
+      }
     } else if (arg == "--moe-input-hashes") {
       moe_input_hashes = true;
     } else if (arg == "--allreduce-bench") {
@@ -1974,6 +2040,10 @@ int main(int argc, char** argv) {
           static_cast<int>(allreduce_bench != 0) >
       1) {
     Warn("--batched-w2, --serial-w2 and --allreduce-bench are exclusive");
+    return kInvalidArguments;
+  }
+  if (width != kMemberCount && !batched_w2 && !serial_w2) {
+    Warn("--width applies only to --batched-w2 and --serial-w2");
     return kInvalidArguments;
   }
   if (device > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
@@ -2206,26 +2276,10 @@ int main(int argc, char** argv) {
             "batched-w2 model reports an MTP sidecar, which this mode refuses");
         return kInvalidArguments;
       }
-      std::vector<std::int32_t> batched_prompt[kMemberCount];
-      for (std::size_t index = 0; index < kMemberCount; ++index) {
-        batched_prompt[index] =
-            prompt_tokens[index].has_value()
-                ? SyntheticPrompt(*batched_model, *prompt_tokens[index], index)
-                : batched_model->Tokenize(prompt[index]);
-        if (batched_prompt[index].empty()) {
-          Warn("batched-w2 member " + std::to_string(index) +
-               " prompt tokenized empty");
-          return kInvalidArguments;
-        }
-        if (batched_prompt[index].size() + budget >
-            static_cast<std::size_t>(context)) {
-          Warn("batched-w2 member " + std::to_string(index) + " prompt has " +
-               std::to_string(batched_prompt[index].size()) +
-               " tokens, plus --max-tokens " + std::to_string(budget) +
-               ", which exceeds the negotiated context " +
-               std::to_string(context));
-          return kInvalidArguments;
-        }
+      std::vector<std::vector<std::int32_t>> batched_prompt;
+      if (!BatchedPrompts(*batched_model, prompt, prompt_tokens, width, budget,
+                          context, &batched_prompt)) {
+        return kInvalidArguments;
       }
       return RunBatchedW2("rank1", batched_model, batched_prompt, budget,
                           context, collectives, serial_w2,
@@ -2305,26 +2359,10 @@ int main(int argc, char** argv) {
       Warn("batched-w2 model reports an MTP sidecar, which this mode refuses");
       return kInvalidArguments;
     }
-    std::vector<std::int32_t> batched_prompt[kMemberCount];
-    for (std::size_t index = 0; index < kMemberCount; ++index) {
-      batched_prompt[index] =
-          prompt_tokens[index].has_value()
-              ? SyntheticPrompt(*batched_model, *prompt_tokens[index], index)
-              : batched_model->Tokenize(prompt[index]);
-      if (batched_prompt[index].empty()) {
-        Warn("batched-w2 member " + std::to_string(index) +
-             " prompt tokenized empty");
-        return kInvalidArguments;
-      }
-      if (batched_prompt[index].size() + budget >
-          static_cast<std::size_t>(context)) {
-        Warn("batched-w2 member " + std::to_string(index) + " prompt has " +
-             std::to_string(batched_prompt[index].size()) +
-             " tokens, plus --max-tokens " + std::to_string(budget) +
-             ", which exceeds the negotiated context " +
-             std::to_string(context));
-        return kInvalidArguments;
-      }
+    std::vector<std::vector<std::int32_t>> batched_prompt;
+    if (!BatchedPrompts(*batched_model, prompt, prompt_tokens, width, budget,
+                        context, &batched_prompt)) {
+      return kInvalidArguments;
     }
     return RunBatchedW2("rank0", batched_model, batched_prompt, budget, context,
                         collectives, serial_w2,
