@@ -47,8 +47,9 @@ token agreement in every passing run.
 Neither TP2 target is usable in practice yet.
 
 - **Q4 on TP2** works but offers nothing over one host: 26.9 against 25.9 tok/s
-  AR, one host with MTP reaches 32–59 tok/s (TP2 has no MTP), and from width 4
-  up TP2 is slower (table below).
+  AR; TP2 serving runs MTP with only one draft token (31.68/39.07 tok/s
+  mixed/repetitive at d4096, TP2.md) against one host's adaptive chain of up to
+  seven (34.57/47.92); and from width 4 up TP2 is slower (table below).
 - **Q8 on TP2** is correct (ranks agree bit for bit; a 2,117-token prompt
   decoded at 23 tok/s over HTTP) and is the reason for TP2, since Q8 does not
   fit one host. Ordinary clients cannot use it yet: requests must be greedy
@@ -124,8 +125,19 @@ limits TP2 at higher concurrency.
 The upstream headline figures (59.41 tok/s single user, 157.22 tok/s at eight
 users) are MTP on the repetitive prompt. On mixed text one-host MTP reaches
 106.47 tok/s at eight users, about AR's 108.67, so AR against AR is the matched
-comparison above. TP2 has no MTP, so on repetitive text one host with MTP leads
-TP2 by a wide margin.
+comparison above. TP2 C1 serving runs MTP but is capped at one draft token, and
+C2 refuses MTP, so on repetitive text one host with MTP still leads TP2.
+
+The one-draft cap (`serve.cpp`, from "reject unsupported concurrency early")
+has no recorded technical reason; one draft was the width qualified on
+hardware. The length controller depends only on acceptance history, never on
+timings (`mtp_policy.hpp`), so ranks with identical tokens choose identical
+draft lengths and issue identical collectives. Rank 0 already fails a request
+whose worker draft telemetry differs, and multi-row verification now agrees
+across ranks at 2, 4 and 8 rows. Lifting the cap needs a hardware
+qualification: drafts up to seven on Q4 and Q8, mixed and repetitive prompts,
+matching tokens and draft telemetry, and the speed. The rank-0 step plan would
+also carry draft lengths and acceptance, which is how C2 can admit MTP.
 
 For Q4, TP2 is a capacity path, not yet a speed path. Profiles and
 microbenchmarks show why:
