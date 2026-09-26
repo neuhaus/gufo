@@ -49,6 +49,14 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+/// Bound on rank 1's wait for one token from rank 0, on the per-token path.
+/// Generous enough to survive a scheduler hiccup or a busy peer, and short
+/// enough to fail the request well before a client gives up. This is NOT the
+/// control channel's idle command wait, which is deliberately unbounded: a
+/// worker waiting for its next command should not time out, but a worker
+/// waiting mid-decode is holding a request open and must not hang.
+constexpr std::chrono::milliseconds kStepTokenTimeout{5000};
+
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
     *error = std::move(message);
@@ -2633,7 +2641,33 @@ public:
       throw std::runtime_error(
           "Qwen3.8-Flash-Next token selection has no logits");
     }
-    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    std::int32_t token = 0;
+    {
+      // Held for the exchange only. Arming happens before Submit and disarming
+      // after Wait, so this is not contended in the normal path; the lock is
+      // here so the ordering does not have to be re-argued at each call site.
+      const std::lock_guard<std::mutex> guard(step_mutex_);
+      if (step_consumer_ != nullptr) {
+        // Rank 1 does not sample. Rank 0's token is authoritative, so the stop
+        // test below runs on the shared token and both ranks stop on it
+        // together, with no separate stop message needed.
+        std::string step_error;
+        if (!step_consumer_->Consume(step_sequence_, &token, &step_final_,
+                                     kStepTokenTimeout, &step_error)) {
+          throw std::runtime_error("TP worker step token unavailable: " +
+                                   step_error);
+        }
+      } else {
+        token = static_cast<std::int32_t>(sampler.Sample(logits));
+        if (step_publisher_ != nullptr) {
+          std::string step_error;
+          if (!step_publisher_->Publish(step_sequence_, token, false,
+                                        &step_error)) {
+            throw std::runtime_error("TP step token send failed: " + step_error);
+          }
+        }
+      }
+    }
     if (model_->IsStopToken(token)) {
       return {.stop = true, .token = 0, .piece = {}};
     }
@@ -2642,6 +2676,18 @@ public:
         .token = static_cast<TextRunnerToken>(token),
         .piece = model_->TokenText(token),
     };
+  }
+
+  /// Arm or disarm the rank-0 step plan for one request. Passing null pointers
+  /// restores independent per-rank sampling, which is the pre-step-plan
+  /// behaviour and what a rank uses when it is not the one being driven.
+  void SetStepChannel(std::shared_ptr<server::TpStepPublisher> publisher,
+                      std::shared_ptr<server::TpStepConsumer> consumer,
+                      std::uint64_t sequence) {
+    const std::lock_guard<std::mutex> guard(step_mutex_);
+    step_publisher_ = std::move(publisher);
+    step_consumer_ = std::move(consumer);
+    step_sequence_ = sequence;
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -2942,6 +2988,16 @@ private:
   bool distributed_{false};
   bool allow_distributed_snapshots_{false};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  /// Rank-0 step plan. At most one of these is set while a request is in
+  /// flight: rank 0 publishes the token it sampled, rank 1 consumes that token
+  /// instead of sampling its own. Both null means independent per-rank
+  /// sampling, which is what a single-host rank and every non-TP rank use.
+  /// `step_final_` is scratch for the consumer's out-parameter.
+  mutable std::mutex step_mutex_;
+  std::shared_ptr<server::TpStepPublisher> step_publisher_;
+  std::shared_ptr<server::TpStepConsumer> step_consumer_;
+  std::uint64_t step_sequence_{0};
+  mutable bool step_final_{false};
 };
 #endif
 
@@ -2951,6 +3007,10 @@ struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
     std::shared_ptr<TextGenerationScheduler> scheduler;
+    /// Non-null only for the Qwen3.8-Flash-Next runner, which is the one whose
+    /// `SelectNext` can publish or consume a step token. Held so the request
+    /// path can arm the rank-0 step plan without a mutable pool accessor.
+    std::shared_ptr<QwenFlashNextTextRunner> flash_next_runner;
     std::shared_ptr<TpControlChannel> control;
     std::shared_ptr<TpResponseBroker> response_broker;
     std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> communicator;
@@ -3826,6 +3886,9 @@ bool InferenceBackend::load(
         tp_config.allow_cache_reuse);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
+    // Retained before the pool takes ownership: the request path arms the
+    // rank-0 step plan on the runner, and `TextRunnerPool::runner()` is const.
+    new_state->flash_next_runner = runner;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
       runner_disk_cache = TextRunnerDiskCacheOptions{
