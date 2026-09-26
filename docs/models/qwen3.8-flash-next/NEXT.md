@@ -307,6 +307,90 @@ mirrored, so rank 1's session holds the same prefix.
 - Speed: time to first token for a turn with 8K tokens of reusable history,
   against uncached TP2 and against one host with its cache.
 
+### Qualification in progress: not finished
+
+Run on `fuzzy`/`misty` and on `fuzzy` alone, Q4 UD-Q4_K_XL, greedy, protocol
+v9, binary `1bd3cfbc…` on both hosts. **The qualification is not complete** and
+the criterion "the output equals the same conversation served uncached" is
+**not** what the code currently satisfies on TP2.
+
+**Equal where it matters.** A four-turn conversation, greedy, produced
+byte-identical output in all three configurations -- one host, one host with
+`--cache-disk`, and TP2 with `--tp-cache-reuse`:
+
+| turn | one host | one host + disk | TP2 |
+| --- | --- | --- | --- |
+| 1 | `1c650a7f…` | `1c650a7f…` | `1c650a7f…` |
+| follow-up 1 (86 cached / 27 prefill) | `1c650a7f…` | `1c650a7f…` | `1c650a7f…` |
+| follow-up 2 (176 / 24) | `ba19e9c3…` | `ba19e9c3…` | `ba19e9c3…` |
+| follow-up 3 (201 / 23) | `ec7d56a0…` | `ec7d56a0…` | `ec7d56a0…` |
+
+Cached equalled uncached on every turn on both paths, and the live-frontier
+reuse path is identical on both: 86, then 176, then 201 cached tokens with
+23--27 prefilled. TP2 produced no divergence warning and no rank-1 error, and
+the end-of-request digest did not fail.
+
+**The restore path is not equivalent, and that is the finding.** Replaying an
+*identical* request is the one shape that selects the snapshot rather than the
+live frontier, because the live frontier is then longer than the prompt:
+
+| | one host | TP2 |
+| --- | --- | --- |
+| cached tokens | 23 (the whole prompt) | 16 |
+| prefilled | 0 | 7 |
+| restore | 4.2 ms | 93.1 ms |
+
+The cause is `inference_backend.cpp`, the `allow_distributed_snapshots_ &&
+request.cache_prompt` block that re-renders the conversation with
+`add_generation_prompt = false` and sets `cache_prefix_tokens` to the common
+prefix with that stripped render. It is TP2-only, so on TP2 the checkpoint is
+the prompt minus its generation prompt, and the generation prompt is
+re-prefilled on every hit. Two consequences:
+
+- The hit is systematically smaller than the prompt by the length of the
+  generation prompt. A reported "55 of 78 kept" is this, not a defect in the
+  matching: `common_prefix_tokens` in the request log is exactly the stripped
+  length.
+- Output is still byte-identical, so this is a cache-behaviour and cost
+  difference, not a correctness one. But it means the two paths do not have the
+  same cache semantics, and a cross-path comparison of `cached_tokens` is
+  meaningless.
+
+TP2 restores **fewer** tokens in **22x** the time because the mirrored
+`kRestore` waits for rank 1 to restore as well; that 93.1 ms is the dominant
+cost of a hit.
+
+**Reuse currently costs more than it saves at these sizes.** On a 200-token
+prompt the cached TTFT was 463 ms against 243 ms for a full prefill, and
+`prefill_tps` was 58--88 on hits against 459--709 on misses: restoring a
+~120 MB snapshot costs more than the 23-token prefill it avoids. This is the
+speed criterion above, and it currently fails at small prompt sizes.
+
+**Not reproduced: a cached/uncached difference.** The difference that prompted
+this qualification could not be reproduced in any shape tried -- multi-turn
+append, agent-style discard, branch, identical replay, with and without
+`--cache-disk`, one host and TP2. Cached and uncached were byte-identical
+everywhere.
+
+**Unresolved: the output is not invariant across server lifetimes.** The same
+request on the same binary produced two different *stable* hashes during one
+session, `1c650a7f…` early and `e6fb9c8d…` later, on the one-host path *and*
+on TP2, each perfectly reproducible within a server's lifetime (4/4, 6/6, 9/9).
+It is not explained by cached versus uncached. It did not reproduce under six
+rounds of the target request alone, nor under six rounds interleaved with
+cached churn. This is a better candidate for the original "different in
+responses" observation than the cache is, and it needs its own bisect: alternate
+the two paths on an identically prepared GPU state and see whether the hash
+tracks allocator or residency state.
+
+Still to qualify: branching to an older boundary, eviction under a small
+budget, sampled and MTP requests with reuse, disconnect during capture, and the
+8K-history speed case.
+
+**Environment.** The two ranks need the host to themselves. A leftover server
+container left rank 0 with 36 GiB free and it failed with `hipMalloc failed for
+stacked tensor`, which rank 1 reports as a misleading handshake error.
+
 ## Plan
 
 1. **Executor** (current work, above). It covers what the earlier plan split

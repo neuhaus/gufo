@@ -136,7 +136,8 @@ build/gpu-tp2/gufo serve llm \
 ```
 
 For full Q8 use the first `Q8_0` shard; the Q8 PLE loader must be in the build.
-`--tp-cache-reuse` is refused until snapshots are mirrored.
+`--tp-cache-reuse` now mirrors snapshots and prefix reuse to rank 1 (protocol
+v9). It is **not qualified yet** -- see [Cache reuse](#cache-reuse) below.
 
 ### Request limits
 
@@ -146,8 +147,40 @@ host. The server still refuses:
 | Refused | Why |
 | --- | --- |
 | More than one session, pending request or connection; request timeouts | Rank 1 executes one request's calls at a time. |
-| `--tp-cache-reuse`, disk cache | Snapshots and prefix reuse are not mirrored. |
+| Disk cache | Snapshots are rank-local and never serialized. |
 | Vision input | Not implemented for two ranks. |
+
+### Cache reuse
+
+`--tp-cache-reuse` forwards the inner runner's `snapshot`, `fork`,
+`prefix_reuse` and `preserve_snapshot_prefix` capabilities instead of clearing
+them, and adds the `snapshot`, `restore`, `drop`, `reuse` and `cancel-prepare`
+instructions. Snapshot bytes stay local; only monotonic snapshot ids cross the
+control channel, and the two hosts take the smaller `HostSnapshotBudgetBytes`
+as the shared budget so rank 1's table cannot outgrow what rank 0 expects.
+
+Qualified so far, and **not finished**: a four-turn greedy conversation is
+byte-identical across one host, one host with a disk cache, and TP2, and cached
+equals uncached on every turn on both paths. Two things are open.
+
+The **restore** path differs between the paths. An identical-request replay is
+the one shape that selects the snapshot rather than the live frontier, and it
+restores the whole prompt on one host (23 cached, 0 prefilled, 4.2 ms) but only
+16 of 23 on TP2, re-prefilling 7. The cause is a TP2-only block in
+`inference_backend.cpp` that re-renders the conversation with
+`add_generation_prompt = false` and uses the common prefix with that stripped
+render as `cache_prefix_tokens`. Output is byte-identical, so this is cache
+semantics and cost rather than correctness, but the two paths do not share cache
+semantics and their `cached_tokens` are not comparable. TP2 also restores fewer
+tokens in 22x the time (93.1 ms against 4.2 ms), because the mirrored `kRestore`
+waits for rank 1.
+
+Reuse is currently a **net loss at small prompt sizes**: 463 ms cached TTFT
+against 243 ms for a full prefill on a 200-token prompt, because a ~120 MB
+snapshot restore costs more than the 23-token prefill it avoids.
+
+`NEXT.md` records the open items, including a cross-lifetime output difference
+that is not caused by the cache and is still unbisected.
 
 ### Probes
 
