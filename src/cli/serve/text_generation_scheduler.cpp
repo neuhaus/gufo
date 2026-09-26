@@ -55,6 +55,10 @@ struct OutputBudget {
 
 struct ScheduledRequest {
   std::uint64_t id{0};
+  // C2 admission identity. Both stay zero for ordinary C1 submissions.
+  std::uint64_t cohort_id{0};
+  std::uint64_t cohort_member_id{0};
+  std::size_t cohort_member_index{0};
   std::string client_id{"anonymous"};
   std::vector<TextRunnerToken> prompt;
   std::shared_ptr<const TextPromptContext> prompt_context;
@@ -95,6 +99,9 @@ struct ScheduledRequest {
 
 struct PendingClient {
   std::string client_id;
+  // C1 groups use zero. A nonzero value keeps one cohort's members together
+  // and ordered even when the members declare different clients.
+  std::uint64_t cohort_id{0};
   std::deque<std::shared_ptr<ScheduledRequest>> requests;
 };
 
@@ -292,6 +299,92 @@ struct TextGenerationScheduler::Impl {
                       client.requests.end());
     }
     return snapshot;
+  }
+
+  [[nodiscard]] std::shared_ptr<ScheduledRequest> PrepareRequest(
+      std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
+      const sampling::SamplingConfig& sampling,
+      const CancellationCheck& is_cancelled, bool publish_token_pieces,
+      RequestMetadata metadata, std::uint64_t id, std::uint64_t cohort_id,
+      std::uint64_t cohort_member_id, std::size_t cohort_member_index) {
+    auto request = std::make_shared<ScheduledRequest>();
+    request->stop_filter =
+        StopSequenceFilter(std::move(metadata.stop_sequences));
+    request->id = id;
+    request->cohort_id = cohort_id;
+    request->cohort_member_id = cohort_member_id;
+    request->cohort_member_index = cohort_member_index;
+    request->client_id = metadata.client_id.empty()
+                             ? "anonymous"
+                             : std::move(metadata.client_id);
+    request->result.prompt_tokens = prompt.size();
+    request->result.client_id = request->client_id;
+    request->result.configured_active_prefill_tokens =
+        prefill_policy.decode_active_tokens;
+    request->result.requested_logical_concurrency = runner_pool->capacity();
+    request->result.execution_plan =
+        runner_pool->capacity() == 1 ? "serial-c1" : "serial-fallback";
+    request->prompt = std::move(prompt);
+    request->prompt_context = std::move(metadata.prompt_context);
+    request->cache_prompt = metadata.cache_prompt;
+    request->cache_prefix_tokens = metadata.cache_prefix_tokens;
+    // Callers reject a prompt that fills the context.
+    const std::size_t context = runner_pool->runner().Descriptor().max_context;
+    const std::size_t available =
+        context > request->prompt.size() ? context - request->prompt.size() : 0;
+    request->token_limit =
+        max_tokens > 0 ? std::min(max_tokens, available) : available;
+    request->sampling = sampling;
+    request->external_cancellation = is_cancelled;
+    request->publish_token_pieces = publish_token_pieces;
+    request->request_start = metadata.request_start;
+    request->deadline = metadata.deadline;
+    if (!request->deadline.has_value() &&
+        scheduler_policy.request_timeout.count() > 0) {
+      request->deadline =
+          request->request_start + scheduler_policy.request_timeout;
+    }
+    request->max_output_bytes = scheduler_policy.max_output_bytes_per_request;
+    request->max_buffered_output_bytes =
+        scheduler_policy.max_buffered_output_bytes_per_request;
+    request->output_budget = output_budget;
+    return request;
+  }
+
+  [[nodiscard]] PendingClient* FindC1Client(const std::string& client_id) {
+    const auto client = std::find_if(
+        queued_clients.begin(), queued_clients.end(),
+        [&](const PendingClient& pending) {
+          return pending.cohort_id == 0 && pending.client_id == client_id;
+        });
+    return client == queued_clients.end() ? nullptr : &*client;
+  }
+
+  [[nodiscard]] std::size_t QueuedClientCount(
+      const std::string& client_id) const {
+    std::size_t count = 0;
+    for (const auto& pending : queued_clients) {
+      for (const auto& request : pending.requests) {
+        count += request->client_id == client_id ? 1 : 0;
+      }
+    }
+    return count;
+  }
+
+  [[nodiscard]] bool FitsClientLimits(
+      const std::array<std::shared_ptr<ScheduledRequest>, kCohort2MemberCount>&
+          requests) const {
+    for (const auto& request : requests) {
+      std::size_t incoming = 0;
+      for (const auto& member : requests) {
+        incoming += member->client_id == request->client_id ? 1 : 0;
+      }
+      if (QueuedClientCount(request->client_id) + incoming >
+          scheduler_policy.max_pending_requests_per_client) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void FinalizeResult(const std::shared_ptr<ScheduledRequest>& request,
@@ -1194,6 +1287,7 @@ struct TextGenerationScheduler::Impl {
   bool stopping{false};
   std::size_t consecutive_active_prefill_chunks{0};
   std::atomic<std::uint64_t> next_request_id{1};
+  std::atomic<std::uint64_t> next_cohort_id{1};
   std::jthread worker;
 };
 
@@ -1216,6 +1310,13 @@ TextGenerationScheduler::Request& TextGenerationScheduler::Request::operator=(
   }
   return *this;
 }
+
+TextGenerationScheduler::Cohort::Cohort(
+    std::uint64_t id, std::array<std::uint64_t, kCohort2MemberCount> member_ids,
+    std::array<Request, kCohort2MemberCount> members)
+    : id_(id),
+      member_ids_(std::move(member_ids)),
+      members_(std::move(members)) {}
 
 TextGenerationScheduler::Request::operator bool() const noexcept {
   return impl_ != nullptr && impl_->request != nullptr;
@@ -1363,40 +1464,11 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
     throw std::invalid_argument(
         "stop sequences require exact incremental token decoding");
 
-  auto request = std::make_shared<ScheduledRequest>();
-  request->stop_filter = StopSequenceFilter(std::move(metadata.stop_sequences));
-  request->id = impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
-  request->client_id =
-      metadata.client_id.empty() ? "anonymous" : std::move(metadata.client_id);
-  request->result.prompt_tokens = prompt.size();
-  request->result.client_id = request->client_id;
-  request->result.configured_active_prefill_tokens =
-      impl_->prefill_policy.decode_active_tokens;
-  request->result.requested_logical_concurrency =
-      impl_->runner_pool->capacity();
-  request->result.execution_plan =
-      impl_->runner_pool->capacity() == 1 ? "serial-c1" : "serial-fallback";
-  request->prompt = std::move(prompt);
-  request->prompt_context = std::move(metadata.prompt_context);
-  request->cache_prompt = metadata.cache_prompt;
-  request->cache_prefix_tokens = metadata.cache_prefix_tokens;
-  request->token_limit =
-      max_tokens > 0 ? std::min(max_tokens, available) : available;
-  request->sampling = sampling;
-  request->external_cancellation = is_cancelled;
-  request->publish_token_pieces = publish_token_pieces;
-  request->request_start = metadata.request_start;
-  request->deadline = metadata.deadline;
-  if (!request->deadline.has_value() &&
-      impl_->scheduler_policy.request_timeout.count() > 0) {
-    request->deadline =
-        request->request_start + impl_->scheduler_policy.request_timeout;
-  }
-  request->max_output_bytes =
-      impl_->scheduler_policy.max_output_bytes_per_request;
-  request->max_buffered_output_bytes =
-      impl_->scheduler_policy.max_buffered_output_bytes_per_request;
-  request->output_budget = impl_->output_budget;
+  const std::uint64_t id =
+      impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
+  auto request = impl_->PrepareRequest(std::move(prompt), max_tokens, sampling,
+                                       is_cancelled, publish_token_pieces,
+                                       std::move(metadata), id, 0, 0, 0);
 
   {
     const std::lock_guard<std::mutex> lock(impl_->queue_mutex);
@@ -1408,26 +1480,22 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       throw TextGenerationError(TextGenerationErrorCode::kQueueFull,
                                 "text generation pending queue is full");
     }
-    auto client =
-        std::find_if(impl_->queued_clients.begin(), impl_->queued_clients.end(),
-                     [&](const PendingClient& pending) {
-                       return pending.client_id == request->client_id;
-                     });
-    if (client != impl_->queued_clients.end() &&
-        client->requests.size() >=
-            impl_->scheduler_policy.max_pending_requests_per_client) {
+    auto* client = impl_->FindC1Client(request->client_id);
+    if (impl_->QueuedClientCount(request->client_id) >=
+        impl_->scheduler_policy.max_pending_requests_per_client) {
       throw TextGenerationError(TextGenerationErrorCode::kClientQueueFull,
                                 "text generation client pending queue is full");
     }
-    if (client == impl_->queued_clients.end()) {
+    if (client == nullptr) {
       impl_->queued_clients.push_back({
           .client_id = request->client_id,
           .requests = {},
       });
-      client = std::prev(impl_->queued_clients.end());
+      client = &*std::prev(impl_->queued_clients.end());
     }
     request->result.queue_depth_at_submit = impl_->queued_count + 1;
-    request->result.client_queue_depth_at_submit = client->requests.size() + 1;
+    request->result.client_queue_depth_at_submit =
+        impl_->QueuedClientCount(request->client_id) + 1;
     client->requests.push_back(request);
     ++impl_->queued_count;
   }
@@ -1453,6 +1521,110 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   config.temperature = temperature;
   return Submit(std::move(prompt), max_tokens, config, is_cancelled,
                 publish_token_pieces, std::move(metadata));
+}
+
+TextGenerationScheduler::Cohort TextGenerationScheduler::SubmitCohort(
+    std::vector<CohortMemberRequest> members) {
+  if (members.size() != kCohort2MemberCount) {
+    throw std::invalid_argument(
+        "text scheduler C2 cohort requires exactly two members");
+  }
+  for (std::size_t index = 0; index < members.size(); ++index) {
+    if (members[index].member_id == 0) {
+      throw std::invalid_argument(
+          "text scheduler C2 cohort member ID must be nonzero");
+    }
+    if (members[index].prompt.empty()) {
+      throw std::invalid_argument("text scheduler prompt must not be empty");
+    }
+    const auto context = impl_->runner_pool->runner().Descriptor().max_context;
+    if (members[index].prompt.size() >= context) {
+      throw std::length_error(
+          "prompt has " + std::to_string(members[index].prompt.size()) +
+          " tokens but the context is " + std::to_string(context) +
+          "; increase --context or shorten the conversation");
+    }
+    members[index].sampling.Validate();
+    if (members[index].max_tokens == 0 ||
+        !members[index].sampling.can_use_unmodified_argmax() ||
+        static_cast<bool>(members[index].is_cancelled) ||
+        members[index].publish_token_pieces ||
+        members[index].metadata.prompt_context != nullptr ||
+        members[index].metadata.cache_prompt ||
+        members[index].metadata.cache_prefix_tokens != 0 ||
+        members[index].metadata.deadline.has_value() ||
+        !members[index].metadata.stop_sequences.empty()) {
+      throw std::invalid_argument(
+          "text scheduler C2 cohort requires greedy, non-streaming, uncached "
+          "members without prompt continuation, cancellation, deadlines, or "
+          "stop sequences");
+    }
+    for (std::size_t previous = 0; previous < index; ++previous) {
+      if (members[previous].member_id == members[index].member_id) {
+        throw std::invalid_argument(
+            "text scheduler C2 cohort member IDs must be unique");
+      }
+    }
+  }
+
+  const std::uint64_t cohort_id =
+      impl_->next_cohort_id.fetch_add(1, std::memory_order_relaxed);
+  std::array<std::uint64_t, kCohort2MemberCount> member_ids{};
+  std::array<std::shared_ptr<ScheduledRequest>, kCohort2MemberCount> requests;
+  for (std::size_t index = 0; index < members.size(); ++index) {
+    member_ids[index] = members[index].member_id;
+    const std::uint64_t request_id =
+        impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
+    requests[index] = impl_->PrepareRequest(
+        std::move(members[index].prompt), members[index].max_tokens,
+        members[index].sampling, members[index].is_cancelled,
+        members[index].publish_token_pieces, std::move(members[index].metadata),
+        request_id, cohort_id, members[index].member_id, index);
+  }
+
+  {
+    const std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    if (impl_->stopping) {
+      throw TextGenerationError(TextGenerationErrorCode::kSchedulerStopping,
+                                "text generation scheduler is stopping");
+    }
+    if (impl_->queued_count + kCohort2MemberCount >
+        impl_->scheduler_policy.max_pending_requests) {
+      throw TextGenerationError(TextGenerationErrorCode::kQueueFull,
+                                "text generation pending queue is full");
+    }
+    if (!impl_->FitsClientLimits(requests)) {
+      throw TextGenerationError(TextGenerationErrorCode::kClientQueueFull,
+                                "text generation client pending queue is full");
+    }
+
+    // Build the ordered group before touching the shared queue, so a failed
+    // allocation cannot leave half a cohort pending.
+    PendingClient cohort;
+    cohort.client_id = requests.front()->client_id;
+    cohort.cohort_id = cohort_id;
+    for (const auto& request : requests) {
+      std::size_t incoming = 0;
+      for (const auto& member : requests) {
+        incoming += member->client_id == request->client_id ? 1 : 0;
+      }
+      request->result.queue_depth_at_submit =
+          impl_->queued_count + kCohort2MemberCount;
+      request->result.client_queue_depth_at_submit =
+          impl_->QueuedClientCount(request->client_id) + incoming;
+      cohort.requests.push_back(request);
+    }
+    impl_->queued_clients.push_back(std::move(cohort));
+    impl_->queued_count += kCohort2MemberCount;
+  }
+  impl_->queue_condition.notify_one();
+
+  std::array<Request, kCohort2MemberCount> handles;
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    handles[index] =
+        Request(std::make_unique<Request::Impl>(std::move(requests[index])));
+  }
+  return Cohort(cohort_id, std::move(member_ids), std::move(handles));
 }
 
 }  // namespace gufo::server

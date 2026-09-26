@@ -1,6 +1,7 @@
 #include "src/cli/serve/text_generation_scheduler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -18,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,7 @@
 namespace {
 
 using gufo::server::ChatRequest;
+using gufo::server::TextCohortMemberRequest;
 using gufo::server::TextDecodeSelection;
 using gufo::server::TextDecodeStep;
 using gufo::server::TextExecutionPlan;
@@ -36,6 +39,7 @@ using gufo::server::TextGenerationScheduler;
 using gufo::server::TextModelRunner;
 using gufo::server::TextPrefillPolicy;
 using gufo::server::TextPrefillStep;
+using gufo::server::TextRequestCohort;
 using gufo::server::TextRequestMetadata;
 using gufo::server::TextRequestPhase;
 using gufo::server::TextRunnerAdvance;
@@ -48,6 +52,10 @@ using gufo::server::TextRunnerToken;
 using gufo::server::TextSchedulerPolicy;
 
 constexpr auto kTestTimeout = std::chrono::seconds{5};
+
+static_assert(!std::is_copy_constructible_v<TextGenerationScheduler::Request>);
+static_assert(std::is_move_constructible_v<TextRequestCohort>);
+static_assert(!std::is_copy_constructible_v<TextRequestCohort>);
 
 void Expect(bool condition, std::string_view message) {
   if (!condition) {
@@ -543,6 +551,197 @@ TextRequestMetadata ClientMetadata(std::string client_id) {
       .deadline = std::nullopt,
       .request_start = TextGenerationScheduler::Clock::now(),
   };
+}
+
+TextCohortMemberRequest MakeCohortMember(std::uint64_t member_id,
+                                         TextRunnerToken label,
+                                         std::string client_id) {
+  auto metadata = ClientMetadata(std::move(client_id));
+  metadata.cache_prompt = false;
+  metadata.cache_prefix_tokens = 0;
+  return {
+      .member_id = member_id,
+      .prompt = {label, label + 10},
+      .max_tokens = 2,
+      .sampling = {},
+      .is_cancelled = {},
+      .publish_token_pieces = false,
+      .metadata = std::move(metadata),
+  };
+}
+
+void RequireCohortRejected(TextGenerationScheduler& scheduler,
+                           std::vector<TextCohortMemberRequest> members,
+                           std::string_view message) {
+  bool rejected = false;
+  try {
+    (void)scheduler.SubmitCohort(std::move(members));
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  Expect(rejected, message);
+}
+
+void TestCohortAdmissionPreservesMemberOrder() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_prefill_label = 1;
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {
+                                     .max_pending_requests = 4,
+                                     .max_pending_requests_per_client = 1,
+                                 });
+
+  auto cohort =
+      scheduler->SubmitCohort({MakeCohortMember(41, 1, "member-zero"),
+                               MakeCohortMember(42, 2, "member-one")});
+  Expect(cohort.id() != 0, "an admitted cohort receives a scheduler identity");
+  Expect(cohort.member_ids() == std::array<std::uint64_t, 2>({41, 42}),
+         "the cohort handle preserves external member order");
+  control->WaitForPrefill(1);
+  auto other = scheduler->Submit({3}, 1, 0.0F, {}, false,
+                                 ClientMetadata("unrelated-client"));
+  control->ReleasePrefill();
+
+  const auto first = cohort.members()[0].Wait();
+  const auto second = cohort.members()[1].Wait();
+  const auto unrelated = other.Wait();
+  Expect(first.tokens == ExpectedTokens(1, 2) &&
+             second.tokens == ExpectedTokens(2, 2) &&
+             unrelated.tokens == ExpectedTokens(3, 1),
+         "cohort and unrelated requests keep isolated C1 trajectories");
+
+  std::vector<TextRunnerToken> prefill_order;
+  for (const auto& event : control->Events()) {
+    if (event.kind == EventKind::kPrefill) {
+      prefill_order.push_back(event.label);
+    }
+  }
+  Expect(prefill_order == std::vector<TextRunnerToken>({1, 2, 3}),
+         "an unrelated client cannot overtake a queued cohort member");
+  Expect(first.execution_plan == "serial-c1" &&
+             second.execution_plan == "serial-c1" &&
+             first.physical_execution_width == 1 &&
+             second.physical_execution_width == 1,
+         "cohort admission alone selects no physical C2 execution plan");
+  Expect(cohort.members()[0].id() < cohort.members()[1].id(),
+         "ordered cohort members retain distinct scheduler request IDs");
+}
+
+void TestCohortRejectsInvalidMembershipBeforeModelWork() {
+  auto control = std::make_shared<FakeControl>();
+  auto scheduler = MakeScheduler(control, 1);
+  const std::size_t initial_states =
+      control->states_created.load(std::memory_order_relaxed);
+
+  RequireCohortRejected(*scheduler, {}, "an empty C2 cohort is rejected");
+  RequireCohortRejected(*scheduler, {MakeCohortMember(41, 1, "member-zero")},
+                        "an incomplete C2 cohort is rejected");
+  RequireCohortRejected(*scheduler,
+                        {MakeCohortMember(41, 1, "member-zero"),
+                         MakeCohortMember(42, 2, "member-one"),
+                         MakeCohortMember(43, 3, "member-two")},
+                        "a third member cannot join the fixed C2 cohort");
+  RequireCohortRejected(*scheduler,
+                        {MakeCohortMember(41, 1, "member-zero"),
+                         MakeCohortMember(41, 2, "member-one")},
+                        "duplicate C2 cohort member IDs are rejected");
+  RequireCohortRejected(*scheduler,
+                        {MakeCohortMember(0, 1, "member-zero"),
+                         MakeCohortMember(42, 2, "member-one")},
+                        "a zero C2 cohort member ID is rejected");
+  auto sampled = MakeCohortMember(43, 3, "member-zero");
+  sampled.sampling.temperature = 0.5F;
+  RequireCohortRejected(
+      *scheduler, {std::move(sampled), MakeCohortMember(44, 4, "member-one")},
+      "a sampled C2 cohort member is rejected");
+  auto streaming = MakeCohortMember(45, 5, "member-zero");
+  streaming.publish_token_pieces = true;
+  RequireCohortRejected(
+      *scheduler, {std::move(streaming), MakeCohortMember(46, 6, "member-one")},
+      "a streaming C2 cohort member is rejected");
+  auto cached = MakeCohortMember(47, 7, "member-zero");
+  cached.metadata.cache_prompt = true;
+  RequireCohortRejected(
+      *scheduler, {std::move(cached), MakeCohortMember(48, 8, "member-one")},
+      "a cached C2 cohort member is rejected");
+  auto deadline = MakeCohortMember(49, 9, "member-zero");
+  deadline.metadata.deadline =
+      TextGenerationScheduler::Clock::now() + std::chrono::seconds(1);
+  RequireCohortRejected(
+      *scheduler, {std::move(deadline), MakeCohortMember(50, 10, "member-one")},
+      "a C2 cohort member with a deadline is rejected");
+  Expect(
+      control->states_created.load(std::memory_order_relaxed) == initial_states,
+      "invalid cohorts are rejected before any runner state is created");
+  Expect(control->Events().empty(),
+         "invalid cohorts are rejected before any model prefill work");
+
+  auto cohort =
+      scheduler->SubmitCohort({MakeCohortMember(51, 5, "member-zero"),
+                               MakeCohortMember(52, 6, "member-one")});
+  const auto first = cohort.members()[0].Wait();
+  const auto second = cohort.members()[1].Wait();
+  Expect(first.tokens == ExpectedTokens(5, 2) &&
+             second.tokens == ExpectedTokens(6, 2),
+         "a valid cohort still executes as independent C1 work");
+  Expect(
+      control->states_created.load(std::memory_order_relaxed) == initial_states,
+      "only the two valid cohort members traverse the one runner state");
+}
+
+void TestCohortQueueAdmissionIsAtomic() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {
+                                     .max_pending_requests = 1,
+                                     .max_pending_requests_per_client = 1,
+                                 });
+
+  auto active = scheduler->Submit({1}, 4, 0.0F, {}, false,
+                                  ClientMetadata("active-client"));
+  control->WaitForAdvance(1);
+  bool queue_full = false;
+  try {
+    (void)scheduler->SubmitCohort({MakeCohortMember(61, 6, "member-zero"),
+                                   MakeCohortMember(62, 7, "member-one")});
+  } catch (const TextGenerationError& error) {
+    queue_full = error.code() == TextGenerationErrorCode::kQueueFull;
+  }
+  Expect(queue_full, "a cohort is rejected unless both members fit the queue");
+  Expect(control->states_created.load(std::memory_order_relaxed) == 1,
+         "a queue-rejected cohort never admits half a cohort");
+
+  control->ReleaseAdvance();
+  Expect(active.Wait().tokens == ExpectedTokens(1, 4),
+         "a rejected cohort does not disturb active C1 work");
+
+  auto shared_control = std::make_shared<FakeControl>();
+  shared_control->block_advance_label = 2;
+  auto shared_scheduler =
+      MakeScheduler(shared_control, 1, {},
+                    {
+                        .max_pending_requests = 4,
+                        .max_pending_requests_per_client = 1,
+                    });
+  auto shared = shared_scheduler->Submit({2}, 4, 0.0F, {}, false,
+                                         ClientMetadata("shared-client"));
+  shared_control->WaitForAdvance(2);
+  bool client_full = false;
+  try {
+    (void)shared_scheduler->SubmitCohort(
+        {MakeCohortMember(71, 7, "shared-client"),
+         MakeCohortMember(72, 8, "shared-client")});
+  } catch (const TextGenerationError& error) {
+    client_full = error.code() == TextGenerationErrorCode::kClientQueueFull;
+  }
+  Expect(client_full,
+         "both cohort members count against one client's pending limit");
+  Expect(shared_control->states_created.load(std::memory_order_relaxed) == 1,
+         "a client-rejected cohort never admits half a cohort");
+  shared_control->ReleaseAdvance();
+  Expect(shared.Wait().tokens == ExpectedTokens(2, 4),
+         "a client-rejected cohort does not disturb active C1 work");
 }
 
 void TestIdlePrefillUsesBulkWorkUnit() {
@@ -1595,6 +1794,9 @@ int main() {
     }
   }
   TestNonIncrementalRunnerFallsBackSafely();
+  TestCohortAdmissionPreservesMemberOrder();
+  TestCohortRejectsInvalidMembershipBeforeModelWork();
+  TestCohortQueueAdmissionIsAtomic();
   TestPendingLimitsRejectBeforeStateAdmission();
   TestPendingClientsAreRoundRobinAndIndividuallyBounded();
   TestExpiredQueuedRequestNeverConsumesState();

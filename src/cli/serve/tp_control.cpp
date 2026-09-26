@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -22,17 +23,19 @@
 #include <unordered_map>
 #include <utility>
 
+#include "src/core/crypto/sha256.hpp"
+
 namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion =
-    4;  // operation scope and cache-policy parity
+constexpr std::uint16_t kVersion = 5;          // ordered C1/C2 cohort envelopes
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
 constexpr std::size_t kMaxPayloadBytes = 16U << 20;
 constexpr std::size_t kMaxPromptTokens = 1U << 20;
+constexpr std::size_t kMaxCohortMembers = 2;
 constexpr std::size_t kMaxClientIdBytes = 4096;
 constexpr std::size_t kMaxErrorBytes = 1U << 20;
 constexpr std::size_t kMaxAuthTokenBytes = 4096;
@@ -95,7 +98,295 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
   return true;
 }
 
+void AppendBytes(std::vector<std::uint8_t>* out,
+                 std::span<const std::uint8_t> bytes) {
+  out->insert(out->end(), bytes.begin(), bytes.end());
+}
+
+bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
+               std::span<std::uint8_t> bytes, std::string* error) {
+  if (*offset > data.size() || bytes.size() > data.size() - *offset) {
+    SetError(error, "TP control payload is truncated");
+    return false;
+  }
+  std::memcpy(bytes.data(), data.data() + *offset, bytes.size());
+  *offset += bytes.size();
+  return true;
+}
+
+[[nodiscard]] bool IsZeroDigest(const TpPlanDigest& digest) noexcept {
+  return std::ranges::all_of(digest,
+                             [](std::uint8_t byte) { return byte == 0; });
+}
+
+[[nodiscard]] bool HasLegacyCommandFields(const TpControlCommand& command) {
+  return command.max_tokens != 0 || command.cache_prompt ||
+         command.cache_prefix_tokens != 0 || !command.prompt_tokens.empty() ||
+         !command.client_id.empty();
+}
+
+[[nodiscard]] bool HasLegacyResponseFields(const TpControlResponse& response) {
+  return !response.tokens.empty() || response.draft_tokens != 0 ||
+         response.draft_accepted_tokens != 0 ||
+         response.cached_prompt_tokens != 0 ||
+         response.cache_snapshot_bytes != 0;
+}
+
+[[nodiscard]] std::vector<TpControlMemberRequest> EffectiveCommandMembers(
+    const TpControlCommand& command) {
+  if (command.kind == TpControlCommandKind::kSingle &&
+      !command.members.empty()) {
+    return command.members;
+  }
+  if (command.kind == TpControlCommandKind::kSingle) {
+    return {{
+        .member_id = command.sequence,
+        .max_tokens = command.max_tokens,
+        .cache_prompt = command.cache_prompt,
+        .cache_prefix_tokens = command.cache_prefix_tokens,
+        .prompt_tokens = command.prompt_tokens,
+        .client_id = command.client_id,
+    }};
+  }
+  return command.members;
+}
+
+void HashString(crypto::Sha256Hasher* hash, std::string_view value) {
+  std::vector<std::uint8_t> encoded;
+  AppendU32(&encoded, static_cast<std::uint32_t>(value.size()));
+  encoded.insert(encoded.end(), value.begin(), value.end());
+  hash->Update(encoded);
+}
+
+void HashU32(crypto::Sha256Hasher* hash, std::uint32_t value) {
+  std::array<std::uint8_t, 4> encoded{};
+  for (unsigned shift = 0; shift < 32; shift += 8) {
+    encoded[shift / 8] = static_cast<std::uint8_t>(value >> shift);
+  }
+  hash->Update(encoded);
+}
+
+void HashU64(crypto::Sha256Hasher* hash, std::uint64_t value) {
+  std::array<std::uint8_t, 8> encoded{};
+  for (unsigned shift = 0; shift < 64; shift += 8) {
+    encoded[shift / 8] = static_cast<std::uint8_t>(value >> shift);
+  }
+  hash->Update(encoded);
+}
+
+void HashPromptTokens(crypto::Sha256Hasher* hash,
+                      std::span<const std::int32_t> tokens) {
+  std::vector<std::uint8_t> encoded;
+  encoded.reserve(tokens.size() * sizeof(std::uint32_t));
+  for (const auto token : tokens) {
+    AppendU32(&encoded, static_cast<std::uint32_t>(token));
+  }
+  hash->Update(encoded);
+}
+
+[[nodiscard]] bool ValidateMemberRequest(const TpControlMemberRequest& member,
+                                         std::string* error) {
+  if (member.max_tokens == 0 || member.prompt_tokens.empty() ||
+      member.prompt_tokens.size() > kMaxPromptTokens ||
+      member.cache_prefix_tokens > member.prompt_tokens.size() ||
+      member.client_id.size() > kMaxClientIdBytes ||
+      std::ranges::any_of(member.prompt_tokens,
+                          [](std::int32_t token) { return token < 0; })) {
+    SetError(error, "TP control cohort member request is invalid");
+    return false;
+  }
+  return true;
+}
+
+[[nodiscard]] bool ValidateMemberResponse(const TpControlMemberResponse& member,
+                                          std::string* error) {
+  if (member.tokens.size() > kMaxPromptTokens) {
+    SetError(error, "TP control cohort member response is too large");
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
+
+TpPlanDigest ComputeTpExecutionPlanDigest(const TpControlCommand& command) {
+  const auto members = EffectiveCommandMembers(command);
+  crypto::Sha256Hasher hash;
+  HashString(&hash, "gufo.tp-control.execution-plan.v1");
+  HashU32(&hash, static_cast<std::uint32_t>(command.kind));
+  HashU64(&hash, command.kind == TpControlCommandKind::kSingle
+                     ? command.sequence
+                     : command.cohort_id);
+  HashU32(&hash, static_cast<std::uint32_t>(members.size()));
+  HashU32(&hash, static_cast<std::uint32_t>(members.size()));
+  // Execution shape. Every plan that exists today is serial: one request
+  // decodes at a time and no prefill is batched. A C2 cohort is two sequential
+  // single-row executions, not one two-row one, so a cohort is NOT a width-2
+  // execution.
+  //
+  // What each position MEANS was never established, so the values are left
+  // exactly as they were rather than being given invented names. Do not
+  // reorder or reinterpret them: that would silently change every C2 digest.
+  //
+  // Known limitation: this function cannot distinguish a serial cohort from a
+  // batched one, because the execution width is not carried on the wire. Both
+  // ranks hash the same command bytes, so comparing digests proves the command
+  // was not mutated -- it does NOT prove the two ranks will execute the same
+  // way. Closing that needs either an execution-width field on the command or
+  // a distinct command kind, and neither should be guessed before a batched
+  // runner exists to describe.
+  if (command.kind == TpControlCommandKind::kCohort2Ar) {
+    constexpr std::uint32_t kC2Shape0 = 0;
+    constexpr std::uint32_t kC2Shape1 = 1;
+    constexpr std::uint32_t kC2Shape2 = 0;
+    constexpr std::uint32_t kC2Shape3 = 1;
+    HashU32(&hash, kC2Shape0);
+    HashU32(&hash, kC2Shape1);
+    HashU32(&hash, kC2Shape2);
+    HashU32(&hash, kC2Shape3);
+  } else {
+    // The C1 layout is a single field, not a prefix of the C2 layout, and
+    // nothing establishes that it denotes the same quantity as any of the
+    // four. Hashed as zero, unchanged.
+    constexpr std::uint32_t kC1Shape = 0;
+    HashU32(&hash, kC1Shape);
+  }
+  for (const auto& member : members) {
+    HashU64(&hash, member.member_id);
+    HashU32(&hash, member.max_tokens);
+    HashU32(&hash, static_cast<std::uint32_t>(member.prompt_tokens.size()));
+    HashPromptTokens(&hash, member.prompt_tokens);
+  }
+  return hash.Finish();
+}
+
+TpPlanDigest ComputeTpCachePlanDigest(const TpControlCommand& command) {
+  const auto members = EffectiveCommandMembers(command);
+  crypto::Sha256Hasher hash;
+  HashString(&hash, "gufo.tp-control.cache-plan.v1");
+  HashU32(&hash, static_cast<std::uint32_t>(command.kind));
+  HashU64(&hash, command.kind == TpControlCommandKind::kSingle
+                     ? command.sequence
+                     : command.cohort_id);
+  HashU32(&hash, static_cast<std::uint32_t>(members.size()));
+  for (const auto& member : members) {
+    HashU64(&hash, member.member_id);
+    HashU32(&hash, member.cache_prompt ? 1U : 0U);
+    HashU32(&hash, member.cache_prefix_tokens);
+  }
+  return hash.Finish();
+}
+
+bool ValidateTpControlCommand(const TpControlCommand& command,
+                              std::string* error) {
+  if (command.kind == TpControlCommandKind::kSingle) {
+    if (command.members.size() > 1 ||
+        (!command.members.empty() && HasLegacyCommandFields(command))) {
+      SetError(error, "TP C1 command has an invalid member envelope");
+      return false;
+    }
+    const auto members = EffectiveCommandMembers(command);
+    if (members.size() != 1 || members.front().member_id != command.sequence) {
+      SetError(error, "TP C1 command must contain its sequence-scoped member");
+      return false;
+    }
+    return ValidateMemberRequest(members.front(), error);
+  }
+  if (command.kind != TpControlCommandKind::kCohort2Ar) {
+    SetError(error, "TP control command kind is invalid");
+    return false;
+  }
+  if (command.cohort_id == 0 || HasLegacyCommandFields(command) ||
+      command.members.size() != kMaxCohortMembers) {
+    SetError(error, "TP C2 command envelope is invalid");
+    return false;
+  }
+  for (std::size_t index = 0; index < command.members.size(); ++index) {
+    const auto& member = command.members[index];
+    if (!ValidateMemberRequest(member, error)) {
+      return false;
+    }
+    if (member.member_id == 0 || member.cache_prompt ||
+        member.cache_prefix_tokens != 0) {
+      SetError(error, "TP C2 requires uncached AR members with nonzero IDs");
+      return false;
+    }
+    for (std::size_t previous = 0; previous < index; ++previous) {
+      if (command.members[previous].member_id == member.member_id) {
+        SetError(error, "TP C2 member IDs must be unique");
+        return false;
+      }
+    }
+  }
+  if (command.execution_plan_digest != ComputeTpExecutionPlanDigest(command) ||
+      command.cache_plan_digest != ComputeTpCachePlanDigest(command)) {
+    SetError(error, "TP C2 plan digest mismatch");
+    return false;
+  }
+  return true;
+}
+
+bool ValidateTpControlResponse(const TpControlResponse& response,
+                               std::string* error) {
+  if (response.error.size() > kMaxErrorBytes) {
+    SetError(error, "TP control response error is too large");
+    return false;
+  }
+  if (response.kind == TpControlResponseKind::kSingle) {
+    if (response.members.size() > 1 ||
+        (!response.members.empty() && HasLegacyResponseFields(response))) {
+      SetError(error, "TP C1 response has an invalid member envelope");
+      return false;
+    }
+    if (response.members.empty()) {
+      if (response.tokens.size() > kMaxPromptTokens ||
+          response.cached_prompt_tokens > kMaxPromptTokens) {
+        SetError(error, "TP C1 response is too large");
+        return false;
+      }
+      return true;
+    }
+    if (response.members.front().member_id != response.sequence ||
+        response.members.front().cached_prompt_tokens > kMaxPromptTokens ||
+        !ValidateMemberResponse(response.members.front(), error)) {
+      if (error != nullptr && error->empty()) {
+        SetError(error, "TP C1 response has an invalid sequence-scoped member");
+      }
+      return false;
+    }
+    return true;
+  }
+  if (response.kind != TpControlResponseKind::kCohort2Ar) {
+    SetError(error, "TP control response kind is invalid");
+    return false;
+  }
+  if (response.cohort_id == 0 || HasLegacyResponseFields(response) ||
+      response.members.size() != kMaxCohortMembers ||
+      IsZeroDigest(response.execution_plan_digest) ||
+      IsZeroDigest(response.cache_plan_digest)) {
+    SetError(error, "TP C2 response envelope is invalid");
+    return false;
+  }
+  for (std::size_t index = 0; index < response.members.size(); ++index) {
+    const auto& member = response.members[index];
+    if (!ValidateMemberResponse(member, error)) {
+      return false;
+    }
+    if (member.member_id == 0 || member.draft_tokens != 0 ||
+        member.draft_accepted_tokens != 0 || member.cached_prompt_tokens != 0 ||
+        member.cache_snapshot_bytes != 0) {
+      SetError(error, "TP C2 response requires uncached AR member results");
+      return false;
+    }
+    for (std::size_t previous = 0; previous < index; ++previous) {
+      if (response.members[previous].member_id == member.member_id) {
+        SetError(error, "TP C2 response member IDs must be unique");
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 TpControlChannel::TpControlChannel(int fd, std::uint32_t rank,
                                    std::uint16_t port)
@@ -412,28 +703,54 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
 
 bool TpControlChannel::SendCommand(const TpControlCommand& command,
                                    std::string* error) {
-  if (!handshaken_ || rank_ != 0 || command.max_tokens == 0 ||
-      command.prompt_tokens.empty() ||
-      command.prompt_tokens.size() > kMaxPromptTokens ||
-      command.cache_prefix_tokens > command.prompt_tokens.size() ||
-      command.client_id.size() > kMaxClientIdBytes) {
-    SetError(error, "TP control command is invalid");
+  if (!handshaken_ || rank_ != 0 || !ValidateTpControlCommand(command, error)) {
+    if (error != nullptr && error->empty()) {
+      SetError(error, "TP control command is invalid");
+    }
     return false;
   }
-  std::vector<std::uint8_t> payload;
-  payload.reserve(28 + command.prompt_tokens.size() * sizeof(std::int32_t) +
-                  command.client_id.size());
-  AppendU64(&payload, command.sequence);
-  AppendU32(&payload, command.max_tokens);
-  AppendU32(&payload, command.cache_prompt ? 1U : 0U);
-  AppendU32(&payload, command.cache_prefix_tokens);
-  AppendU32(&payload, static_cast<std::uint32_t>(command.prompt_tokens.size()));
-  AppendU32(&payload, static_cast<std::uint32_t>(command.client_id.size()));
-  for (const auto token : command.prompt_tokens) {
-    AppendU32(&payload, static_cast<std::uint32_t>(token));
+  const auto members = EffectiveCommandMembers(command);
+  if (max_context_ == 0 ||
+      std::ranges::any_of(members, [&](const auto& member) {
+        return member.prompt_tokens.size() > max_context_ ||
+               (command.kind == TpControlCommandKind::kCohort2Ar &&
+                member.max_tokens > max_context_);
+      })) {
+    SetError(error, "TP control command exceeds the negotiated context");
+    return false;
   }
-  payload.insert(payload.end(), command.client_id.begin(),
-                 command.client_id.end());
+
+  std::vector<std::uint8_t> payload;
+  payload.reserve(96 + members.size() * 64);
+  AppendU64(&payload, command.sequence);
+  AppendU32(&payload, static_cast<std::uint32_t>(command.kind));
+  AppendU64(&payload, command.kind == TpControlCommandKind::kSingle
+                          ? command.sequence
+                          : command.cohort_id);
+  const TpPlanDigest empty_digest{};
+  const auto& execution_digest = command.kind == TpControlCommandKind::kSingle
+                                     ? empty_digest
+                                     : command.execution_plan_digest;
+  const auto& cache_digest = command.kind == TpControlCommandKind::kSingle
+                                 ? empty_digest
+                                 : command.cache_plan_digest;
+  AppendBytes(&payload, execution_digest);
+  AppendBytes(&payload, cache_digest);
+  AppendU32(&payload, static_cast<std::uint32_t>(members.size()));
+  for (const auto& member : members) {
+    AppendU64(&payload, member.member_id);
+    AppendU32(&payload, member.max_tokens);
+    AppendU32(&payload, member.cache_prompt ? 1U : 0U);
+    AppendU32(&payload, member.cache_prefix_tokens);
+    AppendU32(&payload,
+              static_cast<std::uint32_t>(member.prompt_tokens.size()));
+    AppendU32(&payload, static_cast<std::uint32_t>(member.client_id.size()));
+    for (const auto token : member.prompt_tokens) {
+      AppendU32(&payload, static_cast<std::uint32_t>(token));
+    }
+    payload.insert(payload.end(), member.client_id.begin(),
+                   member.client_id.end());
+  }
   return SendFrame(kCommand, command.sequence, payload, error);
 }
 
@@ -443,73 +760,178 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
     SetError(error, "TP control command role is invalid");
     return false;
   }
+  *command = {};
   std::uint64_t sequence = 0;
   if (!ReceiveFrame(kCommand, &sequence, &command_prompt_, error)) {
     return false;
   }
+
+  TpControlCommand parsed;
+  parsed.sequence = sequence;
   std::size_t offset = 0;
   std::uint64_t embedded = 0;
-  std::uint32_t max_tokens = 0;
-  std::uint32_t cache_prompt = 0;
-  std::uint32_t cache_prefix_tokens = 0;
-  std::uint32_t prompt_count = 0;
-  std::uint32_t client_size = 0;
+  std::uint32_t kind = 0;
+  std::uint32_t member_count = 0;
   if (!ReadU64(command_prompt_, &offset, &embedded, error) ||
-      !ReadU32(command_prompt_, &offset, &max_tokens, error) ||
-      !ReadU32(command_prompt_, &offset, &cache_prompt, error) ||
-      !ReadU32(command_prompt_, &offset, &cache_prefix_tokens, error) ||
-      !ReadU32(command_prompt_, &offset, &prompt_count, error) ||
-      !ReadU32(command_prompt_, &offset, &client_size, error) ||
-      embedded != sequence || max_tokens == 0 || prompt_count == 0 ||
-      prompt_count > kMaxPromptTokens || cache_prompt > 1 ||
-      cache_prefix_tokens > prompt_count || max_context_ == 0 ||
-      prompt_count > max_context_ || client_size > kMaxClientIdBytes ||
-      command_prompt_.size() - offset !=
-          static_cast<std::size_t>(prompt_count) * sizeof(std::int32_t) +
-              client_size) {
+      !ReadU32(command_prompt_, &offset, &kind, error) ||
+      !ReadU64(command_prompt_, &offset, &parsed.cohort_id, error) ||
+      !ReadBytes(command_prompt_, &offset, parsed.execution_plan_digest,
+                 error) ||
+      !ReadBytes(command_prompt_, &offset, parsed.cache_plan_digest, error) ||
+      !ReadU32(command_prompt_, &offset, &member_count, error) ||
+      embedded != sequence || member_count == 0 ||
+      member_count > kMaxCohortMembers) {
     command_prompt_.clear();
     command_prompt_.shrink_to_fit();
-    SetError(error, "TP control command payload is invalid");
+    SetError(error, "TP control command envelope is invalid");
     return false;
   }
-  command->sequence = sequence;
-  command->max_tokens = max_tokens;
-  command->cache_prompt = cache_prompt != 0;
-  command->cache_prefix_tokens = cache_prefix_tokens;
-  command->prompt_tokens.resize(prompt_count);
-  for (auto& token : command->prompt_tokens) {
-    std::uint32_t value = 0;
-    if (!ReadU32(command_prompt_, &offset, &value, error)) {
+  if (kind == static_cast<std::uint32_t>(TpControlCommandKind::kSingle)) {
+    parsed.kind = TpControlCommandKind::kSingle;
+  } else if (kind ==
+             static_cast<std::uint32_t>(TpControlCommandKind::kCohort2Ar)) {
+    parsed.kind = TpControlCommandKind::kCohort2Ar;
+  } else {
+    command_prompt_.clear();
+    command_prompt_.shrink_to_fit();
+    SetError(error, "TP control command kind is invalid");
+    return false;
+  }
+  const std::size_t expected_members =
+      parsed.kind == TpControlCommandKind::kSingle ? 1 : kMaxCohortMembers;
+  if (member_count != expected_members) {
+    command_prompt_.clear();
+    command_prompt_.shrink_to_fit();
+    SetError(error, "TP control command member count is invalid");
+    return false;
+  }
+
+  std::vector<TpControlMemberRequest> members(member_count);
+  for (auto& member : members) {
+    std::uint32_t cache_prompt = 0;
+    std::uint32_t prompt_count = 0;
+    std::uint32_t client_size = 0;
+    if (!ReadU64(command_prompt_, &offset, &member.member_id, error) ||
+        !ReadU32(command_prompt_, &offset, &member.max_tokens, error) ||
+        !ReadU32(command_prompt_, &offset, &cache_prompt, error) ||
+        !ReadU32(command_prompt_, &offset, &member.cache_prefix_tokens,
+                 error) ||
+        !ReadU32(command_prompt_, &offset, &prompt_count, error) ||
+        !ReadU32(command_prompt_, &offset, &client_size, error) ||
+        cache_prompt > 1 || prompt_count == 0 ||
+        prompt_count > kMaxPromptTokens || client_size > kMaxClientIdBytes ||
+        client_size > command_prompt_.size() - offset) {
+      command_prompt_.clear();
+      command_prompt_.shrink_to_fit();
+      SetError(error, "TP control command member is invalid");
       return false;
     }
-    token = static_cast<std::int32_t>(value);
+    member.cache_prompt = cache_prompt != 0;
+    member.prompt_tokens.resize(prompt_count);
+    for (auto& token : member.prompt_tokens) {
+      std::uint32_t value = 0;
+      if (!ReadU32(command_prompt_, &offset, &value, error)) {
+        return false;
+      }
+      token = static_cast<std::int32_t>(value);
+    }
+    member.client_id.assign(
+        reinterpret_cast<const char*>(command_prompt_.data() + offset),
+        client_size);
+    offset += client_size;
   }
-  command->client_id.assign(
-      reinterpret_cast<const char*>(command_prompt_.data() + offset),
-      client_size);
+  if (offset != command_prompt_.size()) {
+    command_prompt_.clear();
+    command_prompt_.shrink_to_fit();
+    SetError(error, "TP control command payload has trailing bytes");
+    return false;
+  }
+
+  if (parsed.kind == TpControlCommandKind::kSingle) {
+    if (parsed.cohort_id != sequence || members.front().member_id != sequence) {
+      command_prompt_.clear();
+      command_prompt_.shrink_to_fit();
+      SetError(error, "TP C1 command scope is not its sequence");
+      return false;
+    }
+    parsed.max_tokens = members.front().max_tokens;
+    parsed.cache_prompt = members.front().cache_prompt;
+    parsed.cache_prefix_tokens = members.front().cache_prefix_tokens;
+    parsed.prompt_tokens = std::move(members.front().prompt_tokens);
+    parsed.client_id = std::move(members.front().client_id);
+  } else {
+    parsed.members = std::move(members);
+  }
+  if (max_context_ == 0 ||
+      std::ranges::any_of(EffectiveCommandMembers(parsed),
+                          [&](const auto& member) {
+                            return member.prompt_tokens.size() > max_context_ ||
+                                   (parsed.kind ==
+                                        TpControlCommandKind::kCohort2Ar &&
+                                    member.max_tokens > max_context_);
+                          }) ||
+      !ValidateTpControlCommand(parsed, error)) {
+    command_prompt_.clear();
+    command_prompt_.shrink_to_fit();
+    return false;
+  }
+  *command = std::move(parsed);
   return true;
 }
 
 bool TpControlChannel::SendResponse(const TpControlResponse& response,
                                     std::string* error) {
-  if (!handshaken_ || rank_ != 1 || response.tokens.size() > kMaxPromptTokens ||
-      response.error.size() > kMaxErrorBytes) {
-    SetError(error, "TP control response is invalid");
+  if (!handshaken_ || rank_ != 1 ||
+      !ValidateTpControlResponse(response, error)) {
+    if (error != nullptr && error->empty()) {
+      SetError(error, "TP control response is invalid");
+    }
     return false;
   }
-  std::vector<std::uint8_t> payload;
-  payload.reserve(40 + response.tokens.size() * sizeof(std::int32_t) +
-                  response.error.size());
-  AppendU64(&payload, response.sequence);
-  AppendU32(&payload, static_cast<std::uint32_t>(response.tokens.size()));
-  AppendU64(&payload, response.draft_tokens);
-  AppendU64(&payload, response.draft_accepted_tokens);
-  AppendU32(&payload, response.cached_prompt_tokens);
-  AppendU64(&payload, response.cache_snapshot_bytes);
-  AppendU32(&payload, static_cast<std::uint32_t>(response.error.size()));
-  for (const auto token : response.tokens) {
-    AppendU32(&payload, static_cast<std::uint32_t>(token));
+  std::vector<TpControlMemberResponse> members;
+  if (response.kind == TpControlResponseKind::kSingle &&
+      response.members.empty()) {
+    members.push_back({
+        .member_id = response.sequence,
+        .tokens = response.tokens,
+        .draft_tokens = response.draft_tokens,
+        .draft_accepted_tokens = response.draft_accepted_tokens,
+        .cached_prompt_tokens = response.cached_prompt_tokens,
+        .cache_snapshot_bytes = response.cache_snapshot_bytes,
+    });
+  } else {
+    members = response.members;
   }
+
+  std::vector<std::uint8_t> payload;
+  payload.reserve(128 + members.size() * 64 + response.error.size());
+  AppendU64(&payload, response.sequence);
+  AppendU32(&payload, static_cast<std::uint32_t>(response.kind));
+  AppendU64(&payload, response.kind == TpControlResponseKind::kSingle
+                          ? response.sequence
+                          : response.cohort_id);
+  const TpPlanDigest empty_digest{};
+  const auto& execution_digest = response.kind == TpControlResponseKind::kSingle
+                                     ? empty_digest
+                                     : response.execution_plan_digest;
+  const auto& cache_digest = response.kind == TpControlResponseKind::kSingle
+                                 ? empty_digest
+                                 : response.cache_plan_digest;
+  AppendBytes(&payload, execution_digest);
+  AppendBytes(&payload, cache_digest);
+  AppendU32(&payload, static_cast<std::uint32_t>(members.size()));
+  for (const auto& member : members) {
+    AppendU64(&payload, member.member_id);
+    AppendU32(&payload, static_cast<std::uint32_t>(member.tokens.size()));
+    AppendU64(&payload, member.draft_tokens);
+    AppendU64(&payload, member.draft_accepted_tokens);
+    AppendU32(&payload, member.cached_prompt_tokens);
+    AppendU64(&payload, member.cache_snapshot_bytes);
+    for (const auto token : member.tokens) {
+      AppendU32(&payload, static_cast<std::uint32_t>(token));
+    }
+  }
+  AppendU32(&payload, static_cast<std::uint32_t>(response.error.size()));
   payload.insert(payload.end(), response.error.begin(), response.error.end());
   return SendFrame(kResponse, response.sequence, payload, error);
 }
@@ -520,56 +942,141 @@ bool TpControlChannel::ReceiveResponse(TpControlResponse* response,
     SetError(error, "TP control response role is invalid");
     return false;
   }
+  *response = {};
   std::uint64_t sequence = 0;
   if (!ReceiveFrame(kResponse, &sequence, &response_payload_, error)) {
     return false;
   }
+
+  TpControlResponse parsed;
+  parsed.sequence = sequence;
   std::size_t offset = 0;
   std::uint64_t embedded = 0;
-  std::uint32_t token_count = 0;
-  std::uint32_t error_size = 0;
+  std::uint32_t kind = 0;
+  std::uint32_t member_count = 0;
   if (!ReadU64(response_payload_, &offset, &embedded, error) ||
-      !ReadU32(response_payload_, &offset, &token_count, error) ||
-      !ReadU64(response_payload_, &offset, &response->draft_tokens, error) ||
-      !ReadU64(response_payload_, &offset, &response->draft_accepted_tokens,
-               error) ||
-      !ReadU32(response_payload_, &offset, &response->cached_prompt_tokens,
-               error) ||
-      !ReadU64(response_payload_, &offset, &response->cache_snapshot_bytes,
-               error) ||
-      !ReadU32(response_payload_, &offset, &error_size, error) ||
-      embedded != sequence || token_count > kMaxPromptTokens ||
-      response->cached_prompt_tokens > kMaxPromptTokens ||
-      error_size > kMaxErrorBytes ||
-      response_payload_.size() - offset !=
-          static_cast<std::size_t>(token_count) * sizeof(std::int32_t) +
-              error_size) {
+      !ReadU32(response_payload_, &offset, &kind, error) ||
+      !ReadU64(response_payload_, &offset, &parsed.cohort_id, error) ||
+      !ReadBytes(response_payload_, &offset, parsed.execution_plan_digest,
+                 error) ||
+      !ReadBytes(response_payload_, &offset, parsed.cache_plan_digest, error) ||
+      !ReadU32(response_payload_, &offset, &member_count, error) ||
+      embedded != sequence || member_count == 0 ||
+      member_count > kMaxCohortMembers) {
     response_payload_.clear();
     response_payload_.shrink_to_fit();
-    SetError(error, "TP control response payload is invalid");
+    SetError(error, "TP control response envelope is invalid");
     return false;
   }
-  response->sequence = sequence;
-  response->tokens.resize(token_count);
-  for (auto& token : response->tokens) {
-    std::uint32_t value = 0;
-    if (!ReadU32(response_payload_, &offset, &value, error)) {
+  if (kind == static_cast<std::uint32_t>(TpControlResponseKind::kSingle)) {
+    parsed.kind = TpControlResponseKind::kSingle;
+  } else if (kind ==
+             static_cast<std::uint32_t>(TpControlResponseKind::kCohort2Ar)) {
+    parsed.kind = TpControlResponseKind::kCohort2Ar;
+  } else {
+    response_payload_.clear();
+    response_payload_.shrink_to_fit();
+    SetError(error, "TP control response kind is invalid");
+    return false;
+  }
+  const std::size_t expected_members =
+      parsed.kind == TpControlResponseKind::kSingle ? 1 : kMaxCohortMembers;
+  if (member_count != expected_members) {
+    response_payload_.clear();
+    response_payload_.shrink_to_fit();
+    SetError(error, "TP control response member count is invalid");
+    return false;
+  }
+
+  std::vector<TpControlMemberResponse> members(member_count);
+  for (auto& member : members) {
+    std::uint32_t token_count = 0;
+    if (!ReadU64(response_payload_, &offset, &member.member_id, error) ||
+        !ReadU32(response_payload_, &offset, &token_count, error) ||
+        !ReadU64(response_payload_, &offset, &member.draft_tokens, error) ||
+        !ReadU64(response_payload_, &offset, &member.draft_accepted_tokens,
+                 error) ||
+        !ReadU32(response_payload_, &offset, &member.cached_prompt_tokens,
+                 error) ||
+        !ReadU64(response_payload_, &offset, &member.cache_snapshot_bytes,
+                 error) ||
+        token_count > kMaxPromptTokens) {
+      response_payload_.clear();
+      response_payload_.shrink_to_fit();
+      SetError(error, "TP control response member is invalid");
       return false;
     }
-    token = static_cast<std::int32_t>(value);
+    member.tokens.resize(token_count);
+    for (auto& token : member.tokens) {
+      std::uint32_t value = 0;
+      if (!ReadU32(response_payload_, &offset, &value, error)) {
+        return false;
+      }
+      token = static_cast<std::int32_t>(value);
+    }
   }
-  response->error.assign(
+  std::uint32_t error_size = 0;
+  if (!ReadU32(response_payload_, &offset, &error_size, error) ||
+      error_size > kMaxErrorBytes ||
+      response_payload_.size() - offset != error_size) {
+    response_payload_.clear();
+    response_payload_.shrink_to_fit();
+    SetError(error, "TP control response error payload is invalid");
+    return false;
+  }
+  parsed.error.assign(
       reinterpret_cast<const char*>(response_payload_.data() + offset),
       error_size);
+
+  if (parsed.kind == TpControlResponseKind::kSingle) {
+    if (parsed.cohort_id != sequence || members.front().member_id != sequence) {
+      response_payload_.clear();
+      response_payload_.shrink_to_fit();
+      SetError(error, "TP C1 response scope is not its sequence");
+      return false;
+    }
+    parsed.tokens = std::move(members.front().tokens);
+    parsed.draft_tokens = members.front().draft_tokens;
+    parsed.draft_accepted_tokens = members.front().draft_accepted_tokens;
+    parsed.cached_prompt_tokens = members.front().cached_prompt_tokens;
+    parsed.cache_snapshot_bytes = members.front().cache_snapshot_bytes;
+  } else {
+    parsed.members = std::move(members);
+  }
+  if (!ValidateTpControlResponse(parsed, error)) {
+    response_payload_.clear();
+    response_payload_.shrink_to_fit();
+    return false;
+  }
+  *response = std::move(parsed);
   return true;
 }
 
 struct TpResponseBroker::Impl {
   struct Pending {
     TpControlResponse response;
+    std::optional<TpResponseExpectation> expectation;
     bool ready{false};
     bool delivered{false};
   };
+
+  [[nodiscard]] static bool MatchesExpectation(
+      const TpControlResponse& response,
+      const TpResponseExpectation& expectation) noexcept {
+    if (response.kind != TpControlResponseKind::kCohort2Ar ||
+        response.cohort_id != expectation.cohort_id ||
+        response.execution_plan_digest != expectation.execution_plan_digest ||
+        response.cache_plan_digest != expectation.cache_plan_digest ||
+        response.members.size() != expectation.member_ids.size()) {
+      return false;
+    }
+    for (std::size_t index = 0; index < response.members.size(); ++index) {
+      if (response.members[index].member_id != expectation.member_ids[index]) {
+        return false;
+      }
+    }
+    return true;
+  }
 
   Impl(std::shared_ptr<TpControlChannel> channel, std::size_t capacity)
       : control(std::move(channel)), capacity(capacity) {
@@ -630,6 +1137,16 @@ struct TpResponseBroker::Impl {
           control->Interrupt();
           return;
         }
+        if (found->second->expectation &&
+            !MatchesExpectation(response, *found->second->expectation)) {
+          stopping = true;
+          poisoned = true;
+          failure = "TP response cohort contract mismatch: " +
+                    std::to_string(response.sequence);
+          condition.notify_all();
+          control->Interrupt();
+          return;
+        }
         found->second->response = std::move(response);
         found->second->ready = true;
         condition.notify_all();
@@ -672,6 +1189,48 @@ bool TpResponseBroker::RegisterPendingResponse(std::uint64_t sequence,
   }
   if (!impl_->pending.emplace(sequence, std::make_shared<Impl::Pending>())
            .second) {
+    SetError(error, "TP response sequence is already registered");
+    return false;
+  }
+  return true;
+}
+
+bool TpResponseBroker::RegisterPendingResponse(
+    std::uint64_t sequence, const TpResponseExpectation& expectation,
+    std::string* error) {
+  if (expectation.cohort_id == 0 ||
+      IsZeroDigest(expectation.execution_plan_digest) ||
+      IsZeroDigest(expectation.cache_plan_digest) ||
+      expectation.member_ids.size() != kMaxCohortMembers) {
+    SetError(error, "TP C2 response expectation is invalid");
+    return false;
+  }
+  for (std::size_t index = 0; index < expectation.member_ids.size(); ++index) {
+    if (expectation.member_ids[index] == 0) {
+      SetError(error, "TP C2 response expectation has a zero member ID");
+      return false;
+    }
+    for (std::size_t previous = 0; previous < index; ++previous) {
+      if (expectation.member_ids[previous] == expectation.member_ids[index]) {
+        SetError(error, "TP C2 response expectation member IDs must be unique");
+        return false;
+      }
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->stopping || impl_->poisoned) {
+    SetError(error, impl_->failure.empty() ? "TP response broker is stopped"
+                                           : impl_->failure);
+    return false;
+  }
+  if (impl_->pending.size() >= impl_->capacity) {
+    SetError(error, "TP response broker capacity is exhausted");
+    return false;
+  }
+  auto pending = std::make_shared<Impl::Pending>();
+  pending->expectation = expectation;
+  if (!impl_->pending.emplace(sequence, std::move(pending)).second) {
     SetError(error, "TP response sequence is already registered");
     return false;
   }

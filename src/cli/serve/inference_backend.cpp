@@ -24,6 +24,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/cli/serve/tp_cohort_worker.hpp"
 #include "src/cli/serve/tp_control.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
@@ -120,6 +121,81 @@ private:
   const std::uint64_t scope_id_;
   bool active_{false};
   std::mutex mutex_;
+};
+
+/// Adapts one scheduler cohort to the C2 worker seam.
+///
+/// The cohort owns its members, so the handles borrow stable request addresses
+/// and the admitted members stay alive for every `Wait` and `Cancel` the seam
+/// performs.
+class SchedulerCohortSubmission final : public TpCohortSubmission {
+public:
+  explicit SchedulerCohortSubmission(TextGenerationScheduler::Cohort cohort)
+      : cohort_(std::move(cohort)) {
+    for (std::size_t index = 0; index < kCohort2MemberCount; ++index) {
+      handles_[index] =
+          std::make_unique<MemberHandle>(&cohort_.members()[index]);
+    }
+  }
+
+  SchedulerCohortSubmission(const SchedulerCohortSubmission&) = delete;
+  SchedulerCohortSubmission& operator=(const SchedulerCohortSubmission&) =
+      delete;
+  SchedulerCohortSubmission(SchedulerCohortSubmission&&) = delete;
+  SchedulerCohortSubmission& operator=(SchedulerCohortSubmission&&) = delete;
+  ~SchedulerCohortSubmission() override = default;
+
+  [[nodiscard]] TpCohortMemberHandle& Member(std::size_t index) override {
+    return *handles_[index];
+  }
+
+private:
+  class MemberHandle final : public TpCohortMemberHandle {
+  public:
+    explicit MemberHandle(TextGenerationScheduler::Request* request)
+        : request_(request) {}
+
+    [[nodiscard]] TextGenerationBackend::Result Wait() override {
+      return request_->Wait({});
+    }
+
+    void Cancel() override { request_->Cancel(); }
+
+  private:
+    TextGenerationScheduler::Request* request_;
+  };
+
+  TextGenerationScheduler::Cohort cohort_;
+  std::array<std::unique_ptr<MemberHandle>, kCohort2MemberCount> handles_;
+};
+
+/// Adapts the command-sequence operation scope to the C2 worker seam. The lease
+/// owns its scope state, so the seam only sees one bind and one release.
+class TpOperationScopeLease final : public TpCohortLease {
+public:
+  TpOperationScopeLease(
+      const std::shared_ptr<models::qwen38_flash_next::rocm::Communicator>&
+          communicator,
+      std::uint64_t sequence)
+      : operation_(std::make_unique<TpOperationLease>(communicator, sequence)) {
+  }
+
+  TpOperationScopeLease(const TpOperationScopeLease&) = delete;
+  TpOperationScopeLease& operator=(const TpOperationScopeLease&) = delete;
+  TpOperationScopeLease(TpOperationScopeLease&&) = delete;
+  TpOperationScopeLease& operator=(TpOperationScopeLease&&) = delete;
+  ~TpOperationScopeLease() override = default;
+
+  [[nodiscard]] bool Begin(std::string* error) override {
+    return operation_->Begin(error);
+  }
+
+  [[nodiscard]] bool End(std::string* error) override {
+    return operation_->End(error);
+  }
+
+private:
+  std::unique_ptr<TpOperationLease> operation_;
 };
 
 struct QwenImageContext final : TextPromptContext {
@@ -2881,6 +2957,9 @@ struct InferenceBackend::Impl {
     std::uint32_t tp_rank{0};
     std::uint32_t tp_world_size{1};
     bool tp_allow_cache_reuse{false};
+    /// True when the loaded model carries an MTP draft sidecar. Dormant C2
+    /// cohort AR cannot coexist with it, so the worker fails closed.
+    bool tp_use_mtp{false};
     std::string model_id;
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
@@ -3763,6 +3842,7 @@ bool InferenceBackend::load(
     new_state->tp_rank = tp_rank;
     new_state->tp_world_size = tp_world_size;
     new_state->tp_allow_cache_reuse = tp_config.allow_cache_reuse;
+    new_state->tp_use_mtp = has_mtp;
     if (tp_world_size > 1) {
       const TpControlConfig control_config{
           .rank = tp_rank,
@@ -3810,6 +3890,46 @@ bool InferenceBackend::run_worker(std::string* error) {
     std::string control_error;
     if (!state->control->ReceiveCommand(&command, &control_error)) {
       SetError(error, "TP worker command receive failed: " + control_error);
+      return false;
+    }
+    if (command.kind == TpControlCommandKind::kCohort2Ar) {
+      // Dormant C2 slice: the cohort runs as two ordered serial C1 members in
+      // one operation scope, and the coordinator sends no such command yet.
+      using TpCohortAdmissions =
+          std::vector<TextGenerationScheduler::CohortMemberRequest>;
+      TpCohortWorkerHooks hooks;
+      hooks.submit =
+          [scheduler = state->scheduler](
+              TpCohortAdmissions admitted,
+              std::string* error) -> std::unique_ptr<TpCohortSubmission> {
+        try {
+          return std::make_unique<SchedulerCohortSubmission>(
+              scheduler->SubmitCohort(std::move(admitted)));
+        } catch (const std::exception& exception) {
+          SetError(error, exception.what());
+          return nullptr;
+        }
+      };
+      hooks.send = [control = state->control](const TpControlResponse& response,
+                                              std::string* error) {
+        std::string control_error;
+        if (!control->SendResponse(response, &control_error)) {
+          SetError(error, "TP worker response send failed: " + control_error);
+          return TpWorkerLoopStep::kStop;
+        }
+        return TpWorkerLoopStep::kContinue;
+      };
+      if (RunTpCohortCommand(
+              command, state->tp_use_mtp, state->scheduler->capacity(),
+              std::make_unique<TpOperationScopeLease>(state->communicator,
+                                                      command.sequence),
+              std::move(hooks), error) == TpWorkerLoopStep::kStop) {
+        return false;
+      }
+      continue;
+    }
+    if (command.kind != TpControlCommandKind::kSingle) {
+      SetError(error, "TP C2 control command is not executable");
       return false;
     }
     TpControlResponse response{.sequence = command.sequence};

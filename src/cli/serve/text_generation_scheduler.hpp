@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TEXT_GENERATION_SCHEDULER_HPP_
 #define GUFO_SERVER_TEXT_GENERATION_SCHEDULER_HPP_
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,8 @@ inline constexpr std::size_t kDefaultMaxBufferedOutputBytes =
     static_cast<std::size_t>(64) * 1024;
 inline constexpr std::size_t kDefaultMaxBufferedOutputBytesTotal =
     static_cast<std::size_t>(256) * 1024;
+/// The first C2 slice is fixed at two members.
+inline constexpr std::size_t kCohort2MemberCount = 2;
 
 struct TextPrefillPolicy {
   std::size_t decode_active_tokens{kDefaultDecodeActivePrefillTokens};
@@ -95,6 +98,53 @@ public:
     std::unique_ptr<Impl> impl_;
   };
 
+  /// One externally identified member of a fixed two-member C2 cohort.
+  /// This record describes scheduler admission only; it carries no distributed
+  /// execution plan and never selects a shared C2 collective.
+  struct CohortMemberRequest {
+    std::uint64_t member_id{0};
+    std::vector<TextRunnerToken> prompt;
+    std::size_t max_tokens{1};
+    sampling::SamplingConfig sampling;
+    CancellationCheck is_cancelled;
+    bool publish_token_pieces{false};
+    RequestMetadata metadata;
+  };
+
+  /// Move-only handle for one atomically admitted, ordered C2 cohort.
+  class Cohort {
+  public:
+    Cohort(const Cohort&) = delete;
+    Cohort& operator=(const Cohort&) = delete;
+    Cohort(Cohort&&) noexcept = default;
+    Cohort& operator=(Cohort&&) noexcept = default;
+    ~Cohort() = default;
+
+    [[nodiscard]] std::uint64_t id() const noexcept { return id_; }
+    [[nodiscard]] const std::array<std::uint64_t, kCohort2MemberCount>&
+    member_ids() const noexcept {
+      return member_ids_;
+    }
+    [[nodiscard]] const std::array<Request, kCohort2MemberCount>& members()
+        const noexcept {
+      return members_;
+    }
+    [[nodiscard]] std::array<Request, kCohort2MemberCount>& members() noexcept {
+      return members_;
+    }
+
+  private:
+    friend class TextGenerationScheduler;
+
+    Cohort(std::uint64_t id,
+           std::array<std::uint64_t, kCohort2MemberCount> member_ids,
+           std::array<Request, kCohort2MemberCount> members);
+
+    std::uint64_t id_{0};
+    std::array<std::uint64_t, kCohort2MemberCount> member_ids_{};
+    std::array<Request, kCohort2MemberCount> members_{};
+  };
+
   explicit TextGenerationScheduler(std::shared_ptr<TextRunnerPool> runner_pool,
                                    TextPrefillPolicy prefill_policy = {},
                                    TextSchedulerPolicy scheduler_policy = {});
@@ -134,12 +184,26 @@ public:
                                bool publish_token_pieces,
                                RequestMetadata metadata);
 
+  /// Admits one fixed two-member C2 cohort as a single ordered unit.
+  ///
+  /// Exactly two members with nonzero, unique IDs are required. An incomplete
+  /// cohort, a duplicate ID, or a third-member join is rejected before either
+  /// member can reach a runner. Members must be greedy, non-streaming, uncached
+  /// requests without prompt continuation, cancellation callbacks, or
+  /// deadlines. The members are queued atomically in the given order under one
+  /// scheduler cohort identity. This is a dormant admission and order contract:
+  /// members still execute as independent C1 work, and no distributed runner
+  /// plan or physical C2 collective is selected here.
+  [[nodiscard]] Cohort SubmitCohort(std::vector<CohortMemberRequest> members);
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
 
 using TextRequestMetadata = TextGenerationScheduler::RequestMetadata;
+using TextRequestCohort = TextGenerationScheduler::Cohort;
+using TextCohortMemberRequest = TextGenerationScheduler::CohortMemberRequest;
 
 }  // namespace gufo::server
 

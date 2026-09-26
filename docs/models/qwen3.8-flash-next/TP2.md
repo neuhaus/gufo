@@ -215,8 +215,101 @@ experimental and must not be rendered into the published benchmark tables.
   The first qualification slice, if pursued, is fixed two-request C2, AR before
   MTP, uncached and non-streaming, with repeated ordering/failure tests and
   per-request hashes; it must not be enabled by a CLI alias alone.
+- C2 qualification is landing as three ordered layers, none of which enables a
+  shared collective or a second session:
+  - Protocol v5 validates a dormant two-member AR-only cohort envelope, canonical
+    execution/cache plan digests, ordered member results, and broker mismatch
+    poisoning.
+  - The scheduler atomically admits exactly two ordered, unique members under one
+    cohort identity, and rejects incomplete, duplicate, third-member, sampled,
+    streaming, cached, continued, cancelled, and deadline-bearing cohorts before
+    any model work. Admitted members still select `serial-c1` execution.
+  - A translation seam converts a validated command into ordered scheduler
+    members and two member results into a strict C2 response, rejecting any
+    member that does not report serial width and zero draft/cache telemetry. A
+    rejected cohort still returns both member envelopes.
+
+  The rank-1 worker dispatches `kCohort2Ar` through those layers under exactly
+  one operation lease scoped to the command sequence, and fails closed when an
+  MTP sidecar is loaded because drafts cannot be represented by the C2 response
+  contract. It also refuses a cohort, before binding the lease, unless its
+  runner capacity is one. A wider pool would admit both members at once and
+  interleave them, and each rank's own scheduler decides that interleaving, so
+  the two ranks' collective sequences could diverge. TP2 loading already
+  requires one session, so this guard only matters once `--sessions 2` is
+  enabled. That path stays dormant: no producer constructs a C2 command. The
+  sequence itself is host-testable through injected lease, submission and send
+  hooks, with a single-release-site guard so a bound scope is released exactly
+  once on every path — including a member failure, which would otherwise leave
+  a scope bound and fail-stop the next C1 request.
+
+  Three real fault injections are now verified on hardware, all fail-closed:
+  - **Admission refusal** (rank 1 `--worker-max-pending 1`): `SubmitCohort`
+    throws at admission, the seam releases the bound lease and sends a
+    wire-valid C2 error response that still carries both member envelopes.
+    Rank 0 observed `members=2`, error `text generation pending queue is full`
+    and no collective at all — 2 ms from command sent to response.
+  - **Operation-scope mismatch** (rank 0 `--tp-scope-override N`): the first
+    `AllReduceSum` header exchange fails on `scope_id` (`verbs.cpp:644-660`),
+    poisoning both communicators. Rank 0 failed 13 ms after send with
+    `outgoing=99/0/51200 incoming=1/0/51200`; rank 1, which injected nothing,
+    detected the mismatch and then failed its own lease release with
+    `verbs communicator is poisoned`, so the worker stopped instead of
+    degrading quietly. This is the case a fake lease cannot model, and it
+    confirms the exactly-one-`End` contract against a real poisoned
+    communicator.
+
+  - **MTP refusal** (rank 1 `--mtp-model`): TP2 plus MTP is a supported
+    shipping combination, and the C2 response contract cannot carry draft
+    telemetry at all, so a cohort must be refused rather than answered
+    malformed. With a real 2.79 GB sidecar loaded, the handshake presented
+    `use_mtp=true`/`max_draft_tokens=7`, rank 0 mirrored both fields, and rank 1
+    refused **before** `BeginOperation` — no lease bound, no collective. Rank 0
+    observed both member envelopes and the exact refusal string in 1 ms. The
+    probe compares that string verbatim, because every refusal path returns the
+    same exit code and a mode-1 refusal would otherwise read as this mode's
+    success.
+
+  Still covered by hosted tests only: peer cancel mid-cohort, member failure,
+  and the runner-capacity refusal. TP2 loading rejects more than one session,
+  so that refusal cannot be injected on hardware without relaxing the guard.
+  No C2 command has run with a prompt longer than one prefill chunk.
+
+- The dormant C2 path HAS now run end to end on hardware, three consecutive
+  times, via `qwen38_flash_next_tp_c2_probe` (rank 0 on `fuzzy`, rank 1 on
+  `misty`). `gufo serve` cannot host the worker: TP=2 forces `--max-pending 1`
+  while `SubmitCohort` needs `queued + 2 <= max_pending_requests`, so a cohort
+  is always refused at admission. The probe therefore hosts a real
+  `InferenceBackend` with `max_pending_requests = 2`, runner pool capacity 1 and
+  no MTP, and relaxes nothing in production. Per run: both digests matched, the
+  cohort was admitted, member 0 then member 1 executed serially in one operation
+  scope, and the ordered two-member response agreed token-for-token with rank 0's
+  local greedy output. Each member issued 8 forwards and 384 collectives
+  (48 layers), where 8 published tokens cost 7 decode advances because
+  `final_token_advance_required` is false on the distributed runner. Still
+  unproven: batched/physical C2, any performance benefit, and failure injection
+  on hardware.
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
   routed source bytes and the device model reports post-conversion resident
   bytes. The larger target must pass that local-memory fit check before it is
   promoted to a serving target.
+- Batched single-token advance was compared against serial advance on ONE host,
+  Q4 UD-Q4_K_XL, greedy, 64 new tokens, two prompts of 2106 and 78 prompt
+  tokens. `gufo serve -j 2` selected `plan=batched-w2 batch_width=2` with both
+  requests co-resident (`resident_at_admission=2`, 427 ms queue wait), and the
+  `-j 1` control logged `plan=serial-c1 batch_width=1`. All three paths --
+  `gufo prompt`, `serve -j 1`, `serve -j 2` -- produced identical
+  `reasoning_content`: sha256 `e83f2652...` (282 chars) and `731fb60a...`
+  (353 chars). Batching the advance therefore does not perturb greedy tokens
+  here. Scope, stated narrowly because it is narrow: the advance is the ONLY
+  operation batched on this path. `Prefill` is per-state
+  (`text_model_runner.hpp:262`) and has no batch form in the runner or the
+  engine, so prefill ran serially in every arm and this result says nothing
+  about prefill. `DecodeBatch` fell back to the serial base loop because
+  `use_mtp_` was false (`inference_backend.cpp:2802`), so batched decode is
+  untested. Single host, so no AllReduce and no distributed reduction order; 64
+  greedy tokens, all of them `reasoning_content`; one run per prompt. Reference
+  numbers only, not a like-for-like comparison: `prefill_tps=950.1` at width 2,
+  and `cache_snapshot_bytes` 172425656 and 121428488 per resident session,
+  which bounds how wide a batch can ever be.
