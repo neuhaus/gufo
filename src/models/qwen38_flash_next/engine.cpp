@@ -198,6 +198,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     exec.all_reduce = rocm::Executor::TwoRankAllReduce(options.communicator,
                                                        c.hidden_size);
   }
+  exec.moe_observer = options.moe_observer;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {

@@ -1104,6 +1104,48 @@ bool RunMember(const char* role, std::size_t index,
 /// A 64-bit FNV-1a over raw token bytes, so a cross-rank comparison has one
 /// token to diff instead of two id lists. Not a cryptographic digest: it only
 /// has to detect an unintended difference.
+/// `--moe-input-hashes`: hashes every MoE input while armed, so the ranks'
+/// replicated hidden states can be compared layer by layer. Each hash drains
+/// the stream and copies the input to the host, so it is armed only around
+/// prefill.
+struct MoeInputHashes {
+  bool armed{false};
+  std::vector<std::uint64_t> hashes;
+  std::vector<std::size_t> sizes;
+  std::vector<std::uint8_t> host;
+
+  void Observe(const float* data, std::size_t bytes, hipStream_t stream) {
+    if (!armed) {
+      return;
+    }
+    host.resize(bytes);
+    std::uint64_t hash = 0;
+    if (hipStreamSynchronize(stream) == hipSuccess &&
+        hipMemcpy(host.data(), data, bytes, hipMemcpyDeviceToHost) ==
+            hipSuccess) {
+      hash = 1469598103934665603ULL;
+      for (const std::uint8_t byte : host) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+      }
+    }
+    hashes.push_back(hash);
+    sizes.push_back(bytes);
+  }
+};
+
+/// FNV-1a over the exact bytes of a logit row, so two ranks that compute the
+/// same row bit for bit print the same value.
+std::uint64_t LogitChecksum(std::span<const float> logits) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  const auto* bytes = reinterpret_cast<const std::uint8_t*>(logits.data());
+  for (std::size_t index = 0; index < logits.size_bytes(); ++index) {
+    hash ^= bytes[index];
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
 std::uint64_t TokenChecksum(std::span<const std::int32_t> tokens) {
   std::uint64_t hash = 1469598103934665603ULL;
   for (const std::int32_t token : tokens) {
@@ -1149,7 +1191,7 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
                  const std::vector<std::int32_t> (&prompt)[kMemberCount],
                  std::uint32_t budget, std::uint32_t context,
                  const std::shared_ptr<CollectiveTrace>& collectives,
-                 bool serial, std::string* error) {
+                 bool serial, MoeInputHashes* moe_inputs, std::string* error) {
   // Both ranks bind the same scope id. Nothing on the wire negotiates it in
   // this mode, so it is a constant agreed by construction, and the log prints
   // it so a reader can confirm both sides bound the same value.
@@ -1187,6 +1229,9 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
     return kTransportFailure;
   }
   const auto prefill_start = std::chrono::steady_clock::now();
+  if (moe_inputs != nullptr) {
+    moe_inputs->armed = true;
+  }
   collectives->BeginRecording();
   for (std::size_t index = 0; index < kMemberCount; ++index) {
     if (!session[index]->Sync(prompt[index], error)) {
@@ -1194,6 +1239,14 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
       Warn(std::string(role) + " member " + std::to_string(index) +
            " batched prefill failed: " + *error);
       return kTransportFailure;
+    }
+  }
+  if (moe_inputs != nullptr) {
+    moe_inputs->armed = false;
+    for (std::size_t index = 0; index < moe_inputs->hashes.size(); ++index) {
+      Say(role, "moe-input " + std::to_string(index) + " bytes=" +
+                    std::to_string(moe_inputs->sizes[index]) + " hash=" +
+                    std::to_string(moe_inputs->hashes[index]));
     }
   }
   const auto prefill_elapsed = std::chrono::steady_clock::now() - prefill_start;
@@ -1239,6 +1292,7 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
     std::array<std::size_t, kMemberCount> members{};
     std::size_t rows = 0;
     std::string included;
+    std::string logit_hashes;
     for (std::size_t index = 0; index < kMemberCount; ++index) {
       if (!trace[index].stopped_on_token &&
           trace[index].tokens.size() >= budget) {
@@ -1253,6 +1307,11 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
                  " has no logits to sample from";
         return kTransportFailure;
       }
+      // The logits a rank samples from: ranks that agree bit for bit here
+      // hold the same hidden state, so the first differing step localizes a
+      // numerical divergence even before any sampled token differs.
+      logit_hashes += (logit_hashes.empty() ? "" : ",") +
+                      std::to_string(LogitChecksum(logits));
       const auto sampled =
           static_cast<std::int32_t>(samplers[index]->Sample(logits));
       if (model->IsStopToken(sampled)) {
@@ -1274,9 +1333,10 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
     }
     // The per-step member set is the schedule. It must be identical on both
     // ranks, so it is logged rather than inferred.
-    Say(role, "batched step " + std::to_string(step) +
-                  " rows=" + std::to_string(rows) + " members=" +
-                  (included.empty() ? std::string("none") : included));
+    Say(role, "batched step " + std::to_string(step) + " rows=" +
+                  std::to_string(rows) + " members=" +
+                  (included.empty() ? std::string("none") : included) +
+                  " logits=" + logit_hashes);
     if (rows == 0) {
       break;
     }
@@ -1677,6 +1737,8 @@ int main(int argc, char** argv) {
   bool serial_w2 = false;
   /// `--allreduce-bench N`: time N collectives per payload with no model.
   std::uint32_t allreduce_bench = 0;
+  /// `--moe-input-hashes`: print a hash of every MoE input during prefill.
+  bool moe_input_hashes = false;
   /// Rank-one fault injection: the MTP draft sidecar to load before the
   /// handshake. Empty is the production no-MTP policy.
   std::string mtp_model_path;
@@ -1804,6 +1866,8 @@ int main(int argc, char** argv) {
       batched_w2 = true;
     } else if (arg == "--serial-w2") {
       serial_w2 = true;
+    } else if (arg == "--moe-input-hashes") {
+      moe_input_hashes = true;
     } else if (arg == "--allreduce-bench") {
       if (!ParseUint(next(), &allreduce_bench) || allreduce_bench == 0) {
         Warn("--allreduce-bench requires a positive iteration count");
@@ -1845,9 +1909,10 @@ int main(int argc, char** argv) {
     Warn("--role must be rank0 or rank1");
     return kInvalidArguments;
   }
-  // Only rank 0 owns prompts, so only rank 0 reads prompt files. Rank 1 has no
-  // cohort to build and never issues a request of its own.
-  if (role == "rank0") {
+  // In the cohort modes only rank 0 owns prompts, so only rank 0 reads prompt
+  // files: rank 1 has no cohort to build and never issues a request of its
+  // own. The two-program modes run the same prompts on both ranks.
+  if (role == "rank0" || batched_w2 || serial_w2) {
     for (std::size_t index = 0; index < kMemberCount; ++index) {
       if (!prompt_file[index].empty() &&
           !ReadPromptFile(prompt_file[index], &prompt[index])) {
@@ -2118,6 +2183,14 @@ int main(int argc, char** argv) {
           .hip_device = static_cast<int>(device),
           .communicator = collectives,
       };
+      auto moe_inputs = std::make_shared<MoeInputHashes>();
+      if (moe_input_hashes) {
+        batched_options.moe_observer =
+            [moe_inputs](const float* data, std::size_t bytes,
+                         hipStream_t stream) {
+              moe_inputs->Observe(data, bytes, stream);
+            };
+      }
       auto batched_model =
           q::Model::Load(model_path, batched_options, &batched_error);
       if (!batched_model) {
@@ -2151,7 +2224,9 @@ int main(int argc, char** argv) {
         }
       }
       return RunBatchedW2("rank1", batched_model, batched_prompt, budget,
-                           context, collectives, serial_w2, &batched_error);
+                           context, collectives, serial_w2,
+                           moe_input_hashes ? moe_inputs.get() : nullptr,
+                           &batched_error);
     }
     const MtpSidecar mtp{
         .model_path = mtp_model_path,
@@ -2209,6 +2284,14 @@ int main(int argc, char** argv) {
         .hip_device = static_cast<int>(device),
         .communicator = collectives,
     };
+    auto moe_inputs = std::make_shared<MoeInputHashes>();
+    if (moe_input_hashes) {
+      batched_options.moe_observer =
+          [moe_inputs](const float* data, std::size_t bytes,
+                       hipStream_t stream) {
+            moe_inputs->Observe(data, bytes, stream);
+          };
+    }
     auto batched_model = q::Model::Load(model_path, batched_options, &error);
     if (!batched_model) {
       Warn("batched-w2 model load failed: " + error);
@@ -2240,7 +2323,8 @@ int main(int argc, char** argv) {
       }
     }
     return RunBatchedW2("rank0", batched_model, batched_prompt, budget,
-                         context, collectives, serial_w2, &error);
+                         context, collectives, serial_w2,
+                         moe_input_hashes ? moe_inputs.get() : nullptr, &error);
   }
 
   // 2. The rank-zero control peer listens; the worker connects and both

@@ -1565,6 +1565,9 @@ bool Executor::AllReduce(float* data, std::size_t rows,
     }
     return false;
   }
+  if (options_.moe_observer) {
+    options_.moe_observer(data, bytes, stream_);
+  }
   return true;
 }
 
@@ -1573,6 +1576,11 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                    bool last_only) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
+  if (options_.moe_observer) {
+    options_.moe_observer(
+        x, static_cast<std::size_t>(n_tokens) * c.hidden_size * sizeof(float),
+        stream_);
+  }
   // Router logits and the shared-expert gate come out of one GEMM.
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
@@ -1592,37 +1600,38 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       return false;
     }
   }
-  // The shared expert is owned by rank zero in the first hybrid layout. The
-  // routed contribution is reduced after the epilogue, so peers must not add
-  // a second copy of this dense output.
+  // Queue the shared-expert GEMMs after the count download, then prepare
+  // the routed dispatch on the CPU without waiting for these GEMMs.
   shexp_half_ready_ = false;
-  if (model_->tp_rank() != 0) {
-    if (!Check(hipMemsetAsync(s_.shexp_out, 0,
-                              static_cast<std::size_t>(n_tokens) *
-                                  c.hidden_size * sizeof(float),
-                              stream_),
-               "non-owner shared expert clear", error_msg)) {
+  if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
+                  &l.shexp_down, error_msg)) {
+    return false;
+  }
+  if (shexp_half_ready_) {
+    shexp_half_ready_ = false;
+    if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out,
+                      n_tokens, l.shexp_down.rows, l.shexp_down.cols,
+                      stream_)) {
+      AssignError(error_msg, "shared expert F16 GEMM failed");
       return false;
     }
-  } else {
-    // Queue the shared-expert GEMMs after the count download, then prepare
-    // the routed dispatch on the CPU without waiting for these GEMMs.
-    if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
-                    &l.shexp_down, error_msg)) {
-      return false;
-    }
-    if (shexp_half_ready_) {
-      shexp_half_ready_ = false;
-      if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out,
-                        n_tokens, l.shexp_down.rows, l.shexp_down.cols,
-                        stream_)) {
-        AssignError(error_msg, "shared expert F16 GEMM failed");
-        return false;
-      }
-    } else if (!Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens,
-                      error_msg)) {
-      return false;
-    }
+  } else if (!Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens,
+                    error_msg)) {
+    return false;
+  }
+  // Rank zero owns the shared expert's contribution, and the routed sum is
+  // reduced after the epilogue, so peers must not add a second copy. Peers
+  // still run the projections above: they rewrite the activation staging
+  // caches, and skipping them would leave a peer's later projections reusing
+  // a different staged copy than rank zero's, so the replicated state would
+  // drift apart (seen with full Q8).
+  if (model_->tp_rank() != 0 &&
+      !Check(hipMemsetAsync(s_.shexp_out, 0,
+                            static_cast<std::size_t>(n_tokens) *
+                                c.hidden_size * sizeof(float),
+                            stream_),
+             "non-owner shared expert clear", error_msg)) {
+    return false;
   }
   if (last_only && l.ffn_gate_exps.type == GgmlType::kQ8_0 &&
       l.ffn_up_exps.type == GgmlType::kQ8_0 &&

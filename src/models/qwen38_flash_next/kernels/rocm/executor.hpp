@@ -148,6 +148,12 @@ public:
     /// callback is required only when DeviceModel carries world_size > 1.
     std::function<bool(float*, std::size_t, hipStream_t, std::string*)>
         all_reduce;
+    /// Diagnostic observer called with every MoE input and, under TP, every
+    /// reduced MoE output, in forward order: a device buffer of rows x hidden
+    /// floats pending on the given stream. Null in production; probes set it
+    /// to compare ranks layer by layer.
+    std::function<void(const float*, std::size_t, hipStream_t)>
+        moe_observer;
   };
 
   /// The two-rank all-reduce over `communicator` for rows of `hidden` floats:

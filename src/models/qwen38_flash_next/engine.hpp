@@ -18,6 +18,8 @@
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 
+struct ihipStream_t;
+
 namespace gufo::core {
 class GgufReader;
 }
@@ -52,6 +54,10 @@ struct ModelOptions {
   std::uint32_t tp_world_size = 1;
   int hip_device = 0;
   std::shared_ptr<rocm::Communicator> communicator;
+  /// Diagnostic observer for MoE inputs and outputs; see Executor::Options. The
+  /// stream parameter is a `hipStream_t`, spelled without the HIP headers.
+  std::function<void(const float*, std::size_t, ihipStream_t*)>
+      moe_observer;
 };
 
 class Session;

@@ -614,23 +614,31 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   if (rows <= kDecodeRows)
     return Moe(l, x, out, rows, error);
   const auto& c = config();
+  if (options_.moe_observer) {
+    options_.moe_observer(
+        x, static_cast<std::size_t>(rows) * c.hidden_size * sizeof(float),
+        stream_);
+  }
   const Scratch base = s_;
   if (!DenseBatch(l.router, x, base.router, rows, error))
     return false;
   RouterTopK(base.router, c.num_experts + 1, base.ids, base.weights, rows,
              c.num_experts, c.num_experts_used, model_->expert_begin(),
              model_->local_experts(), stream_);
-  if (model_->tp_rank() != 0) {
-    if (!Check(hipMemsetAsync(base.shexp_out, 0,
-                              static_cast<std::size_t>(rows) * c.hidden_size *
-                                  sizeof(float),
-                              stream_),
-               error))
-      return false;
-  } else if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
-                              error) ||
-             !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows,
-                         error)) {
+  if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
+                       error) ||
+      !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error)) {
+    return false;
+  }
+  // Rank zero owns the shared expert's contribution; peers run the same
+  // projections so their activation staging state matches, then drop the
+  // output (see Executor::Moe).
+  if (model_->tp_rank() != 0 &&
+      !Check(hipMemsetAsync(base.shexp_out, 0,
+                            static_cast<std::size_t>(rows) * c.hidden_size *
+                                sizeof(float),
+                            stream_),
+             error)) {
     return false;
   }
   if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
