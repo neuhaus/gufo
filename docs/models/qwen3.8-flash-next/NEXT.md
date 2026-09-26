@@ -77,11 +77,23 @@ bugs two-host runs found.
 
 What is **not** done is lifting the restrictions the plan unblocks. The
 `TP2 requires greedy text without stop sequences` guard still refuses sampling,
-stop sequences and streaming. The end-of-run token comparison has been demoted
-to telemetry, so a divergence between the ranks is now logged with its position
-and both ids rather than failing the request -- that is correct under the plan,
-since the token originates on rank 0, but the check is kept because it is the
-cheapest signal that the exchange still works.
+stop sequences and streaming.
+
+The rank token comparison fails the request again. It had been demoted to a
+logged warning on the reasoning that the token originates on rank 0, but the
+step plan covers AR only: with MTP the runner decodes through `DecodeStep`,
+which never touches the step channel, so each rank still selects its own
+tokens and a divergence would have been served. A difference is never benign:
+either a token bypassed the plan or a step was stale or mis-sequenced, and
+either way the collectives combined partials from different states. Under the
+plan rank 1 also compares its own greedy choice, made on a copy of its sampler,
+with each token it consumes, because consuming rank 0's token would otherwise
+hide a numerical divergence such as the full-Q8 bug. The first disagreement
+fails the request at its end, after both ranks finished the collective schedule
+together. Fault injection on two hosts: a forced rank-1 disagreement at step 5
+returned HTTP 500 naming the step and both tokens, a corrupted rank-1 token
+under MTP returned 500 with the index logged, and in both runs the next request
+succeeded with the usual output.
 
 **Stop sequences are a protocol change, not plumbing.** Measured on two hosts:
 removing the guard lets a request with `stop` through and it is then **silently
@@ -94,7 +106,14 @@ above bit. So the rules have to travel: a field on `TpControlCommand`, a
 `kVersion` bump, encoder/decoder/validator changes, and rank 1 passing them into
 its own `Submit`. Even then nothing *forces* both ranks to stop on the same
 step; identical rules plus identical tokens should make them agree, and the
-token telemetry is what would show it if they did not.
+token comparison is what would show it if they did not.
+
+Rather than shipping the rules, rank 0 can send the decision: it already
+evaluates stop sequences, cancellation and client disconnects, and rank 1 always
+waits for the next step, so an end marker in place of the next token ends the
+request on both ranks at the same step. One mechanism then covers stop
+sequences, cancellation and streaming, and nothing depends on both ranks
+evaluating the rules identically.
 
 The same design question covers the rest of the remaining work: streaming,
 cancellation and a client-side stop all need rank 1 to learn that a request is
@@ -109,9 +128,10 @@ Order:
 2. Move the production fixes from `claude/c2-spike-serial` into #2 and condense
    #2 into a short, reviewable series.
 3. ~~Rank-0 step plan.~~ **Done and verified on two hosts** (above), and the
-   end-of-run comparison is now telemetry. Next: the request-end protocol --
-   carry stop rules to rank 1, then sampled decoding, then streaming and
-   cancellation, designed together rather than one guard at a time.
+   rank token comparison fails the request again (above). Next: the
+   request-end protocol -- an end marker from rank 0 for stop sequences, then
+   sampled decoding, then streaming and cancellation, designed together rather
+   than one guard at a time; and extending the plan to MTP drafts.
 4. Q8 quality against a reference, and the `slow`/`external-model` suites.
 5. Send TP2 C1 upstream together with the Q8 PLE loader (#1), which is not
    useful upstream on its own because Q8 needs two hosts.

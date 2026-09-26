@@ -425,11 +425,21 @@ ranks run a speculative prefill lookahead (`PreviewFirstToken`, called from
 participate in the exchange on either rank; `SelectNextImpl` takes an explicit
 `use_step_channel` flag for exactly this, and `PreviewFirstToken` passes false.
 
-**Not yet done.** The end-of-run token comparison is now telemetry: a divergence
-is logged with its index and both ids instead of failing the request, which is
-correct once the token originates on rank 0. It is kept rather than deleted
-because it is the cheapest signal that the exchange still behaves, and it would
-catch a stale or mis-sequenced step.
+**Rank agreement.** The rank token comparison fails the request again. It had been demoted to a
+logged warning on the reasoning that the token originates on rank 0, but the
+step plan covers AR only: with MTP the runner decodes through `DecodeStep`,
+which never touches the step channel, so each rank still selects its own
+tokens and a divergence would have been served. A difference is never benign:
+either a token bypassed the plan or a step was stale or mis-sequenced, and
+either way the collectives combined partials from different states. Under the
+plan rank 1 also compares its own greedy choice, made on a copy of its sampler,
+with each token it consumes, because consuming rank 0's token would otherwise
+hide a numerical divergence such as the full-Q8 bug. The first disagreement
+fails the request at its end, after both ranks finished the collective schedule
+together. Fault injection on two hosts: a forced rank-1 disagreement at step 5
+returned HTTP 500 naming the step and both tokens, a corrupted rank-1 token
+under MTP returned 500 with the index logged, and in both runs the next request
+succeeded with the usual output.
 
 The request restrictions themselves are still enforced. The
 `TP2 requires greedy text without stop sequences` guard still refuses sampling,
@@ -451,7 +461,13 @@ So stop sequences need the rules to travel on the wire: a field on
 `TpControlCommand`, a `kVersion` bump, encoder/decoder/validator changes, and
 rank 1 passing them into its own `Submit`. Even then nothing forces both ranks
 to stop on the same step -- identical rules and identical tokens should make
-them agree, and the token telemetry is what would show it if they did not.
+them agree, and the token comparison is what would show it if they did not.
+Rather than shipping the rules, rank 0 can send the decision: it already
+evaluates stop sequences, cancellation and client disconnects, and rank 1 always
+waits for the next step, so an end marker in place of the next token ends the
+request on both ranks at the same step. One mechanism then covers stop
+sequences, cancellation and streaming, and nothing depends on both ranks
+evaluating the rules identically.
 Streaming and cancellation have the same shape, since both need rank 1 to learn
 that a request is over rather than waiting for a token that is not coming, so
 they are worth designing together.
