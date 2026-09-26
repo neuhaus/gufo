@@ -336,3 +336,48 @@ experimental and must not be rendered into the published benchmark tables.
   bounded receive and both role bridges are implemented and hosted-tested, but
   nothing constructs them yet and the decode path is unchanged: `kStep` is still
   refused as an unknown kind by the worker.
+
+### Rank-0 step plan: arming order and the failure path
+
+The step plan is implemented and hosted-tested but **not armed**: nothing calls
+`SetStepChannel`, so both ranks still sample independently and the decode path
+is unchanged. What remains is a reordering, and the reason is a hazard rather
+than a preference.
+
+Rank 0's C1 flow today is: `Submit` (rank 0 starts decoding) ->
+`RegisterPendingResponse` -> `SendCommand(kSingle)` (rank 1 only now learns to
+start) -> `WaitForResponse` -> `request.Wait()` -> compare tokens.
+
+Arming the publisher before `Submit` would let rank 0's first `SelectNext`
+publish a `kStep` **before** the `kSingle` command reaches rank 1. Both travel
+the same ordered channel, so rank 1's worker loop would read the step first and
+refuse it as an unknown kind. Nothing today prevents that by construction: it
+holds only because rank 0's prefill costs at least one forward of `num_layers`
+collectives while the command is a local TCP write. A short prompt narrows that
+margin, and building lockstep on it would trade a real restriction for a race.
+
+So the command must be sent **before** rank 0's request is submitted. Rank 1
+then starts and blocks in `Consume` while rank 0 prefills, and rank 0's first
+published token releases it. That is the lockstep the design intends anyway:
+rank 1 waits for rank 0's first token in either order.
+
+What that costs is the failure path. The existing `catch` unconditionally does
+`request.Cancel()` and `request.Wait({})`, and with send-before-submit the
+`request` does not exist when `Submit` is what failed. The `send_started` and
+`response_received` flags also need re-derivation. The three cases that block
+must keep working:
+
+- **Command not sent.** Cancel the unsent response; rank 1 never started, so
+  there is nothing to drain.
+- **Command sent, response outstanding.** `FailAll`, so rank 1's eventual reply
+  is discarded instead of being correlated to whatever request runs next.
+- **Rank 0 fails mid-decode.** Rank 1 is blocked in `Consume` holding a
+  request open, so rank 0 must publish a `step_final` step before unwinding.
+  Rank 1's consumer treats `final` as a failure rather than an empty token,
+  because a consumer has nothing to hand its scheduler and returning token zero
+  would decode a valid-looking token attributed to a normal completion.
+
+The third case is the one that needs hardware. A hosted test can prove the
+protocol refuses a malformed step, an out-of-sequence step and an ended exchange,
+but only a two-host run that kills or stalls rank 0 mid-request can prove rank 1
+unblocks rather than waiting out `kStepTokenTimeout` on every later request.
