@@ -747,6 +747,74 @@ int main() {
 
   Require(server->port() == port && client->port() == port,
           "TP control service port");
-  std::puts("PASS: TP control handshake, C1/C2 envelopes, and broker routing");
+
+  // A bounded receive must return a command that arrives inside the bound, and
+  // must hand the socket back to the unbounded command wait afterwards rather
+  // than leaking a per-token bound into the next one.
+  {
+    const TpControlCommand prompt_step{
+        .sequence = command.sequence,
+        .kind = TpControlCommandKind::kStep,
+        .step_token = 1234,
+        .step_index = 3,
+    };
+    std::thread prompt_sender(
+        [&] { (void)server->SendCommand(prompt_step, &server_error); });
+    TpControlCommand within;
+    std::string within_error;
+    Require(client->ReceiveCommandWithin(&within, std::chrono::seconds(10),
+                                         &within_error),
+            "TP bounded receive must return a command inside its bound: " +
+                within_error);
+    prompt_sender.join();
+    Require(within.kind == TpControlCommandKind::kStep &&
+                within.step_token == 1234 && within.step_index == 3,
+            "TP bounded receive preserves the step it waited for");
+
+    // The next command is not sent yet, so this must simply keep waiting: the
+    // bound applied to the step must not have become the command wait's bound.
+    std::thread late_sender([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(400));
+      (void)server->SendCommand(command, &server_error);
+    });
+    TpControlCommand late;
+    std::string late_error;
+    Require(client->ReceiveCommand(&late, &late_error),
+            "TP command wait is unbounded again after a bounded receive: " +
+                late_error);
+    late_sender.join();
+    Require(late.sequence == command.sequence,
+            "TP unbounded command wait returns the command sent after the step");
+  }
+
+  // A bounded receive that expires must fail closed, and must leave the channel
+  // unusable rather than letting a later read reinterpret the tail of a partial
+  // frame. Nothing is sent here, so the bound is reached with an empty stream.
+  {
+    TpControlCommand expired;
+    std::string expired_error;
+    Require(!client->ReceiveCommandWithin(&expired,
+                                          std::chrono::milliseconds(150),
+                                          &expired_error) &&
+                !expired_error.empty(),
+            "TP bounded receive must fail when the bound expires");
+
+    // Poisoned: a further receive fails immediately instead of blocking or
+    // succeeding. If the stream were merely abandoned this would either hang
+    // forever or consume a later frame as if it were whole.
+    std::thread late_sender(
+        [&] { (void)server->SendCommand(command, &server_error); });
+    TpControlCommand after_poison;
+    std::string poison_error;
+    const bool poisoned = client->ReceiveCommandWithin(
+        &after_poison, std::chrono::milliseconds(150), &poison_error);
+    late_sender.join();
+    Require(!poisoned && !poison_error.empty(),
+            "TP bounded receive must stay refused after a timeout: " +
+                poison_error);
+  }
+
+  std::puts("PASS: TP control handshake, C1/C2 envelopes, step messages, "
+            "bounded receive, and broker routing");
   return 0;
 }

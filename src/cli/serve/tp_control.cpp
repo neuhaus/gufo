@@ -962,6 +962,28 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
   return true;
 }
 
+bool TpControlChannel::ReceiveCommandWithin(TpControlCommand* command,
+                                            std::chrono::milliseconds timeout,
+                                            std::string* error) {
+  if (receive_poisoned_.load(std::memory_order_acquire)) {
+    SetError(error, "TP control channel is unusable after a timed-out receive");
+    return false;
+  }
+  // `ReceiveFrame` takes `receive_mutex_` itself, so this must not hold it.
+  const auto bounded = std::max<std::int64_t>(timeout.count(), 1);
+  const timeval window{bounded / 1000, (bounded % 1000) * 1000};
+  (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &window, sizeof(window));
+  const bool received = ReceiveCommand(command, error);
+  if (!received) {
+    receive_poisoned_.store(true, std::memory_order_release);
+    return false;
+  }
+  // Back to waiting as long as the server stays idle: a per-token bound must
+  // not leak into the next command wait.
+  ClearReceiveTimeout(fd_);
+  return true;
+}
+
 bool TpControlChannel::SendResponse(const TpControlResponse& response,
                                     std::string* error) {
   if (!handshaken_ || rank_ != 1 ||

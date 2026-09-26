@@ -174,6 +174,18 @@ public:
                                  std::string* error);
   [[nodiscard]] bool ReceiveCommand(TpControlCommand* command,
                                     std::string* error);
+  /// Receive one command with a bounded wait, unlike `ReceiveCommand`, which
+  /// waits for as long as the server stays idle.
+  ///
+  /// `SO_RCVTIMEO` bounds each `read`, not each message, so a timeout can land
+  /// in the middle of a frame and desynchronize the stream with no safe way
+  /// back. A timeout therefore poisons the channel: every later receive fails
+  /// immediately rather than reinterpret the tail of a partial frame as a whole
+  /// one. This is the per-token path, where an unbounded wait would turn one
+  /// stalled peer into one stall per token rather than a single failure.
+  [[nodiscard]] bool ReceiveCommandWithin(TpControlCommand* command,
+                                          std::chrono::milliseconds timeout,
+                                          std::string* error);
   [[nodiscard]] bool SendResponse(const TpControlResponse& response,
                                   std::string* error);
   [[nodiscard]] bool ReceiveResponse(TpControlResponse* response,
@@ -208,6 +220,10 @@ private:
   std::mutex send_mutex_;
   std::mutex receive_mutex_;
   std::atomic<bool> interrupted_{false};
+  /// Set when a bounded receive timed out, after which the receive stream may
+  /// be mid-frame and no further receive is attempted. See
+  /// `ReceiveCommandWithin`.
+  std::atomic<bool> receive_poisoned_{false};
   std::vector<std::uint8_t> command_prompt_;
   std::vector<std::uint8_t> response_payload_;
 };
