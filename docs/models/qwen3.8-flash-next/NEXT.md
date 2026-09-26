@@ -35,7 +35,8 @@ needs both hosts; it does not fit one.
 | Decode, tok/s | Q4 TP2 | Q4 one host | Q8 TP2 |
 |---|---|---|---|
 | AR, one stream | 26.9 | 25.9 | 24.2 |
-| MTP, mixed / repetitive | 42.0 / 43.4 | 38.9 / 46.5 | 37.7 / 42.4 |
+| MTP greedy, mixed / repetitive | 41.7 / 43.0 | 38.7 / 46.4 | 37.4 / 42.3 |
+| MTP sampled (T 0.7, top-p 0.95), mixed / repetitive | 35.5 / 38.5 | 33.1 / 34.4 | |
 | AR batched, width 2 / 4 / 8 (probe only) | 44.8 / 63.2 / 87.7 | 45.7 / 76.3 / 108.7 | 37.2 / 54.4 / 76.2 |
 
 Prefill from 0 to 32K runs at 1,187 tok/s on TP2 against 1,422–1,457 on one
@@ -74,11 +75,10 @@ What would help, in order of payoff for effort:
 
 ## What does not work yet
 
-- **Sampled MTP.** Sampled requests work but decode token by token, well below
-  greedy MTP speed. Upstream's pending
+- **Upstream sampling defaults.** Upstream's pending
   `feat/model-sampling-defaults` (#277) makes requests without an explicit
-  temperature sampled (1.0 / top_p 0.95 / top_k 20), which makes this the
-  common case.
+  temperature sampled (1.0 / top_p 0.95 / top_k 20); TP2 now handles those
+  with MTP.
 - **Cache reuse.** Every request prefills its whole prompt, so multi-turn chats
   re-prefill their history; `--tp-cache-reuse` is refused until snapshots are
   mirrored.
@@ -106,13 +106,13 @@ Progress (update after every step):
 - [x] Greedy MTP through a `decode` instruction.
 - [x] Two-host qualification (TP2.md checklist; see EXPERIMENTS.md, "TP2
       rank-1 executor"). Speed unchanged against the pre-executor binary.
+- [x] Sampled MTP: the `decode` instruction carries rank 0's draw state and
+      the begin command the sampling configuration (protocol v8).
+- [ ] Cache reuse (mirrored snapshots), then C2 on the batched calls.
 
 Status: qualified on two hosts for Q4 and full Q8, AR and MTP. Sampling,
-streaming, stop sequences and client cancellation now work; outputs are
-byte-identical to the previous binary and speed is unchanged. Next in this
-line: sampled MTP (sampled requests on an MTP server decode token by token,
-about 24 tok/s against 31–42 for greedy MTP), then cache reuse, then C2.
-- [ ] Then sampled MTP, cache reuse, C2 on the batched calls.
+streaming, stop sequences and client cancellation work, and sampled requests
+use MTP. Next in this line: cache reuse, then C2.
 
 **Audit.** The scheduler reaches the model only through `TextRunnerPool`, which
 calls the runner and the request states:
