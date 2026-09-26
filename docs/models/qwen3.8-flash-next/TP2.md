@@ -425,9 +425,33 @@ ranks run a speculative prefill lookahead (`PreviewFirstToken`, called from
 participate in the exchange on either rank; `SelectNextImpl` takes an explicit
 `use_step_channel` flag for exactly this, and `PreviewFirstToken` passes false.
 
-**Not yet done.** The request restrictions the plan unblocks are still enforced:
-the `TP2 requires greedy text without stop sequences` guard still refuses
-sampling, stop sequences and streaming, and the end-of-run token comparison is
-still a gate rather than telemetry. That comparison is deliberate for now -- it
-is the check that would catch a regression in the plan -- and demoting it is a
-separate step, not something to fold in silently.
+**Not yet done.** The end-of-run token comparison is now telemetry: a divergence
+is logged with its index and both ids instead of failing the request, which is
+correct once the token originates on rank 0. It is kept rather than deleted
+because it is the cheapest signal that the exchange still behaves, and it would
+catch a stale or mis-sequenced step.
+
+The request restrictions themselves are still enforced. The
+`TP2 requires greedy text without stop sequences` guard still refuses sampling,
+stop sequences and streaming, and that refusal is load-bearing rather than
+incidental:
+
+- **Removing the stop-sequence part of the guard makes stop sequences silently
+  ignored, not working.** Measured on two hosts: a request with `stop: ["banana"]`
+  whose 200-token essay contained "banana" was accepted and still finished
+  `finish: length`. A client asking for a stop would get a full-length response,
+  which is worse than the 400 it replaced.
+- **The cause is structural.** `TpControlCommand` carries no stop rules -- the
+  struct has no stop field at all -- so rank 1 never receives them. The non-TP
+  path passes `.stop_sequences` into `Submit`; both TP2 paths omitted it, which
+  is what the experiment exposed. Rank 0 had the rules locally and rank 1 had
+  none, so the ranks would stop at different steps and desync at scope teardown.
+
+So stop sequences need the rules to travel on the wire: a field on
+`TpControlCommand`, a `kVersion` bump, encoder/decoder/validator changes, and
+rank 1 passing them into its own `Submit`. Even then nothing forces both ranks
+to stop on the same step -- identical rules and identical tokens should make
+them agree, and the token telemetry is what would show it if they did not.
+Streaming and cancellation have the same shape, since both need rank 1 to learn
+that a request is over rather than waiting for a token that is not coming, so
+they are worth designing together.

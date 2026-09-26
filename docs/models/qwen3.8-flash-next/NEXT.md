@@ -77,10 +77,30 @@ bugs two-host runs found.
 
 What is **not** done is lifting the restrictions the plan unblocks. The
 `TP2 requires greedy text without stop sequences` guard still refuses sampling,
-stop sequences and streaming, and the end-of-run token comparison is still
-enforced. That comparison is deliberate for now: it is the check that would
-catch a regression in the plan, and demoting it to telemetry is a separate,
-deliberate step rather than something to fold in silently.
+stop sequences and streaming. The end-of-run token comparison has been demoted
+to telemetry, so a divergence between the ranks is now logged with its position
+and both ids rather than failing the request -- that is correct under the plan,
+since the token originates on rank 0, but the check is kept because it is the
+cheapest signal that the exchange still works.
+
+**Stop sequences are a protocol change, not plumbing.** Measured on two hosts:
+removing the guard lets a request with `stop` through and it is then **silently
+ignored**. A 200-token essay whose text contained the stop word still finished
+`length`. The reason is that `TpControlCommand` carries no stop rules at all --
+the struct has no stop field -- so rank 1 never receives them and has nothing to
+evaluate, while rank 0 has the rules locally. A rank that stops where its peer
+does not is a desync at scope teardown, which is exactly where the four bugs
+above bit. So the rules have to travel: a field on `TpControlCommand`, a
+`kVersion` bump, encoder/decoder/validator changes, and rank 1 passing them into
+its own `Submit`. Even then nothing *forces* both ranks to stop on the same
+step; identical rules plus identical tokens should make them agree, and the
+token telemetry is what would show it if they did not.
+
+The same design question covers the rest of the remaining work: streaming,
+cancellation and a client-side stop all need rank 1 to learn that a request is
+over rather than waiting for a token that will not come. That is the thing to
+settle before implementing any of them, and it is why they are better done as
+one design than three patches.
 
 Order:
 1. Open an upstream issue asking whether two-host InfiniBand TP is wanted: it
@@ -88,11 +108,10 @@ Order:
    build gate (`GUFO_ENABLE_TP2_RDMA`) must stay off by default.
 2. Move the production fixes from `claude/c2-spike-serial` into #2 and condense
    #2 into a short, reviewable series.
-3. ~~Rank-0 step plan.~~ **Done and verified on two hosts** (above). Next:
-   demote the end-of-run token comparison to telemetry, then lift the
-   restrictions one at a time -- stop sequences first, since the stop decision
-   has to travel on the wire, then sampled decoding, then streaming and
-   cancellation.
+3. ~~Rank-0 step plan.~~ **Done and verified on two hosts** (above), and the
+   end-of-run comparison is now telemetry. Next: the request-end protocol --
+   carry stop rules to rank 1, then sampled decoding, then streaming and
+   cancellation, designed together rather than one guard at a time.
 4. Q8 quality against a reference, and the `slow`/`external-model` suites.
 5. Send TP2 C1 upstream together with the Q8 PLE loader (#1), which is not
    useful upstream on its own because Q8 needs two hosts.
