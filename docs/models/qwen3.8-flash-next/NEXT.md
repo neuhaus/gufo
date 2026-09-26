@@ -94,7 +94,9 @@ Started 2026-09-26, in the order of the list above.
       double-buffered by operation parity), a second control block for half
       B's position and indexer blocks, row offsets for PLE, and a larger
       prefill chunk so each half keeps today's 2048 rows of expert-weight
-      reuse. Expected about +37% prefill (≈1,600 tok/s against 1,167; one
+      reuse: 1024-token chunks alone cost 8% (1,065–1,069 against
+      1,142–1,167 tok/s at 2K–9K tokens), so run 4096-token chunks as two
+      2048-row halves. Expected about +37% prefill (≈1,600 tok/s against 1,167; one
       host 1,372). FP16 partials would only save about 14% and change
       numerics; a second NIC needs an independent PCIe path (the ConnectX-3's
       two ports share one Gen3 x4 link).
