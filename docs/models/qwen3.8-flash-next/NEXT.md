@@ -27,9 +27,10 @@ C2 probe, measurements and documentation.
 ## What works
 
 Two-host serving (`fuzzy` rank 0, `misty` rank 1, FDR InfiniBand) of one
-greedy, non-streaming request at a time, Q4 and full Q8, AR and MTP. Both hosts
-stay bit-identical; lost peers, scope mismatches and rank disagreement fail the
-request with HTTP 500. Full Q8 needs both hosts; it does not fit one.
+request at a time, Q4 and full Q8, AR and MTP, with sampling, streaming, stop
+sequences and client cancellation. Both hosts stay bit-identical; lost peers,
+scope mismatches and rank disagreement fail the request with HTTP 500. Full Q8
+needs both hosts; it does not fit one.
 
 | Decode, tok/s | Q4 TP2 | Q4 one host | Q8 TP2 |
 |---|---|---|---|
@@ -53,11 +54,14 @@ Why TP2 is not faster than one host on Q4:
 
 ## What does not work yet
 
-- **Ordinary clients.** The executor accepts sampled, streaming and `stop`
-  requests but is not yet qualified on two hosts. Upstream's pending
+- **Sampled MTP.** Sampled requests work but decode token by token, well below
+  greedy MTP speed. Upstream's pending
   `feat/model-sampling-defaults` (#277) makes requests without an explicit
-  temperature sampled (1.0 / top_p 0.95 / top_k 20), which the executor must
-  handle before that lands.
+  temperature sampled (1.0 / top_p 0.95 / top_k 20), which makes this the
+  common case.
+- **Cache reuse.** Every request prefills its whole prompt, so multi-turn chats
+  re-prefill their history; `--tp-cache-reuse` is refused until snapshots are
+  mirrored.
 - **Q8 quality.** The ranks agree with each other, but full Q8 has not been
   compared with a reference. It needs a CPU or reference-logit comparison,
   since Q8 does not fit one host.
@@ -80,14 +84,14 @@ Progress (update after every step):
 - [x] Request paths: sampling, streaming, stop sequences and cancellation no
       longer refused; both entry points share `StartTpRequest`.
 - [x] Greedy MTP through a `decode` instruction.
-- [ ] Two-host qualification (TP2.md checklist plus fault injection).
+- [x] Two-host qualification (TP2.md checklist; see EXPERIMENTS.md, "TP2
+      rank-1 executor"). Speed unchanged against the pre-executor binary.
 
-Status: implemented, builds on both hosts, and passes the hosted tests there,
-including `tp_executor_test`, which runs the real scheduler and pool on rank 0
-against an executor on rank 1 over a loopback channel. It fails when the
-single-token decode path forwards to the inner runner or when resets are not
-mirrored (checked by mutation). Not yet run on two hosts; TP2.md already
-describes the executor.
+Status: qualified on two hosts for Q4 and full Q8, AR and MTP. Sampling,
+streaming, stop sequences and client cancellation now work; outputs are
+byte-identical to the previous binary and speed is unchanged. Next in this
+line: sampled MTP (sampled requests on an MTP server decode token by token,
+about 24 tok/s against 31–42 for greedy MTP), then cache reuse, then C2.
 - [ ] Then sampled MTP, cache reuse, C2 on the batched calls.
 
 **Audit.** The scheduler reaches the model only through `TextRunnerPool`, which
@@ -215,4 +219,4 @@ behind the `Communicator` interface.
 - TP2 and one-host logits differ by reduction order and are compared with a
   tolerance, not bit-identity.
 - Full Q8 is not a supported serving target.
-- Neither TP2 target is usable with ordinary clients yet.
+- TP2 serves one request at a time.
