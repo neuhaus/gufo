@@ -280,12 +280,11 @@ class Session:
             command += speculative
         else:
             command += ["--speculative", "off"]
-        # The TP2 server currently admits only one draft, one pending request,
-        # one connection, and no request timeout or disk cache.
+        # The TP2 server currently admits only one pending request, one
+        # connection, and no request timeout or disk cache.
         command += [
             "--max-pending", "1", "--max-pending-per-client", "1",
             "--max-connections", "1", "--request-timeout-ms", "0",
-            "--draft-tokens", "1", "--min-draft-tokens", "1",
             "--tp-world-size", "2", "--tp-rank", str(rank),
             "--tp-bootstrap-port", str(config.get("bootstrap_port", 18515)),
             "--tp-control-port", str(config.get("control_port", 18516)),
