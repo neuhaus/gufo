@@ -8,12 +8,12 @@ measurements are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 ## Design
 
-**Partition.** Routed experts are split by rank (full Q8: rank 0 holds experts
-0–255, rank 1 experts 256–511). The shared expert's intermediate dimension is
-split in half. Dense, attention, GDN, HC, embedding, PLE and LM-head weights are
-replicated. Both hosts hold the complete checkpoint; RDMA carries activations,
-not weights. A rank with no locally selected experts contributes zeros and still
-takes part in the exchange.
+**Partition.** Every expert's intermediate dimension, routed and shared, is
+split in half: each rank holds units 0–319 or 320–639 of all 512 routed experts
+(those rows of gate/up, those columns of down, on quantization-block
+boundaries) and computes every selected expert on its half. Dense, attention,
+GDN, HC, embedding, PLE and LM-head weights are replicated. Both hosts hold the
+complete checkpoint; RDMA carries activations, not weights.
 
 **Exchange.** Each MoE layer ends in one exchange of the ranks' partial outputs:
 48 per token, 10 KiB per decode row. Each rank stages its partial in host
