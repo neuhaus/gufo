@@ -108,7 +108,8 @@ Progress (update after every step):
       rank-1 executor"). Speed unchanged against the pre-executor binary.
 - [x] Sampled MTP: the `decode` instruction carries rank 0's draw state and
       the begin command the sampling configuration (protocol v8).
-- [ ] Cache reuse (mirrored snapshots), then C2 on the batched calls.
+- [ ] Cache reuse (mirrored snapshots; outline below), then C2 on the
+      batched calls.
 
 Status: qualified on two hosts for Q4 and full Q8, AR and MTP. Sampling,
 streaming, stop sequences and client cancellation work, and sampled requests
@@ -168,6 +169,143 @@ Traps the audit found:
 - The dormant C2 worker path needs rank 1's scheduler, so it is retired; C2
   returns later on batched instructions.
 - Cost: one small message per model call, as with the step plan.
+
+## Next: cache reuse on the executor
+
+Not started. Without it every TP2 request prefills its whole prompt, so a
+multi-turn chat re-prefills its history on every turn (about 1,190 tok/s on
+TP2, so roughly 7 s per 8K tokens of history), and `--tp-cache-reuse` is
+refused. The step-plan design had qualified symmetric rank-local reuse
+(EXPERIMENTS.md, "TP2 symmetric live-prefix handoff" and "TP2 rank-local
+immutable snapshot boundary") because rank 1 ran its own identical scheduler
+and cache. Rank 1 now has neither, so every cache action that touches model
+state must reach it as an instruction, like the prefill and decode calls do.
+
+### What the cache does on one host
+
+`TextRunnerPool` owns a `ContinuationCache` of request states plus immutable
+host snapshots, and on a request:
+
+1. **Acquire** picks a state: a *live hit* keeps a state whose session already
+   holds a prefix of the prompt (no copy); a *snapshot hit* restores an older
+   boundary into a state (`RestoreOrFork`); otherwise it resets a state. A hit
+   calls `PreparePrefixReuse` (Flash-Next: checks the position and resets the
+   MTP draft-length controller).
+2. **Prompt snapshot**: after prefilling up to the stable prompt boundary
+   (`cache_prefix_tokens`, before the assistant framing), the pool captures a
+   snapshot on a `std::async` worker (`runner->Snapshot`) while the state is
+   frozen, and joins the capture before the next call that mutates the state.
+   A failed capture is skipped, not fatal.
+3. **Commit** records the prompt snapshot and the live frontier as reusable;
+   eviction drops snapshots under a host-memory budget
+   (`HostSnapshotBudgetBytes`, half of available memory).
+
+On Flash-Next a snapshot is a host copy of the session (KV cache, recurrent
+state, draft-block state, last logits), about 120–170 MB per resident session
+at the depths measured. Both ranks hold identical session contents, so each
+rank can keep its own copy; snapshot bytes never cross hosts.
+
+### What must be mirrored
+
+| Rank-0 call | Instruction | Rank 1 |
+| --- | --- | --- |
+| `Snapshot(state)` (capture worker) | `snapshot(state, id)` | capture its own copy into a table under `id` |
+| destruction of a mirrored snapshot | `drop(id)` (also between requests) | free the table entry |
+| `RestoreOrFork(state, snapshot)` | `restore(state, id)` | restore from its table |
+| `PreparePrefixReuse(state, prefix)` | `reuse(state, prefix_size)` | the same call with the `kSingle` prompt's first `prefix_size` tokens |
+| `PrepareCancellation(state)` | `cancel-prepare(state)` | the same call (a no-op on Flash-Next; mirrored for other runners) |
+| `SnapshotPayloadBytes`, `CheckpointPosition` | none | read-only |
+
+Live hits need nothing extra: every call that changed the state was already
+mirrored, so rank 1's session holds the same prefix.
+
+### Design
+
+1. **Snapshot identity and lifetime.** `TpMirroredRunner::Snapshot` returns a
+   `TpMirroredSnapshot` (a `TextRunnerSnapshot` holding the inner snapshot and a
+   channel-wide monotonic id, never reused) and sends `snapshot(state, id)`
+   *before* copying. Its destructor sends `drop(id)`; destruction can happen
+   on the scheduler thread, in the cache or at shutdown, so the send is
+   `noexcept` and a failure is recorded like a failed reset. `PayloadBytes`
+   forwards to the inner snapshot, so rank 0's budget accounting is
+   unchanged. If rank 0's own capture throws after the instruction went out,
+   the wrapper sends `drop(id)` before rethrowing so rank 1 does not keep an
+   orphan.
+2. **Ordering.** The capture runs on the pool's worker thread, not the
+   scheduler thread. That is safe because the pool freezes the state: no call
+   that mutates it is made (so no instruction for it is sent) until the
+   capture is joined, and the capture's instruction goes out before the copy
+   starts. The channel send is already serialized by the sink's mutex. Add an
+   assertion that `Snapshot` is only called while a request is being mirrored,
+   and a hosted test that holds the capture open while the scheduler tries to
+   proceed.
+3. **Rank-1 capture.** First version: synchronous when the instruction
+   arrives. Rank 0 cannot advance that state until its own capture is joined,
+   so rank 1's copy overlaps rank 0's and the stall is roughly the same copy
+   time on both. Measure it; only if rank 1 becomes the laggard, capture on a
+   rank-1 worker and join before the next instruction that names the state.
+4. **Digest.** Add the snapshot id, and after `restore` and `reuse` the state's
+   `CheckpointPosition`, so a missing or mismatched restore fails the request.
+5. **Asymmetric failure.** A rank-1 capture or restore can fail where rank
+   0's succeeded (for example rank 1 has less free host memory). Then rank 0's
+   cache holds an entry rank 1 cannot restore, and every later hit on it would
+   fail. Recovery, in order of preference:
+   - rank 1 lists the ids it failed to capture or no longer holds in its
+     `kEnd` response, and rank 0 invalidates the cache entries that hold them
+     (needs a `TextRunnerPool`/`ContinuationCache` call to drop entries by
+     snapshot);
+   - simpler fallback: on any rank-1 failure in a cached request, rank 0
+     clears its whole continuation cache, which resets and drops everything on
+     both ranks.
+   Either way the failing request itself returns HTTP 500, and the next one
+   succeeds without reuse.
+6. **Memory.** Rank 1 allocates the same snapshots as rank 0 but is not
+   consulted by rank 0's budget. Take the budget as the smaller of the two
+   hosts' at startup: rank 1 can report its `HostSnapshotBudgetBytes` in the
+   handshake. This also bounds the orphan risk.
+7. **Configuration.** Remove the `--tp-cache-reuse` refusal in `load()` and the
+   snapshot check in the `TpMirroredRunner` constructor; forward the inner
+   runner's `snapshot`, `fork`, `prefix_reuse` and `preserve_snapshot_prefix`
+   capabilities and `retained_snapshot_capacity_bytes` instead of clearing
+   them. Keep the handshake requiring both ranks to agree on the flag. Disk
+   persistence stays refused: snapshots are rank-local and never serialized.
+8. **Protocol v9**: instruction operations `snapshot`, `restore`, `drop`,
+   `reuse`, `cancel-prepare`, and a snapshot id field; `drop`, like a reset,
+   may arrive between requests.
+
+### Implementation order
+
+1. Protocol and validation, with round-trip and refusal tests in
+   `tp_control_test`.
+2. `TpMirroredSnapshot` and the wrapper calls; the rank-1 snapshot table and
+   executor cases; digest additions.
+3. Extend `tp_executor_test`: give the toy runner snapshots (copy its tokens),
+   send `cache_prompt` requests, and check that both ranks make identical
+   calls across a multi-turn conversation (live hit), a branch back to an
+   older boundary (snapshot restore), eviction (every rank-0 drop reaches rank
+   1, and rank 1's table size equals the snapshots rank 0 still holds), a
+   capture on a worker thread, and a failed rank-1 capture (the request fails,
+   the cache recovers, the next request succeeds). Mutation-check each: a
+   missing `drop`, a missing `reuse`, a restore of the wrong id.
+4. Failure recovery (item 5), then the memory budget exchange (item 6).
+5. Two-host qualification.
+
+### Qualification on two hosts
+
+- Multi-turn greedy chat with `cache_prompt`: turn two reports
+  `cached_prompt_tokens` close to the previous turn's length, prefill time
+  drops accordingly, and the output equals the same conversation served
+  uncached.
+- Branching: two continuations of one prefix restore the older boundary, and
+  both outputs equal their uncached versions.
+- Sampled and MTP requests with reuse (the draft-length controller is reset on
+  reuse on both ranks).
+- Eviction under a small budget: rank 1's resident snapshot bytes track rank
+  0's, and nothing leaks after many requests.
+- Client disconnect during a prompt-snapshot capture, then a cached request.
+- Killing rank 1 fails closed as before.
+- Speed: time to first token for a turn with 8K tokens of reusable history,
+  against uncached TP2 and against one host with its cache.
 
 ## Plan
 
