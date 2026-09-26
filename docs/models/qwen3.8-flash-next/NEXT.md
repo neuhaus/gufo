@@ -46,10 +46,10 @@ token agreement in every passing run.
 
 Neither TP2 target is usable in practice yet.
 
-- **Q4 on TP2** works but offers nothing over one host: 26.9 against 25.9 tok/s
-  AR; TP2 serving runs MTP with only one draft token (31.68/39.07 tok/s
-  mixed/repetitive at d4096, TP2.md) against one host's adaptive chain of up to
-  seven (34.57/47.92); and from width 4 up TP2 is slower (table below).
+- **Q4 on TP2** works but offers little over one host: 26.9 against 25.9 tok/s
+  AR; with MTP (up to seven drafts) 42.03/43.41 tok/s mixed/repetitive against
+  one host's 38.87/46.48 on the same requests; and from width 4 up TP2 AR is
+  slower (table below).
 - **Q8 on TP2** is correct (ranks agree bit for bit; a 2,117-token prompt
   decoded at 23 tok/s over HTTP) and is the reason for TP2, since Q8 does not
   fit one host. Ordinary clients cannot use it yet: requests must be greedy
@@ -125,19 +125,27 @@ limits TP2 at higher concurrency.
 The upstream headline figures (59.41 tok/s single user, 157.22 tok/s at eight
 users) are MTP on the repetitive prompt. On mixed text one-host MTP reaches
 106.47 tok/s at eight users, about AR's 108.67, so AR against AR is the matched
-comparison above. TP2 C1 serving runs MTP but is capped at one draft token, and
-C2 refuses MTP, so on repetitive text one host with MTP still leads TP2.
+comparison above. C2 refuses MTP; the rank-0 step plan would carry draft
+lengths and acceptance, which is how C2 can admit MTP.
 
-The one-draft cap (`serve.cpp`, from "reject unsupported concurrency early")
-has no recorded technical reason; one draft was the width qualified on
-hardware. The length controller depends only on acceptance history, never on
-timings (`mtp_policy.hpp`), so ranks with identical tokens choose identical
-draft lengths and issue identical collectives. Rank 0 already fails a request
-whose worker draft telemetry differs, and multi-row verification now agrees
-across ranks at 2, 4 and 8 rows. Lifting the cap needs a hardware
-qualification: drafts up to seven on Q4 and Q8, mixed and repetitive prompts,
-matching tokens and draft telemetry, and the speed. The rank-0 step plan would
-also carry draft lengths and acceptance, which is how C2 can admit MTP.
+TP2 C1 serving now runs MTP with the normal adaptive chain of up to seven
+drafts; the former one-draft cap had no technical reason. The length controller
+depends only on acceptance history, never on timings (`mtp_policy.hpp`), so
+ranks with identical tokens choose identical draft lengths, and rank 0 fails a
+request whose worker draft telemetry differs. Serving, greedy, 256 tokens after
+a ~2,000-token benchmark prompt (`prose`/`repetition` tasks), tok/s:
+
+| Configuration | Mixed | Repetitive |
+|---|---|---|
+| Q4 TP2, 1 draft | 39.06 | 40.31 |
+| Q4 TP2, up to 7 | 42.03 | 43.41 |
+| Q4 one host, up to 7 | 38.87 | 46.48 |
+| Q8 TP2, 1 draft | 34.93 | 37.70 |
+| Q8 TP2, up to 7 | 37.65 | 42.41 |
+
+Both ranks agreed on tokens and draft telemetry in every request, and each TP2
+output matched its one-draft output exactly. With MTP, Q8 TP2 decodes 1.6–1.8×
+faster than its AR rate (about 24 tok/s).
 
 For Q4, TP2 is a capacity path, not yet a speed path. Profiles and
 microbenchmarks show why:

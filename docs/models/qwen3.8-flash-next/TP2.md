@@ -58,7 +58,6 @@ build/gpu-tp2/gufo serve llm \
   --model models/qwen3.8-flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --speculative mtp \
   --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  --draft-tokens 1 --min-draft-tokens 1 \
   --tp-world-size 2 --tp-rank 0 \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
   --tp-control-token SHARED_TOKEN \
@@ -69,7 +68,6 @@ build/gpu-tp2/gufo serve llm \
   --model models/qwen3.8-flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --speculative mtp \
   --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  --draft-tokens 1 --min-draft-tokens 1 \
   --tp-world-size 2 --tp-rank 1 \
   --tp-bootstrap-host RANK0_ADDRESS \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
