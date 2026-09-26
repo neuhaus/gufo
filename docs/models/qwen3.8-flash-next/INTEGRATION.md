@@ -7,6 +7,11 @@ started. This is the reproducible baseline and implementation handoff.
 
 `codex/tp2-q8-integration` combines TP2 `d71fc6c` with Q8 PLE `426ab78` in merge
 commit `0cf273a9124ebc63c08a123025075f3802bd25c9`. The merge was conflict-free.
+That commit is the tree both hosts built and qualified, and it is deliberately
+**not** an ancestor of this branch: the branch has gained documentation since.
+Fetch it with `git fetch origin tag tp2-q8-integration-baseline`, which points at
+that exact commit. Citing the branch tip instead would assert that the current
+tree was the qualified one, which is a stronger claim than the evidence supports.
 The separate `pr/tp2-c1` and `pr/q8-ple` branches were not changed. They remain
 separate upstream review units; their combination is the hardware qualification
 target. The TP2 spike alone does not contain the Q8 PLE loader.
