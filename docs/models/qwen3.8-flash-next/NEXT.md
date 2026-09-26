@@ -72,7 +72,8 @@ microbenchmarks show why:
 Proposed order for TP2 speed:
 1. Split the shared expert across ranks: each computes half its intermediate
    dimension and the partial sums ride the existing all-reduce, so it adds no
-   collective. Removes rank 0's extra work and the rank-1 wait.
+   collective. Both ranks already run the shared expert (the Q8 fix below), so
+   the split halves that work and recovers the fix's ~3%.
 2. Split the replicated dense projections (true tensor parallelism for
    attention, GDN and HC projections). This is the only change that can make
    TP2 decode clearly faster than one host, and it adds collectives, so the
@@ -274,29 +275,21 @@ worker running more than one session must not run the serial contract.
   response contract requires zero draft telemetry per member. Decide whether
   that stays permanent or whether the response contract grows draft fields.
 
-## 3. Full Q8 — blocked
+## 3. Full Q8 — cross-rank divergence fixed
 
-Unqualified and separate from the above. Full Q8 fits memory at ~71,647 MiB GPU
-allocation per rank, but long-context AR ranks diverge numerically and the HTTP
-path reports `TP worker token mismatch`. Shard hashes are identical on both
-hosts, so this is not a transfer problem.
+Full Q8 fits memory at ~71,647 MiB GPU allocation per rank. The long-context
+divergence and the HTTP `TP worker token mismatch` had one root cause: only rank
+0 ran the shared expert, and its Q8_0 projections re-key the executor's
+activation staging caches. Rank 1 then reused a differently rounded staged copy
+in later projections. Every rank now runs the shared expert and peers drop its
+output (see `EXPERIMENTS.md`). The Q8 PLE gather was excluded first (#1).
 
-The ordered diagnostic plan is in `Q8.md`, added by
-[#1](https://github.com/neuhaus/gufo/pull/1). Its first step, a host-only PLE
-gather hash for the retained long prompt, has run: both hosts produced identical
-hashes, so PLE is excluded.
-
-Next, locate the first divergence directly. Each all-reduce computes local plus
-peer from the same two buffers, so both ranks hold bit-identical hidden states
-right after every all-reduce. A divergence must therefore come from a replicated
-kernel between two all-reduces that gives different results on the two hosts,
-for example through nondeterministic accumulation, or from host-dependent
-input. A per-layer hidden-state hash on both ranks names the first divergent
-layer and stage; the router digest in `Q8.md` then shows whether routing flips
-there. Do not change the Q8 quantizer, expert offsets or reduction order before
-that evidence exists.
-
-The supported baseline remains Q4 UD-Q4_K_XL plus a shared-Q8 MTP sidecar.
+Q8 ranks now agree bit for bit on the retained long prompt, and Q8 TP2 serving
+answered a 2,117-token prompt at 23.0 tok/s decode. Still open before Q8 is a
+supported target: a quality check against a reference (Q8 does not fit one
+host, so it needs a CPU or reference-logit comparison), the `slow` and
+`external-model` suites, and the shared-expert split to recover the ~3% the fix
+costs. `Q8.md` in #1 should record the closure.
 
 ## 4. Verification debt
 
@@ -327,4 +320,5 @@ The supported baseline remains Q4 UD-Q4_K_XL plus a shared-Q8 MTP sidecar.
   the host float sum changes the reduction order relative to a single device.
   Between the two ranks the sum has two operands, so both ranks get the same
   result and it does not by itself make them disagree.
-- Full Q8 is not a supported serving target.
+- Full Q8 is not yet a supported serving target: the ranks now agree, but its
+  quality has not been checked against a reference.
