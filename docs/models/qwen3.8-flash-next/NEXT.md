@@ -28,9 +28,10 @@ C2 probe, measurements and documentation.
 
 Two-host serving (`fuzzy` rank 0, `misty` rank 1, FDR InfiniBand) of one
 request at a time, Q4 and full Q8, AR and MTP, with sampling, streaming, stop
-sequences and client cancellation. Both hosts stay bit-identical; lost peers,
-scope mismatches and rank disagreement fail the request with HTTP 500. Full Q8
-needs both hosts; it does not fit one.
+sequences, client cancellation and history reuse as on one host.
+Both hosts stay bit-identical; lost peers, scope mismatches and rank
+disagreement fail the request with HTTP 500. Full Q8 needs both hosts; it does
+not fit one.
 
 | Decode, tok/s | Q4 TP2 | Q4 one host | Q8 TP2 |
 |---|---|---|---|
@@ -79,9 +80,6 @@ What would help, in order of payoff for effort:
   `feat/model-sampling-defaults` (#277) makes requests without an explicit
   temperature sampled (1.0 / top_p 0.95 / top_k 20); TP2 now handles those
   with MTP.
-- **Cache reuse.** Every request prefills its whole prompt, so multi-turn chats
-  re-prefill their history; `--tp-cache-reuse` is refused until snapshots are
-  mirrored.
 - **Q8 quality.** The ranks agree with each other, but full Q8 has not been
   compared with a reference. It needs a CPU or reference-logit comparison,
   since Q8 does not fit one host.
@@ -108,12 +106,14 @@ Progress (update after every step):
       rank-1 executor"). Speed unchanged against the pre-executor binary.
 - [x] Sampled MTP: the `decode` instruction carries rank 0's draw state and
       the begin command the sampling configuration (protocol v8).
-- [ ] Cache reuse (mirrored snapshots; outline below), then C2 on the
-      batched calls.
+- [x] Cache reuse: mirrored snapshots, prefix reuse and drops (protocol v9),
+      qualified on Q4 (below).
+- [ ] C2 on the batched calls.
 
 Status: qualified on two hosts for Q4 and full Q8, AR and MTP. Sampling,
 streaming, stop sequences and client cancellation work, and sampled requests
-use MTP. Next in this line: cache reuse, then C2.
+use MTP, and history is reused as on one host. Next in this
+line: C2.
 
 **Audit.** The scheduler reaches the model only through `TextRunnerPool`, which
 calls the runner and the request states:
@@ -124,8 +124,8 @@ calls the runner and the request states:
 | `Advance(state, token)` | one forward, exchanges | `advance(state, token)` |
 | `DecodeStep(state, max, sampler)`, MTP | draft and verify, exchanges | `decode(state, max)`, greedy only at first |
 | `state.Invalidate()` (called by the cache, not the runner) | session reset | `invalidate(state)` |
-| `PreparePrefixReuse` | resets the MTP draft-length controller | later, with cache reuse |
-| `Snapshot`, `RestoreOrFork` | host copies of session state | later, with cache reuse |
+| `PreparePrefixReuse` | resets the MTP draft-length controller | `reuse(state, prefix_size)` |
+| `Snapshot`, `RestoreOrFork` | host copies of session state | `snapshot(state, id)`, `restore(state, id)`; `drop(id)` when rank 0 frees it |
 | `AdvanceBatch`, `DecodeBatch` | batched forwards | later, C2 |
 | `SelectNext`, `PreviewFirstToken`, `CheckpointPosition`, `Decode` | logits and bookkeeping only | none |
 
@@ -165,241 +165,51 @@ Traps the audit found:
   closed.
 - Sampled requests with MTP loaded decode token by token (local selection plus
   `advance`) until sampled MTP is mirrored.
-- `--tp-cache-reuse` is refused in executor mode until snapshots are mirrored.
 - The dormant C2 worker path needs rank 1's scheduler, so it is retired; C2
   returns later on batched instructions.
 - Cost: one small message per model call, as with the step plan.
 
-## Next: cache reuse on the executor
+## Cache reuse on the executor
 
-Not started. Without it every TP2 request prefills its whole prompt, so a
-multi-turn chat re-prefills its history on every turn (about 1,190 tok/s on
-TP2, so roughly 7 s per 8K tokens of history), and `--tp-cache-reuse` is
-refused. The step-plan design had qualified symmetric rank-local reuse
-(EXPERIMENTS.md, "TP2 symmetric live-prefix handoff" and "TP2 rank-local
-immutable snapshot boundary") because rank 1 ran its own identical scheduler
-and cache. Rank 1 now has neither, so every cache action that touches model
-state must reach it as an instruction, like the prefill and decode calls do.
+Done 2026-09-26 and the default (protocol v10; `--tp-cache-reuse` is gone);
+design in [TP2.md](TP2.md#cache-reuse), evidence in EXPERIMENTS.md ("TP2 cache
+reuse on the executor").
 
-### What the cache does on one host
+How it differs from the outline: rank 1 acknowledges every cache operation
+before either rank continues, so an asymmetric failure is known at once
+instead of reported in `kEnd`; a failed capture on either rank skips the
+snapshot (as on one host) and rank 0 drops the id; any other rank-1 failure
+fails the request and rank 0 clears its whole cache. The first hardware run
+found TP2 caching differently from one host (a replay restored 16 of 23 tokens
+in 93 ms): two workarounds from rank-local caching, a stable-prefix boundary
+without the generation prompt and `preserve_snapshot_prefix`, were still
+active. Both are removed, and the control socket now sets `TCP_NODELAY`.
 
-`TextRunnerPool` owns a `ContinuationCache` of request states plus immutable
-host snapshots, and on a request:
+Qualified on Q4: TP2 cached output equals one-host cached output with the same
+hits; a replay restores the whole prompt in about 5 ms; 5.9K tokens of history
+reach the first token in 124–141 ms instead of about 4.9 s; MTP speed is
+unchanged; functional and kill checks pass; rank 1's memory stays flat.
 
-1. **Acquire** picks a state: a *live hit* keeps a state whose session already
-   holds a prefix of the prompt (no copy); a *snapshot hit* restores an older
-   boundary into a state (`RestoreOrFork`); otherwise it resets a state. A hit
-   calls `PreparePrefixReuse` (Flash-Next: checks the position and resets the
-   MTP draft-length controller).
-2. **Prompt snapshot**: after prefilling up to the stable prompt boundary
-   (`cache_prefix_tokens`, before the assistant framing), the pool captures a
-   snapshot on a `std::async` worker (`runner->Snapshot`) while the state is
-   frozen, and joins the capture before the next call that mutates the state.
-   A failed capture is skipped, not fatal.
-3. **Commit** records the prompt snapshot and the live frontier as reusable;
-   eviction drops snapshots under a host-memory budget
-   (`HostSnapshotBudgetBytes`, half of available memory).
+Open:
 
-On Flash-Next a snapshot is a host copy of the session (KV cache, recurrent
-state, draft-block state, last logits), about 120–170 MB per resident session
-at the depths measured. Both ranks hold identical session contents, so each
-rank can keep its own copy; snapshot bytes never cross hosts.
-
-### What must be mirrored
-
-| Rank-0 call | Instruction | Rank 1 |
-| --- | --- | --- |
-| `Snapshot(state)` (capture worker) | `snapshot(state, id)` | capture its own copy into a table under `id` |
-| destruction of a mirrored snapshot | `drop(id)` (also between requests) | free the table entry |
-| `RestoreOrFork(state, snapshot)` | `restore(state, id)` | restore from its table |
-| `PreparePrefixReuse(state, prefix)` | `reuse(state, prefix_size)` | the same call with the `kSingle` prompt's first `prefix_size` tokens |
-| `PrepareCancellation(state)` | `cancel-prepare(state)` | the same call (a no-op on Flash-Next; mirrored for other runners) |
-| `SnapshotPayloadBytes`, `CheckpointPosition` | none | read-only |
-
-Live hits need nothing extra: every call that changed the state was already
-mirrored, so rank 1's session holds the same prefix.
-
-### Design
-
-1. **Snapshot identity and lifetime.** `TpMirroredRunner::Snapshot` returns a
-   `TpMirroredSnapshot` (a `TextRunnerSnapshot` holding the inner snapshot and a
-   channel-wide monotonic id, never reused) and sends `snapshot(state, id)`
-   *before* copying. Its destructor sends `drop(id)`; destruction can happen
-   on the scheduler thread, in the cache or at shutdown, so the send is
-   `noexcept` and a failure is recorded like a failed reset. `PayloadBytes`
-   forwards to the inner snapshot, so rank 0's budget accounting is
-   unchanged. If rank 0's own capture throws after the instruction went out,
-   the wrapper sends `drop(id)` before rethrowing so rank 1 does not keep an
-   orphan.
-2. **Ordering.** The capture runs on the pool's worker thread, not the
-   scheduler thread. That is safe because the pool freezes the state: no call
-   that mutates it is made (so no instruction for it is sent) until the
-   capture is joined, and the capture's instruction goes out before the copy
-   starts. The channel send is already serialized by the sink's mutex. Add an
-   assertion that `Snapshot` is only called while a request is being mirrored,
-   and a hosted test that holds the capture open while the scheduler tries to
-   proceed.
-3. **Rank-1 capture.** First version: synchronous when the instruction
-   arrives. Rank 0 cannot advance that state until its own capture is joined,
-   so rank 1's copy overlaps rank 0's and the stall is roughly the same copy
-   time on both. Measure it; only if rank 1 becomes the laggard, capture on a
-   rank-1 worker and join before the next instruction that names the state.
-4. **Digest.** Add the snapshot id, and after `restore` and `reuse` the state's
-   `CheckpointPosition`, so a missing or mismatched restore fails the request.
-5. **Asymmetric failure.** A rank-1 capture or restore can fail where rank
-   0's succeeded (for example rank 1 has less free host memory). Then rank 0's
-   cache holds an entry rank 1 cannot restore, and every later hit on it would
-   fail. Recovery, in order of preference:
-   - rank 1 lists the ids it failed to capture or no longer holds in its
-     `kEnd` response, and rank 0 invalidates the cache entries that hold them
-     (needs a `TextRunnerPool`/`ContinuationCache` call to drop entries by
-     snapshot);
-   - simpler fallback: on any rank-1 failure in a cached request, rank 0
-     clears its whole continuation cache, which resets and drops everything on
-     both ranks.
-   Either way the failing request itself returns HTTP 500, and the next one
-   succeeds without reuse.
-6. **Memory.** Rank 1 allocates the same snapshots as rank 0 but is not
-   consulted by rank 0's budget. Take the budget as the smaller of the two
-   hosts' at startup: rank 1 can report its `HostSnapshotBudgetBytes` in the
-   handshake. This also bounds the orphan risk.
-7. **Configuration.** Remove the `--tp-cache-reuse` refusal in `load()` and the
-   snapshot check in the `TpMirroredRunner` constructor; forward the inner
-   runner's `snapshot`, `fork`, `prefix_reuse` and `preserve_snapshot_prefix`
-   capabilities and `retained_snapshot_capacity_bytes` instead of clearing
-   them. Keep the handshake requiring both ranks to agree on the flag. Disk
-   persistence stays refused: snapshots are rank-local and never serialized.
-8. **Protocol v9**: instruction operations `snapshot`, `restore`, `drop`,
-   `reuse`, `cancel-prepare`, and a snapshot id field; `drop`, like a reset,
-   may arrive between requests.
-
-### Implementation order
-
-1. Protocol and validation, with round-trip and refusal tests in
-   `tp_control_test`.
-2. `TpMirroredSnapshot` and the wrapper calls; the rank-1 snapshot table and
-   executor cases; digest additions.
-3. Extend `tp_executor_test`: give the toy runner snapshots (copy its tokens),
-   send `cache_prompt` requests, and check that both ranks make identical
-   calls across a multi-turn conversation (live hit), a branch back to an
-   older boundary (snapshot restore), eviction (every rank-0 drop reaches rank
-   1, and rank 1's table size equals the snapshots rank 0 still holds), a
-   capture on a worker thread, and a failed rank-1 capture (the request fails,
-   the cache recovers, the next request succeeds). Mutation-check each: a
-   missing `drop`, a missing `reuse`, a restore of the wrong id.
-4. Failure recovery (item 5), then the memory budget exchange (item 6).
-5. Two-host qualification.
-
-### Qualification on two hosts
-
-- Multi-turn greedy chat with `cache_prompt`: turn two reports
-  `cached_prompt_tokens` close to the previous turn's length, prefill time
-  drops accordingly, and the output equals the same conversation served
-  uncached.
-- Branching: two continuations of one prefix restore the older boundary, and
-  both outputs equal their uncached versions.
-- Sampled and MTP requests with reuse (the draft-length controller is reset on
-  reuse on both ranks).
-- Eviction under a small budget: rank 1's resident snapshot bytes track rank
-  0's, and nothing leaks after many requests.
-- Client disconnect during a prompt-snapshot capture, then a cached request.
-- Killing rank 1 fails closed as before.
-- Speed: time to first token for a turn with 8K tokens of reusable history,
-  against uncached TP2 and against one host with its cache.
-
-### Qualification in progress: not finished
-
-Run on `fuzzy`/`misty` and on `fuzzy` alone, Q4 UD-Q4_K_XL, greedy, protocol
-v9, binary `1bd3cfbc…` on both hosts. **The qualification is not complete** and
-the criterion "the output equals the same conversation served uncached" is
-**not** what the code currently satisfies on TP2.
-
-**Equal where it matters.** A four-turn conversation, greedy, produced
-byte-identical output in all three configurations -- one host, one host with
-`--cache-disk`, and TP2 with `--tp-cache-reuse`:
-
-| turn | one host | one host + disk | TP2 |
-| --- | --- | --- | --- |
-| 1 | `1c650a7f…` | `1c650a7f…` | `1c650a7f…` |
-| follow-up 1 (86 cached / 27 prefill) | `1c650a7f…` | `1c650a7f…` | `1c650a7f…` |
-| follow-up 2 (176 / 24) | `ba19e9c3…` | `ba19e9c3…` | `ba19e9c3…` |
-| follow-up 3 (201 / 23) | `ec7d56a0…` | `ec7d56a0…` | `ec7d56a0…` |
-
-Cached equalled uncached on every turn on both paths, and the live-frontier
-reuse path is identical on both: 86, then 176, then 201 cached tokens with
-23--27 prefilled. TP2 produced no divergence warning and no rank-1 error, and
-the end-of-request digest did not fail.
-
-**The restore path is not equivalent, and that is the finding.** Replaying an
-*identical* request is the one shape that selects the snapshot rather than the
-live frontier, because the live frontier is then longer than the prompt:
-
-| | one host | TP2 |
-| --- | --- | --- |
-| cached tokens | 23 (the whole prompt) | 16 |
-| prefilled | 0 | 7 |
-| restore | 4.2 ms | 93.1 ms |
-
-The cause is `inference_backend.cpp`, the `allow_distributed_snapshots_ &&
-request.cache_prompt` block that re-renders the conversation with
-`add_generation_prompt = false` and sets `cache_prefix_tokens` to the common
-prefix with that stripped render. It is TP2-only, so on TP2 the checkpoint is
-the prompt minus its generation prompt, and the generation prompt is
-re-prefilled on every hit. Two consequences:
-
-- The hit is systematically smaller than the prompt by the length of the
-  generation prompt. A reported "55 of 78 kept" is this, not a defect in the
-  matching: `common_prefix_tokens` in the request log is exactly the stripped
-  length.
-- Output is still byte-identical, so this is a cache-behaviour and cost
-  difference, not a correctness one. But it means the two paths do not have the
-  same cache semantics, and a cross-path comparison of `cached_tokens` is
-  meaningless.
-
-TP2 restores **fewer** tokens in **22x** the time because the mirrored
-`kRestore` waits for rank 1 to restore as well; that 93.1 ms is the dominant
-cost of a hit.
-
-**Reuse currently costs more than it saves at these sizes.** On a 200-token
-prompt the cached TTFT was 463 ms against 243 ms for a full prefill, and
-`prefill_tps` was 58--88 on hits against 459--709 on misses: restoring a
-~120 MB snapshot costs more than the 23-token prefill it avoids. This is the
-speed criterion above, and it currently fails at small prompt sizes.
-
-**Not reproduced: a cached/uncached difference.** The difference that prompted
-this qualification could not be reproduced in any shape tried -- multi-turn
-append, agent-style discard, branch, identical replay, with and without
-`--cache-disk`, one host and TP2. Cached and uncached were byte-identical
-everywhere.
-
-**Unresolved: the output is not invariant across server lifetimes.** The same
-request on the same binary produced two different *stable* hashes during one
-session, `1c650a7f…` early and `e6fb9c8d…` later, on the one-host path *and*
-on TP2, each perfectly reproducible within a server's lifetime (4/4, 6/6, 9/9).
-It is not explained by cached versus uncached. It did not reproduce under six
-rounds of the target request alone, nor under six rounds interleaved with
-cached churn. This is a better candidate for the original "different in
-responses" observation than the cache is, and it needs its own bisect: alternate
-the two paths on an identically prepared GPU state and see whether the hash
-tracks allocator or residency state.
-
-Still to qualify: branching to an older boundary, eviction under a small
-budget, sampled and MTP requests with reuse, disconnect during capture, and the
-8K-history speed case.
-
-**Environment.** The two ranks need the host to themselves. A leftover server
-container left rank 0 with 36 GiB free and it failed with `hipMalloc failed for
-stacked tensor`, which rank 1 reports as a misleading handshake error.
+- **The qualification criterion was wrong.** "Cached output equals uncached"
+  does not hold on one host either: prefilling a short suffix on a cached
+  prefix runs different kernel shapes than prefilling the whole prompt, and a
+  close greedy choice can flip (seen on turns 3 and 4 of the test chat, AR and
+  MTP). Compare TP2 with one host under the same cache hits instead.
+- **Branching** to a point inside an earlier turn misses on both paths: the
+  prompt snapshot sits after the generation prompt, which a later render of
+  that turn does not contain. It is a one-host property, now shared by TP2.
+- **Cross-lifetime hashes.** The first hardware run saw one request give two
+  stable hashes across server lifetimes. Seven server lifetimes today (one
+  host and TP2, AR and MTP) all gave `25e35c11` for the first turn; not
+  reproduced, not explained.
+- **Not measured:** eviction on hardware (the budget follows host memory and
+  has no switch; the hosted test covers it), and Q8 with reuse.
 
 ## Plan
 
-1. **Executor** (current work, above). It covers what the earlier plan split
-   into an end marker, sampled AR and a step plan for MTP: rank 0's scheduler
-   decides stops, cancellations and disconnects, and rank 1 simply receives no
-   further model calls. MTP decisions stay inside `Session::DecodeStep`, so
-   greedy MTP runs the same call on both ranks and compares results; sampled
-   MTP needs rank 1's sampler to match rank 0's (RNG state, pending draw and
-   accepted history).
+1. **Executor**: done, with sampled MTP and cache reuse (above).
 2. **Q8 quality** against a reference, and the `slow`/`external-model` suites.
 3. **Upstream.** Open an issue asking whether two-host InfiniBand TP is wanted:
    it adds a libibverbs dependency and hardware upstream likely cannot test,
@@ -448,8 +258,11 @@ behind the `Communicator` interface.
 - `LocalExpert` has no production caller. Its test expectation was corrected to
   the documented `global - expert_begin` rule; revisit if it gets one.
 - The `nixbox` container on `fuzzy` mounts a stale checkout; format checks run
-  there before 2026-09-26 afternoon checked old code. Check on a `git archive`
-  export.
+  there before 2026-09-26 afternoon checked old code. Copy the tree into the
+  container (`git ls-files -z | tar --null -T - -cf - | podman exec -i -w
+  /tmp/fmt nixbox tar -xf -`, after `git init` there) and run `nix
+  --extra-experimental-features "nix-command flakes" shell --inputs-from .
+  nixpkgs#clang-tools nixpkgs#python3 -c python3 tools/ci/check-format.py`.
 - `inference_backend_gpu_test` skips without a model; a skip is not a pass.
 - The step message's cross-host cost is measured only end to end (26.69 tok/s
   median of ten against a single 27.3 control); its loopback cost is 1.9 µs.

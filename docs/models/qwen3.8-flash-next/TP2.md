@@ -72,8 +72,8 @@ ranks. Rules that the compiler does not enforce:
   draft-length controller depends only on acceptance history
   (`mtp_policy.hpp`). A one-token budget selects on rank 0 and mirrors the
   advance.
-- The wrapper does not mirror snapshots, forks or prefix reuse, so it reports
-  none of them and TP2 refuses `--tp-cache-reuse`.
+- Cache operations are mirrored too, and acknowledged: see
+  [Cache reuse](#cache-reuse).
 
 **Agreement checks.** Both ranks keep a digest of every call and its result
 (prefill consumption, decoded tokens and draft counts, checkpoint positions,
@@ -136,8 +136,8 @@ build/gpu-tp2/gufo serve llm \
 ```
 
 For full Q8 use the first `Q8_0` shard; the Q8 PLE loader must be in the build.
-`--tp-cache-reuse` now mirrors snapshots and prefix reuse to rank 1 (protocol
-v9). It is **not qualified yet** -- see [Cache reuse](#cache-reuse) below.
+TP2 reuses conversation history as one host does; see
+[Cache reuse](#cache-reuse).
 
 ### Request limits
 
@@ -152,35 +152,42 @@ host. The server still refuses:
 
 ### Cache reuse
 
-`--tp-cache-reuse` forwards the inner runner's `snapshot`, `fork`,
-`prefix_reuse` and `preserve_snapshot_prefix` capabilities instead of clearing
-them, and adds the `snapshot`, `restore`, `drop`, `reuse` and `cancel-prepare`
-instructions. Snapshot bytes stay local; only monotonic snapshot ids cross the
-control channel, and the two hosts take the smaller `HostSnapshotBudgetBytes`
-as the shared budget so rank 1's table cannot outgrow what rank 0 expects.
+Rank 0's continuation cache works exactly as on one host (live frontiers, prompt snapshots, restores, eviction), and every cache
+operation that touches model state is mirrored:
 
-Qualified so far, and **not finished**: a four-turn greedy conversation is
-byte-identical across one host, one host with a disk cache, and TP2, and cached
-equals uncached on every turn on both paths. Two things are open.
+| Rank-0 call | Instruction | Rank 1 |
+| --- | --- | --- |
+| `Snapshot(state)` (pool capture worker) | `snapshot(state, id)` | captures its own copy under `id` |
+| a mirrored snapshot is freed | `drop(id)`, also between requests | frees its copy |
+| `RestoreOrFork(state, snapshot)` | `restore(state, id)` | restores its copy |
+| `PreparePrefixReuse(state, prefix)` | `reuse(state, prefix_size)` | the same call on the `kSingle` prompt |
+| `PrepareCancellation(state)` | `cancel-prepare(state)` | the same call |
 
-The **restore** path differs between the paths. An identical-request replay is
-the one shape that selects the snapshot rather than the live frontier, and it
-restores the whole prompt on one host (23 cached, 0 prefilled, 4.2 ms) but only
-16 of 23 on TP2, re-prefilling 7. The cause is a TP2-only block in
-`inference_backend.cpp` that re-renders the conversation with
-`add_generation_prompt = false` and uses the common prefix with that stripped
-render as `cache_prefix_tokens`. Output is byte-identical, so this is cache
-semantics and cost rather than correctness, but the two paths do not share cache
-semantics and their `cached_tokens` are not comparable. TP2 also restores fewer
-tokens in 22x the time (93.1 ms against 4.2 ms), because the mirrored `kRestore`
-waits for rank 1.
+Live hits need nothing more: every call that changed the state was mirrored.
+Snapshot bytes stay on each host; ids are channel-wide and never reused. The
+snapshot budget is the smaller of the two hosts' `HostSnapshotBudgetBytes`,
+exchanged in the handshake.
 
-Reuse is currently a **net loss at small prompt sizes**: 463 ms cached TTFT
-against 243 ms for a full prefill on a 200-token prompt, because a ~120 MB
-snapshot restore costs more than the 23-token prefill it avoids.
+Rules:
 
-`NEXT.md` records the open items, including a cross-lifetime output difference
-that is not caused by the cache and is still unbisected.
+- Rank 1 acknowledges each of these operations (except `drop`) before rank 0
+  returns from the call, so no later instruction can overtake a capture and a
+  rank-1 failure is known before the next call. Rank 0 runs its own copy while
+  rank 1 runs its.
+- A capture that fails on either rank skips the snapshot, as a failed capture
+  does on one host: rank 0 drops the id and the request continues. Any other
+  cache failure on rank 1 fails the request, and rank 0 then clears its whole
+  cache, which resets and drops everything on both ranks.
+- The capture runs on the pool's worker thread while the pool keeps the state
+  frozen, so no call on that state can be sent before the capture is joined.
+- The digest includes snapshot ids and each restored or reused position.
+- TP2 must not change the cache's boundaries: an earlier design, where each
+  rank kept its own cache, cut the prompt snapshot before the generation
+  prompt, and TP2 then restored less than one host did.
+
+Disk persistence stays refused. Cached and uncached outputs can differ on one
+host too (prefilling a short suffix runs different kernel shapes), so compare
+TP2 with one host under the same cache hits, not cached with uncached.
 
 ### Probes
 
@@ -216,7 +223,6 @@ not be rendered into the published tables.
       "bootstrap_port": 18515,
       "control_port": 18516,
       "control_token": "EXPERIMENT_ONLY_TOKEN",
-      "cache_reuse": false,
       "container_image": "gufo-tp2-dev:7.2.3",
       "workspace": "/path/to/gufo",
       "container_workspace": "/workspace/gufo",
@@ -234,8 +240,8 @@ python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
 ```
 
 The driver uses non-streaming JSON requests, records both rank fingerprints,
-redacts the token and bootstrap address, and refuses loading, memory, image,
-C>1 and (unless `cache_reuse` is set) nonzero-depth tables. `multi-*` tables
+redacts the token and bootstrap address, and refuses loading, memory, image
+and C>1 tables. `multi-*` tables
 run only at concurrency 1 with uncached requests.
 
 ## Full Q8 checkpoint
@@ -282,7 +288,10 @@ one row in EXPERIMENTS.md (machine-readable detail in `artifacts/`).
 6. Failure paths: kill rank 1 mid-request (rank 0 returns 500 promptly); a
    scope mismatch fails on the first exchange; an injected rank-1 disagreement
    returns 500 and the next request succeeds.
-7. For speed, report the median of several warm requests; the first request is
+7. Cache reuse: a multi-turn greedy AR chat, its identical replay
+   (restores the whole prompt) and a follow-up on about 6K tokens of history;
+   outputs and cached token counts must match one host with its cache.
+8. For speed, report the median of several warm requests; the first request is
    about 13% slower.
 
 ## C2 (dormant)
