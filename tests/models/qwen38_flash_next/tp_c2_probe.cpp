@@ -21,7 +21,7 @@
 //
 // COLLECTIVE TRACE ARITHMETIC (load-bearing)
 //   One `Executor::Forward(n)` runs the trunk layer loop once and issues
-//   exactly `num_layers` `AllReduceSum` collectives of `n * hidden_size * 4`
+//   exactly `num_layers` `ExchangePartial` collectives of `n * hidden_size * 4`
 //   bytes (executor.cpp: one `Moe` -> one `AllReduce` per layer). Byte size is
 //   therefore fully determined by the forward's row count.
 //
@@ -114,7 +114,7 @@
 //   The fail-closed C2 paths are otherwise covered only by hosted tests with
 //   fakes. A real RDMA failure does not arrive as "lease Begin() returned
 //   false"; it arrives as a 30 s `kCollectiveTimeout` or a header mismatch
-//   inside `AllReduceSum`, which sets `poisoned_` on the communicator
+//   inside `ExchangePartial`, which sets `poisoned_` on the communicator
 //   (verbs.cpp:604-608) and surfaces through a different route. These three
 //   modes put that route in front of a real worker over a real RDMA pair.
 //
@@ -143,7 +143,7 @@
 //      command whose `sequence` is the normal value, so rank 1's worker binds
 //      `command.sequence` (inference_backend.cpp `TpOperationScopeLease`,
 //      tp_cohort_worker.cpp) and the two scopes disagree. The FIRST
-//      `AllReduceSum` header exchange fails `magic`/`version`/`scope_id`/
+//      `ExchangePartial` header exchange fails `magic`/`version`/`scope_id`/
 //      `operation_id`/`bytes` validation (verbs.cpp:644-660) and poisons both
 //      communicators, so the run fails closed on both ranks: rank 1's model
 //      execution errors, the member `Wait()` throws, the seam cancels the peer
@@ -231,6 +231,7 @@
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/verbs.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
@@ -489,8 +490,8 @@ Fault-injection modes (all deliberate, all fail closed; none can pass):
        rank0: --tp-scope-override N  (N != --sequence)
      Rank 0 binds communicator->BeginOperation(N) while the command still
      carries the normal sequence, so rank 1's worker binds command.sequence
-     and the two scopes disagree. The FIRST AllReduceSum header exchange fails
-     identity validation and poisons both communicators.
+     and the two scopes disagree. The FIRST ExchangePartial header exchange
+     fails identity validation and poisons both communicators.
      EXPECTED: the run FAILS on both ranks. Rank 1's model execution errors,
      the member Wait() throws, the seam cancels the peer and the lease release
      itself fails on a poisoned communicator, so the worker stops. Rank 0
@@ -680,13 +681,13 @@ private:
 /// window is open.
 ///
 /// `Model::Load` wires the executor's all-reduce callback to this object's
-/// `AllReduceSum` (engine.cpp:199-202) and the callback is the ONLY route from
-/// a forward to the wire, so the sizes collected here ARE the byte sequence the
-/// peer sees. That is the point: the prefill chunking is a prediction, and a
-/// prediction the probe also reports as its own result is a prediction it can
-/// be wrong about silently. Recording makes the prediction checkable, and a
-/// divergence is reported at the first offending index instead of surfacing as
-/// an unattributable collective timeout.
+/// `ExchangePartial` (`Executor::TwoRankAllReduce`) and the callback is the
+/// ONLY route from a forward to the wire, so the sizes collected here ARE the
+/// byte sequence the peer sees. That is the point: the prefill chunking is a
+/// prediction, and a prediction the probe also reports as its own result is a
+/// prediction it can be wrong about silently. Recording makes the prediction
+/// checkable, and a divergence is reported at the first offending index
+/// instead of surfacing as an unattributable collective timeout.
 ///
 /// Every method delegates, so the wire behaviour is exactly the inner
 /// communicator's; the decorator adds no collective and drops none. No lock:
@@ -714,12 +715,40 @@ public:
                                   std::string* error) override {
     return inner_->EndOperation(scope_id, error);
   }
-  bool AllReduceSum(float* data, std::size_t bytes, hipStream_t stream,
-                    std::string* error) override {
+  [[nodiscard]] const float* ExchangePartial(const float* data,
+                                             std::size_t bytes,
+                                             hipStream_t stream,
+                                             std::string* error) override {
     if (recording_) {
       sizes_.push_back(bytes);
     }
-    return inner_->AllReduceSum(data, bytes, stream, error);
+    if (!timing_) {
+      return inner_->ExchangePartial(data, bytes, stream, error);
+    }
+    // Drain the stream first, untimed, so the timed call measures the
+    // exchange alone and not the layer that produced its input. The inner
+    // communicator synchronizes the same stream first anyway.
+    if (bytes != 0 && hipStreamSynchronize(stream) != hipSuccess) {
+      *error = "timed collective stream synchronize failed";
+      return nullptr;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const float* peer = inner_->ExchangePartial(data, bytes, stream, error);
+    timed_micros_.push_back(std::chrono::duration<double, std::micro>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+    return peer;
+  }
+
+  /// Starts timing every collective, excluding the GPU work queued before it.
+  void BeginTiming() {
+    timed_micros_.clear();
+    timing_ = true;
+  }
+  /// Stops timing and returns each collective's duration in microseconds.
+  [[nodiscard]] std::vector<double> EndTiming() {
+    timing_ = false;
+    return std::move(timed_micros_);
   }
 
   /// Starts a recording window. The prefill is the only window the probe opens:
@@ -741,6 +770,8 @@ private:
   std::shared_ptr<q::rocm::Communicator> inner_;
   std::vector<std::size_t> sizes_;
   bool recording_{false};
+  std::vector<double> timed_micros_;
+  bool timing_{false};
 };
 
 bool ParseUint(std::string_view text, std::uint32_t* value) {
@@ -1151,7 +1182,7 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
   // A zero-byte collective is a barrier: the ranks load the model at different
   // speeds, and without it the first prefill collective would bill the slower
   // load to the faster rank's prefill time.
-  if (!collectives->AllReduceSum(nullptr, 0, nullptr, error)) {
+  if (collectives->ExchangePartial(nullptr, 0, nullptr, error) == nullptr) {
     Warn(std::string(role) + " pre-prefill barrier failed: " + *error);
     return kTransportFailure;
   }
@@ -1200,6 +1231,7 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
   // two programs issue the same number of forwards.
   std::chrono::steady_clock::duration decode_time{};
   std::size_t timed_steps = 0;
+  collectives->BeginTiming();
   std::size_t forwards = 0;
   std::size_t advanced_tokens = 0;
   for (std::size_t step = 0; step < budget; ++step) {
@@ -1272,6 +1304,7 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
       ++trace[members[row]].decode_forwards;
     }
   }
+  std::vector<double> collective_micros = collectives->EndTiming();
   const double decode_ms =
       std::chrono::duration<double, std::milli>(decode_time).count();
   char timing[160];
@@ -1283,6 +1316,23 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
                 " decode: steps=" + std::to_string(timed_steps) +
                 " forwards=" + std::to_string(forwards) + " advanced_tokens=" +
                 std::to_string(advanced_tokens) + " " + timing);
+  if (!collective_micros.empty()) {
+    std::sort(collective_micros.begin(), collective_micros.end());
+    double collective_total = 0.0;
+    for (const double value : collective_micros) {
+      collective_total += value;
+    }
+    char collective_line[192];
+    std::snprintf(collective_line, sizeof(collective_line),
+                  "decode collectives: n=%zu total_ms=%.1f per_forward_ms=%.2f "
+                  "p50_us=%.1f p90_us=%.1f p99_us=%.1f",
+                  collective_micros.size(), collective_total / 1000.0,
+                  forwards == 0 ? 0.0 : collective_total / 1000.0 / forwards,
+                  collective_micros[collective_micros.size() / 2],
+                  collective_micros[(collective_micros.size() * 9) / 10],
+                  collective_micros[(collective_micros.size() * 99) / 100]);
+    Say(role, collective_line);
+  }
 
   if (!scope.End(error)) {
     Warn(std::string(role) + " could not release batched scope: " + *error);
@@ -1304,9 +1354,10 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
 /// `--allreduce-bench N`: times N back-to-back all-reduces per payload with no
 /// model loaded, on both ranks in lockstep. The payloads are one, two and eight
 /// Flash-Next decode rows and one 512-token prefill chunk, so the result is the
-/// bare communicator cost of a collective: stream sync, device-to-host staging,
-/// the TCP header and ack round trips, the RDMA read, the host sum and the copy
-/// back. Model compute is absent by construction.
+/// bare cost of a collective as the model issues it: the exchange (stream sync,
+/// device-to-host staging, the TCP header, the RDMA read and the ack) plus the
+/// GPU add of the peer's partial, timed until the add completes. Model compute
+/// is absent by construction.
 int RunAllReduceBench(const char* role, q::rocm::Communicator& communicator,
                       std::uint32_t device, std::uint32_t iterations) {
   // One Flash-Next hidden row: 2560 floats, the decode all-reduce unit.
@@ -1345,9 +1396,18 @@ int RunAllReduceBench(const char* role, q::rocm::Communicator& communicator,
     micros.reserve(iterations);
     for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
       const auto start = std::chrono::steady_clock::now();
-      if (!communicator.AllReduceSum(data, bytes, stream, &error)) {
+      const float* peer =
+          communicator.ExchangePartial(data, bytes, stream, &error);
+      if (peer == nullptr) {
         Warn(std::string(role) + " allreduce bench failed at " +
              std::to_string(bytes) + " B: " + error);
+        release();
+        return kTransportFailure;
+      }
+      q::rocm::AddRowsBroadcast(peer, data, static_cast<std::uint32_t>(rows),
+                                kRowBytes / sizeof(float), 1, stream);
+      if (hipStreamSynchronize(stream) != hipSuccess) {
+        Warn(std::string(role) + " allreduce bench add failed");
         release();
         return kTransportFailure;
       }
@@ -2331,7 +2391,7 @@ int main(int argc, char** argv) {
   //    share the command sequence scope, so one lease spans the whole cohort.
   //    `--tp-scope-override` binds a DIFFERENT scope while the command keeps
   //    the normal sequence, so rank 1's worker binds `command.sequence` and the
-  //    first `AllReduceSum` header exchange must fail identity validation.
+  //    first `ExchangePartial` header exchange must fail identity validation.
   const std::uint64_t bound_scope = scope_override.value_or(command.sequence);
   OperationScope operation(collectives, bound_scope);
   if (!operation.Begin(&error)) {
@@ -2351,8 +2411,8 @@ int main(int argc, char** argv) {
             " while the command carries sequence " +
             std::to_string(command.sequence) +
             ", which is the scope rank 1's worker binds; the first "
-            "AllReduceSum header exchange must fail with a verbs identity or "
-            "size mismatch and poison both communicators");
+            "ExchangePartial header exchange must fail with a verbs identity "
+            "or size mismatch and poison both communicators");
   }
   if (expect_c2_error) {
     Say("rank0",
@@ -2389,7 +2449,7 @@ int main(int argc, char** argv) {
              std::to_string(bound_scope) +
              " and rank 1 bound the command sequence " +
              std::to_string(command.sequence) +
-             ", so the first AllReduceSum header exchange poisoned both "
+             ", so the first ExchangePartial header exchange poisoned both "
              "communicators; this run must fail closed, never pass");
       }
       return kTransportFailure;

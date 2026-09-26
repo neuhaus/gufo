@@ -386,11 +386,8 @@ int main(int argc, char** argv) {
   if (mtp_audit || cost_audit)
     options.max_speculative = 8;
   if (communicator) {
-    options.all_reduce = [communicator](float* data, std::size_t bytes,
-                                        hipStream_t stream,
-                                        std::string* error) {
-      return communicator->AllReduceSum(data, bytes, stream, error);
-    };
+    options.all_reduce = q::rocm::Executor::TwoRankAllReduce(
+        communicator, device->config().hidden_size);
   }
 
   if (cost_audit) {

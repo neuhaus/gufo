@@ -1524,6 +1524,26 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   return !project_output || Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
 }
 
+std::function<bool(float*, std::size_t, hipStream_t, std::string*)>
+Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
+                           std::uint32_t hidden) {
+  return [communicator = std::move(communicator), hidden](
+             float* data, std::size_t bytes, hipStream_t stream,
+             std::string* error) {
+    const float* peer =
+        communicator->ExchangePartial(data, bytes, stream, error);
+    if (peer == nullptr) {
+      return false;
+    }
+    const std::size_t rows = bytes / (sizeof(float) * hidden);
+    if (rows != 0) {
+      AddRowsBroadcast(peer, data, static_cast<std::uint32_t>(rows), hidden, 1,
+                       stream);
+    }
+    return true;
+  };
+}
+
 bool Executor::AllReduce(float* data, std::size_t rows,
                          std::string* error_msg) const {
   if (model_->tp_world_size() == 1) {
@@ -2638,7 +2658,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
              error_msg)) {
     return false;
   }
-  MtpAddEmbedding(s_.mtp_eproj, s_.mtp_res, n, c.hidden_size, c.hc_count,
+  AddRowsBroadcast(s_.mtp_eproj, s_.mtp_res, n, c.hidden_size, c.hc_count,
                   stream_);
   if (trace && !copy_trace(s_.mtp_res + final_row, trace->fused))
     return false;

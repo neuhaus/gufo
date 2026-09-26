@@ -2535,13 +2535,13 @@ __global__ void MtpHiddenKernel(const float* base, const float* alt,
   }
 }
 
-__global__ void MtpAddEmbeddingKernel(const float* embedding, float* residual,
-                                      std::uint32_t hidden,
-                                      std::uint32_t streams) {
+__global__ void AddRowsBroadcastKernel(const float* addend, float* residual,
+                                       std::uint32_t hidden,
+                                       std::uint32_t streams) {
   const std::uint32_t t = blockIdx.x;
   for (std::uint32_t i = threadIdx.x; i < streams * hidden; i += blockDim.x) {
     residual[static_cast<std::size_t>(t) * streams * hidden + i] +=
-        embedding[static_cast<std::size_t>(t) * hidden + i % hidden];
+        addend[static_cast<std::size_t>(t) * hidden + i % hidden];
   }
 }
 
@@ -5872,11 +5872,11 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                      base, alt, row, dst, width);
 }
 
-void MtpAddEmbedding(const float* embedding, float* residual,
-                     std::uint32_t n_tokens, std::uint32_t hidden,
-                     std::uint32_t streams, hipStream_t stream) {
-  hipLaunchKernelGGL(MtpAddEmbeddingKernel, dim3(n_tokens), dim3(kThreads), 0,
-                     stream, embedding, residual, hidden, streams);
+void AddRowsBroadcast(const float* addend, float* residual,
+                      std::uint32_t n_tokens, std::uint32_t hidden,
+                      std::uint32_t streams, hipStream_t stream) {
+  hipLaunchKernelGGL(AddRowsBroadcastKernel, dim3(n_tokens), dim3(kThreads),
+                     0, stream, addend, residual, hidden, streams);
 }
 
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,

@@ -279,7 +279,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                         error)) {
         return false;
       }
-      MtpAddEmbedding(s_.mtp_eproj, s_.mtp_res, count, c.hidden_size,
+      AddRowsBroadcast(s_.mtp_eproj, s_.mtp_res, count, c.hidden_size,
                       c.hc_count, stream_);
       i = end;
     }

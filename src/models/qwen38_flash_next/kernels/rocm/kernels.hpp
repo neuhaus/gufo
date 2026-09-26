@@ -457,10 +457,13 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                float* dst, std::uint32_t n_tokens, std::uint32_t width,
                hipStream_t stream);
 
-/// Add the projected embedding once to each projected hidden branch.
-void MtpAddEmbedding(const float* embedding, float* residual,
-                     std::uint32_t n_tokens, std::uint32_t hidden,
-                     std::uint32_t streams, hipStream_t stream);
+/// residual[t] += addend[t] for each of `n_tokens` rows, broadcasting the
+/// `hidden`-float addend row over the row's `streams` consecutive slices.
+/// MTP adds its projected embedding to every hidden branch this way; the TP
+/// all-reduce adds the peer's partial with `streams` = 1.
+void AddRowsBroadcast(const float* addend, float* residual,
+                      std::uint32_t n_tokens, std::uint32_t hidden,
+                      std::uint32_t streams, hipStream_t stream);
 
 inline constexpr std::uint32_t kArgmaxParts = 64;
 struct ArgmaxCandidate {

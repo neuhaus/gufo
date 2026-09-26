@@ -41,9 +41,9 @@ constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
 constexpr std::size_t kBufferBytes = 64U << 20;
 constexpr std::uintptr_t kSendAddress = 0x0000700000000000ULL;
 constexpr std::uintptr_t kRecvAddress = kSendAddress + kBufferBytes;
-constexpr std::uintptr_t kResultAddress = kRecvAddress + kBufferBytes;
 constexpr std::uint32_t kPort = 1;
 constexpr auto kCollectiveTimeout = std::chrono::seconds(30);
+constexpr auto kReceiveSpinWindow = std::chrono::microseconds(500);
 constexpr int kMemoryAccessFlags =
     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
 
@@ -266,8 +266,18 @@ public:
                              std::string* error) const {
     auto* cursor = static_cast<std::uint8_t*>(data);
     std::size_t received = 0;
+    // A collective peer usually answers within a few hundred microseconds.
+    // Polling that long avoids the scheduler wake-up a blocking receive pays
+    // on every exchange; a slower peer falls back to the blocking receive.
+    const auto spin_deadline =
+        std::chrono::steady_clock::now() + kReceiveSpinWindow;
     while (received < bytes) {
-      const ssize_t n = ::recv(fd_, cursor + received, bytes - received, 0);
+      const bool spinning = std::chrono::steady_clock::now() < spin_deadline;
+      const ssize_t n = ::recv(fd_, cursor + received, bytes - received,
+                               spinning ? MSG_DONTWAIT : 0);
+      if (n < 0 && spinning && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        continue;
+      }
       if (n < 0 && errno == EINTR) {
         continue;
       }
@@ -398,10 +408,12 @@ public:
       return false;
     }
     recv_registered_ = true;
-    if (!MapFixedBuffer(kResultAddress, &result_buffer_, error)) {
+    // The GPU adds the peer's partial straight from the receive window.
+    if (hipHostGetDevicePointer(&recv_device_, recv_buffer_, 0) != hipSuccess ||
+        recv_device_ == nullptr) {
+      SetError(error, "receive window has no device mapping");
       return false;
     }
-    result_registered_ = true;
     send_mr_ = ibv_reg_mr(pd_, send_buffer_, kBufferBytes, kMemoryAccessFlags);
     recv_mr_ = ibv_reg_mr(pd_, recv_buffer_, kBufferBytes, kMemoryAccessFlags);
     if (send_mr_ == nullptr || recv_mr_ == nullptr) {
@@ -579,37 +591,45 @@ public:
     return true;
   }
 
-  [[nodiscard]] bool AllReduceSum(float* data, std::size_t bytes,
-                                  hipStream_t stream,
-                                  std::string* error) override {
+  [[nodiscard]] const float* ExchangePartial(const float* data,
+                                             std::size_t bytes,
+                                             hipStream_t stream,
+                                             std::string* error) override {
     std::lock_guard lock(mutex_);
     if (qp_ == nullptr) {
       SetError(error, "verbs communicator is not initialized");
-      return false;
+      return nullptr;
     }
     if (control_ == nullptr) {
       SetError(error, "verbs control channel is not initialized");
-      return false;
+      return nullptr;
     }
     if (poisoned_) {
       SetError(error, "verbs communicator is poisoned");
-      return false;
+      return nullptr;
     }
     if (!bound_scope_.has_value()) {
       poisoned_ = true;
       SetError(error, "verbs collective has no bound operation scope");
-      return false;
+      return nullptr;
     }
     if (bytes > kBufferBytes || bytes % sizeof(float) != 0 ||
         (bytes != 0 && data == nullptr)) {
       poisoned_ = true;
       SetError(error, "all-reduce buffer is invalid");
-      return false;
+      return nullptr;
     }
     if (next_operation_ == std::numeric_limits<std::uint64_t>::max()) {
       poisoned_ = true;
       SetError(error, "verbs collective operation sequence exhausted");
-      return false;
+      return nullptr;
+    }
+    // The peer acknowledges each exchange once its read of this rank's send
+    // window is complete. Take that acknowledgement before the window is
+    // overwritten; by now the peer has almost always sent it already.
+    if (ack_pending_ && !ReceivePendingAck(error)) {
+      poisoned_ = true;
+      return nullptr;
     }
     const std::uint64_t scope_id = *bound_scope_;
     const std::uint64_t operation_id = next_operation_;
@@ -621,18 +641,20 @@ public:
     CollectiveHeader incoming{};
 
     // Stage before announcing readiness. The peer can then read directly from
-    // this send window without a per-chunk TCP data-ready round trip.
+    // this send window without a per-chunk TCP data-ready round trip. The
+    // synchronization also retires the previous exchange's add, which reads
+    // the receive window this exchange overwrites.
     if (bytes != 0 && (hipStreamSynchronize(stream) != hipSuccess ||
                        hipMemcpy(send_buffer_, data, bytes,
                                  hipMemcpyDeviceToHost) != hipSuccess)) {
       poisoned_ = true;
       SetError(error, "HIP device-to-host all-reduce staging failed");
-      return false;
+      return nullptr;
     }
     if (!control_->SendAll(&outgoing, sizeof(outgoing), error) ||
         !control_->RecvAll(&incoming, sizeof(incoming), error)) {
       poisoned_ = true;
-      return false;
+      return nullptr;
     }
     if (incoming.magic != kCollectiveMagic ||
         incoming.version != kCollectiveVersion ||
@@ -649,15 +671,7 @@ public:
                  std::to_string(incoming.operation_id) + "/" +
                  std::to_string(incoming.bytes);
       }
-      return false;
-    }
-    if (bytes == 0) {
-      if (!ExchangeAck(scope_id, operation_id, error)) {
-        poisoned_ = true;
-        return false;
-      }
-      ++next_operation_;
-      return true;
+      return nullptr;
     }
     for (std::size_t offset = 0; offset < bytes; offset += kBufferBytes) {
       const std::size_t count = std::min(kBufferBytes, bytes - offset);
@@ -678,73 +692,58 @@ public:
         if (ibv_req_notify_cq(cq_, 0) != 0) {
           poisoned_ = true;
           SetError(error, "ibv_req_notify_cq failed");
-          return false;
+          return nullptr;
         }
         completion_armed_ = true;
       }
       if (ibv_post_send(qp_, &wr, nullptr) != 0) {
         poisoned_ = true;
         SetError(error, "ibv_post_send failed");
-        return false;
+        return nullptr;
       }
       if (!PollCompletion(offset, error)) {
         poisoned_ = true;
-        return false;
-      }
-      auto* local = reinterpret_cast<float*>(
-          static_cast<std::uint8_t*>(send_buffer_) + offset);
-      const auto* peer = reinterpret_cast<const float*>(destination);
-      auto* result = reinterpret_cast<float*>(
-          static_cast<std::uint8_t*>(result_buffer_) + offset);
-      const std::size_t values = count / sizeof(float);
-      for (std::size_t i = 0; i < values; ++i) {
-        result[i] = local[i] + peer[i];
+        return nullptr;
       }
     }
-    // Receiving the peer acknowledgement means that its read of this send
-    // window is complete. The result window is independent, so the local
-    // host-to-device copy below can proceed without racing the peer.
-    if (!ExchangeAck(scope_id, operation_id, error)) {
-      poisoned_ = true;
-      return false;
-    }
-    if (hipMemcpy(data, result_buffer_, bytes, hipMemcpyHostToDevice) !=
-            hipSuccess ||
-        hipStreamSynchronize(stream) != hipSuccess) {
-      poisoned_ = true;
-      SetError(error, "HIP host-to-device all-reduce staging failed");
-      return false;
-    }
-    ++next_operation_;
-    return true;
-  }
-
-private:
-  [[nodiscard]] bool ExchangeAck(std::uint64_t scope_id,
-                                 std::uint64_t operation_id,
-                                 std::string* error) {
-    const CollectiveAck outgoing{
+    // The read of the peer's window is complete, so the peer may reuse it.
+    // This rank's own acknowledgement arrives with its next exchange.
+    const CollectiveAck ack{
         .scope_id = scope_id,
         .operation_id = operation_id,
     };
+    if (!control_->SendAll(&ack, sizeof(ack), error)) {
+      poisoned_ = true;
+      return nullptr;
+    }
+    ack_pending_ = true;
+    pending_ack_scope_ = scope_id;
+    pending_ack_operation_ = operation_id;
+    ++next_operation_;
+    return static_cast<const float*>(recv_device_);
+  }
+
+private:
+  [[nodiscard]] bool ReceivePendingAck(std::string* error) {
     CollectiveAck incoming{};
-    if (!control_->SendAll(&outgoing, sizeof(outgoing), error) ||
-        !control_->RecvAll(&incoming, sizeof(incoming), error)) {
+    if (!control_->RecvAll(&incoming, sizeof(incoming), error)) {
       return false;
     }
     if (incoming.magic != kReadyMagic ||
         incoming.version != kCollectiveVersion ||
-        incoming.scope_id != scope_id ||
-        incoming.operation_id != operation_id) {
+        incoming.scope_id != pending_ack_scope_ ||
+        incoming.operation_id != pending_ack_operation_) {
       if (error != nullptr) {
         *error =
             "verbs collective acknowledgement identity mismatch: expected=" +
-            std::to_string(scope_id) + "/" + std::to_string(operation_id) +
+            std::to_string(pending_ack_scope_) + "/" +
+            std::to_string(pending_ack_operation_) +
             " incoming=" + std::to_string(incoming.scope_id) + "/" +
             std::to_string(incoming.operation_id);
       }
       return false;
     }
+    ack_pending_ = false;
     return true;
   }
 
@@ -856,11 +855,6 @@ private:
       recv_registered_ = false;
     }
     recv_buffer_ = nullptr;
-    if (result_registered_) {
-      UnmapFixedBuffer(result_buffer_);
-      result_registered_ = false;
-    }
-    result_buffer_ = nullptr;
     if (completion_channel_ != nullptr) {
       (void)ibv_destroy_comp_channel(completion_channel_);
       completion_channel_ = nullptr;
@@ -890,10 +884,9 @@ private:
   ibv_mr* recv_mr_{nullptr};
   void* send_buffer_{nullptr};
   void* recv_buffer_{nullptr};
-  void* result_buffer_{nullptr};
+  void* recv_device_{nullptr};
   bool send_registered_{false};
   bool recv_registered_{false};
-  bool result_registered_{false};
   ibv_gid local_sgid_{};
   std::uint64_t remote_send_address_{0};
   std::uint32_t remote_rkey_{0};
@@ -902,6 +895,10 @@ private:
   // Monotonic for the communicator lifetime; scope_id supplies request
   // identity.
   std::uint64_t next_operation_{0};
+  // The last exchange's acknowledgement, consumed by the next exchange.
+  bool ack_pending_{false};
+  std::uint64_t pending_ack_scope_{0};
+  std::uint64_t pending_ack_operation_{0};
   bool poisoned_{false};
   mutable std::mutex mutex_;
 };

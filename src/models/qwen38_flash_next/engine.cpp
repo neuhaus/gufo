@@ -195,11 +195,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
           : 1;
   exec.max_speculative = exec.max_logit_rows;
   if (options.communicator) {
-    const auto communicator = options.communicator;
-    exec.all_reduce = [communicator](float* data, std::size_t bytes,
-                                     hipStream_t stream, std::string* error) {
-      return communicator->AllReduceSum(data, bytes, stream, error);
-    };
+    exec.all_reduce = rocm::Executor::TwoRankAllReduce(options.communicator,
+                                                       c.hidden_size);
   }
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);

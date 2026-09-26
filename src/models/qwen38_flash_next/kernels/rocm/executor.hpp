@@ -19,6 +19,7 @@
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
@@ -148,6 +149,14 @@ public:
     std::function<bool(float*, std::size_t, hipStream_t, std::string*)>
         all_reduce;
   };
+
+  /// The two-rank all-reduce over `communicator` for rows of `hidden` floats:
+  /// exchange partials, then add the peer's partial on the stream, so the host
+  /// keeps launching while the GPU adds.
+  [[nodiscard]] static std::function<bool(float*, std::size_t, hipStream_t,
+                                          std::string*)>
+  TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
+                   std::uint32_t hidden);
 
   ~Executor();
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
