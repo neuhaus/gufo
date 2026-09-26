@@ -333,104 +333,83 @@ experimental and must not be rendered into the published benchmark tables.
   cross-host figure has to come from a two-host run. The measurement asserts no
   threshold and is labelled `perf`, so it is excluded from the correctness run
   with `ctest -LE perf`; a slow result is a result, not a failure. Protocol,
-  bounded receive and both role bridges are implemented and hosted-tested, but
-  nothing constructs them yet and the decode path is unchanged: `kStep` is still
-  refused as an unknown kind by the worker.
+  bounded receive and both role bridges are implemented, hosted-tested, and now
+  verified on two hosts; see "Rank-0 step plan: verified on two hosts" below.
 
-### Rank-0 step plan: arming order and the failure path
+### Rank-0 step plan: verified on two hosts
 
-The step plan is implemented and hosted-tested but **not armed**: nothing calls
-`SetStepChannel`, so both ranks still sample independently and the decode path
-is unchanged. What remains is a reordering, and the reason is a hazard rather
-than a preference.
+The step plan is **implemented and verified on hardware**. Rank 0 samples each
+token and publishes it as a `kStep` control command; rank 1 consumes that token
+in `SelectNext` instead of sampling its own. Because the token originates on
+rank 0, the stop test runs on the shared token and both ranks stop together with
+no separate stop message, and the two ranks no longer need bit-identical logits.
 
-Rank 0's C1 flow today is: `Submit` (rank 0 starts decoding) ->
-`RegisterPendingResponse` -> `SendCommand(kSingle)` (rank 1 only now learns to
-start) -> `WaitForResponse` -> `request.Wait()` -> compare tokens.
+Measured on `fuzzy`/`misty`, Q4 UD-Q4_K_XL, greedy, 64 tokens, AR, no MTP:
 
-Arming the publisher before `Submit` would let rank 0's first `SelectNext`
-publish a `kStep` **before** the `kSingle` command reaches rank 1. Both travel
-the same ordered channel, so rank 1's worker loop would read the step first and
-refuse it as an unknown kind. Nothing today prevents that by construction: it
-holds only because rank 0's prefill costs at least one forward of `num_layers`
-collectives while the command is a local TCP write. A short prompt narrows that
-margin, and building lockstep on it would trade a real restriction for a race.
+- rank 0 published 64 tokens, rank 1 consumed 64, first and last agreeing
+  (`1596` ... `4971`), `sequence=1`, both ranks armed and cleanly disarmed
+- **27.44 tok/s, `execution_plan: serial-c1`**, output byte-identical to the
+  step-plan-off control at 27.3 tok/s
 
-So the command must be sent **before** rank 0's request is submitted. Rank 1
-then starts and blocks in `Consume` while rank 0 prefills, and rank 0's first
-published token releases it. That is the lockstep the design intends anyway:
-rank 1 waits for rank 0's first token in either order.
+So the mechanism is proven rather than inferred, and the exchange costs nothing
+measurable: the per-token command is ~1.9 us one-way (a loopback lower bound,
+see the exchange-cost entry above), about 0.005% of a 26 tok/s token.
 
-What that costs is the failure path. The existing `catch` unconditionally does
-`request.Cancel()` and `request.Wait({})`, and with send-before-submit the
-`request` does not exist when `Submit` is what failed. The `send_started` and
-`response_received` flags also need re-derivation. The three cases that block
-must keep working:
+**What two-host runs cost to get here.** Four bugs, all in this work, found only
+on hardware because each one is invisible to a hosted test:
 
-- **Command not sent.** Cancel the unsent response; rank 1 never started, so
-  there is nothing to drain.
-- **Command sent, response outstanding.** `FailAll`, so rank 1's eventual reply
-  is discarded instead of being correlated to whatever request runs next.
-- **Rank 0 fails mid-decode.** Rank 1 is blocked in `Consume` holding a
-  request open, so rank 0 must publish a `step_final` step before unwinding.
-  Rank 1's consumer treats `final` as a failure rather than an empty token,
-  because a consumer has nothing to hand its scheduler and returning token zero
-  would decode a valid-looking token attributed to a normal completion.
+1. **`SO_RCVTIMEO` leaked on the failure path.** `ReceiveCommandWithin` cleared
+   the per-token bound only on success, so a timed-out consume left a 5 s timeout
+   on the socket and rank 1's *idle command wait* — which must wait
+   indefinitely — failed with `EAGAIN` and the worker exited.
+2. **Clean timeouts poisoned the channel.** A receive that expired with nothing
+   read leaves the byte stream intact, so poisoning it was both wrong and
+   unnecessary; only a failure that may have landed mid-frame may poison.
+3. **Rank 0 deadlocked on the response.** It waited for rank 1's reply before
+   waiting on its own decode, so under the step plan each rank waited on the
+   other. The order is now: send the command, submit, wait on rank 0's own
+   decode, then collect rank 1's response.
+4. **The step channel was armed in the wrong function.** TP2 has three request
+   entry points -- `GenerateScheduled`, `start_chat` and the rank-one worker --
+   and the arming existed in only one. HTTP goes through `start_chat`, so rank 0
+   never armed its publisher at all and rank 1 starved. `TpStepArm` is now a
+   single RAII type used by all three, so a new entry point cannot forget the
+   disarm; `ScheduledGenerationRequest` holds it as a member because
+   `start_chat` returns lazily and decodes inside `Wait`.
 
-The third case is the one that needs hardware. A hosted test can prove the
-protocol refuses a malformed step, an out-of-sequence step and an ended exchange,
-but only a two-host run that kills or stalls rank 0 mid-request can prove rank 1
-unblocks rather than waiting out `kStepTokenTimeout` on every later request.
+A fifth defect was a plain counter bug with an unhelpful symptom: the step
+validator rejects `sequence == 0`, and `tp_sequence` started at 0, so the first
+request a server ever served had every per-token message refused. The peer simply
+starved. The counter now starts at 1, with a hosted test.
 
-### Rank-0 step plan: prefill previews a token before the plan is armed
-
-The step plan is implemented, hosted-tested, and **still not working on
-hardware**. Two-host bisect on one binary, gated by an env var, with the base
-branch as control:
+**How the failures were isolated.** A two-host bisect on one binary, with the
+step channel behind an env gate, against the base branch as control:
 
 | Arm | Reordering | Step channel | Result |
 | --- | --- | --- | --- |
 | base `d73562ab` | absent | absent | 27.3 tok/s, `serial-c1` |
 | A `69cfcab1` | on | off | 27.3 tok/s, `serial-c1` |
-| B `69cfcab1` | on | on | **fail, 30.5 s, `bootstrap receive`** |
+| B `69cfcab1` | on | on | fail, 30.5 s, `bootstrap receive` |
 
-So the reordering (command before submit) and the own-wait-before-response
-ordering are both correct, and the step channel alone causes the failure. The
-`GUFO_TP2_STEP_PLAN` env gate that made this bisect possible is diagnostic
-scaffolding and must be removed once the channel works.
+Arm A matching the control exactly is what proved the reordering and the
+own-wait ordering were correct and the step channel alone was at fault. Arm B then
+failed on the *collective*, not the control channel, which is what pointed at
+prefill and the preview rather than at the exchange. The env gate and the
+`[step-trace]` tracing that made this possible are **removed**; they were
+diagnostic scaffolding and must not ship in a serving path. Re-adding tracing is
+the first step if the plan ever regresses.
 
-Traced runs give the mechanism. Rank 0 reaches token selection exactly once
-before anything is armed:
+One ordering hazard is worth keeping, because it is not enforced by the compiler:
+the publisher must be armed before rank 0's scheduler thread can decode. Both
+ranks run a speculative prefill lookahead (`PreviewFirstToken`, called from
+`PrepareFirstSnapshot` at `text_generation_scheduler.cpp:818`) which delegates to
+`SelectNext`. It samples a token the prefill path discards, so it must **not**
+participate in the exchange on either rank; `SelectNextImpl` takes an explicit
+`use_step_channel` flag for exactly this, and `PreviewFirstToken` passes false.
 
-```
-[step-trace] select rank=0 pos=68 pub=0 cons=0
-[step-trace] select rank=1 pos=68 cons=1
-[step-trace] consume FAILED: TP control receive: Resource temporarily unavailable
-```
-
-`pos=68` is the prompt length, and rank 0's line has `pub=0`: the publisher was
-not yet armed. That selection is **`PreviewFirstToken`**, which
-`PrepareFirstSnapshot` (`text_generation_scheduler.cpp:818`) calls on the
-scheduler thread during prefill, and which on Flash-Next simply delegates to
-`SelectNext`. It runs while rank 0 is still prefilling, before the control path
-arms anything.
-
-Two consequences, and the second is the fatal one:
-
-- The prefill preview samples a first token that the prefill path then discards.
-  Under the step plan that sample is local, so it is also a token rank 1 never
-  sees.
-- Rank 0 therefore reaches the decode loop having already produced a token
-  outside the exchange, while rank 1 is armed and blocked in `Consume`. Rank 0's
-  first *published* token is one step out of phase with what rank 1 is waiting
-  for, and the pair never synchronises; rank 1 exhausts `kStepTokenTimeout` and
-  exits, leaving rank 0's prefill collective with no peer until the 30 s
-  `kCollectiveTimeout` in `verbs.cpp`.
-
-The fix is not to reorder the arming again. `PreviewFirstToken` must **not**
-participate in the step exchange: it is a speculative prefill lookahead whose
-result is thrown away, so it must sample locally and must never publish or
-consume. That makes it the one selection point that has to opt out of the plan,
-and it means rank 0's first *published* token is the first token of the real
-decode, which is exactly what rank 1 blocks for. Both roles need this, because
-both ranks run the same prefill preview.
+**Not yet done.** The request restrictions the plan unblocks are still enforced:
+the `TP2 requires greedy text without stop sequences` guard still refuses
+sampling, stop sequences and streaming, and the end-of-run token comparison is
+still a gate rather than telemetry. That comparison is deliberate for now -- it
+is the check that would catch a regression in the plan -- and demoting it is a
+separate step, not something to fold in silently.
