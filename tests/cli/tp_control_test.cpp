@@ -268,6 +268,14 @@ int main() {
     bad.sequence = 0;
     refuses_step("a zero sequence", bad);
   }
+  // Rank zero's per-token messages name the request they belong to, and the
+  // first request a server serves is sequence 1, not 0. A step naming sequence
+  // zero is refused above, so a server whose sequence counter started at zero
+  // would fail every step of its first request -- found on hardware, where the
+  // symptom was the peer starving rather than an obvious counter bug.
+  Require(step.sequence != 0,
+          "TP step commands must name a live request, so the first served "
+          "sequence cannot be zero");
   {
     TpControlCommand bad = step;
     bad.members = {{.member_id = command.sequence, .max_tokens = 4}};

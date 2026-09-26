@@ -2632,6 +2632,19 @@ public:
 
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNextImpl(state, sampler, /*use_step_channel=*/true);
+  }
+
+  /// `use_step_channel` is false ONLY for the prefill preview. The preview is a
+  /// speculative lookahead whose token the prefill path discards, so it must
+  /// sample locally and must never publish or consume. Were it to participate,
+  /// rank 0 would produce a token outside the exchange during prefill, rank 1
+  /// would already be blocked in `Consume`, and the two would be a step out of
+  /// phase until rank 1's bounded receive expired. Both ranks run the preview,
+  /// so both must opt out.
+  [[nodiscard]] TextDecodeSelection SelectNextImpl(
+      TextRunnerState& state, sampling::SamplerState& sampler,
+      bool use_step_channel) const {
     auto& qfn = RequireQwenFlashNextState(state);
     if (qfn.position() >= max_context_) {
       return {.stop = true, .piece = {}};
@@ -2647,7 +2660,10 @@ public:
       // after Wait, so this is not contended in the normal path; the lock is
       // here so the ordering does not have to be re-argued at each call site.
       const std::lock_guard<std::mutex> guard(step_mutex_);
-      if (step_consumer_ != nullptr) {
+      if (!use_step_channel) {
+        // Prefill preview: local sample only, deliberately not exchanged.
+        token = static_cast<std::int32_t>(sampler.Sample(logits));
+      } else if (step_consumer_ != nullptr) {
         // Rank 1 does not sample. Rank 0's token is authoritative, so the stop
         // test below runs on the shared token and both ranks stop on it
         // together, with no separate stop message needed.
@@ -2706,7 +2722,9 @@ public:
 
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
-    return SelectNext(state, sampler);
+    // Opts out of the step exchange: this token is a prefill lookahead that the
+    // prefill path discards, so exchanging it would desynchronise the ranks.
+    return SelectNextImpl(state, sampler, /*use_step_channel=*/false);
   }
 
   [[nodiscard]] TextDecodeStep DecodeStep(
@@ -3003,6 +3021,47 @@ private:
 
 }  // namespace
 
+/// RAII arm of the rank-0 step plan for one request.
+///
+/// Every TP2 request entry point must arm the step channel before it submits
+/// and disarm before it returns, and getting that wrong in one copy is
+/// invisible: the request still decodes, it just decodes without exchanging
+/// tokens, and the peer starves. Centralising it here means a new entry point
+/// cannot forget the disarm, and the exchange is armed in exactly one place.
+#if defined(ENGINE_ENABLE_HIP)
+class TpStepArm {
+public:
+  TpStepArm(std::shared_ptr<QwenFlashNextTextRunner> runner,
+            std::shared_ptr<TpControlChannel> control, std::uint64_t sequence,
+            bool publish)
+      : runner_(std::move(runner)) {
+    if (runner_ == nullptr || control == nullptr) {
+      return;
+    }
+    if (publish) {
+      runner_->SetStepChannel(
+          std::make_shared<TpControlStepPublisher>(std::move(control)),
+          nullptr, sequence);
+    } else {
+      runner_->SetStepChannel(
+          nullptr,
+          std::make_shared<TpControlStepConsumer>(std::move(control)),
+          sequence);
+    }
+  }
+  TpStepArm(const TpStepArm&) = delete;
+  TpStepArm& operator=(const TpStepArm&) = delete;
+  ~TpStepArm() {
+    if (runner_ != nullptr) {
+      runner_->SetStepChannel(nullptr, nullptr, 0);
+    }
+  }
+
+private:
+  std::shared_ptr<QwenFlashNextTextRunner> runner_;
+};
+#endif
+
 struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
@@ -3039,7 +3098,14 @@ struct InferenceBackend::Impl {
           request_(std::move(scheduled_request)),
           response_broker_(std::move(response_broker)),
           operation_(std::move(operation)),
-          sequence_(sequence) {
+          sequence_(sequence),
+          // Held for the lifetime of the request, so the step channel stays
+          // armed across `Wait` -- which is where this path decodes -- and is
+          // released when the request is destroyed. `start_chat` returns this
+          // lazily, so the arm cannot live at the call site the way it does in
+          // the synchronous path.
+          step_arm_(state_->flash_next_runner, state_->control, sequence,
+                    /*publish=*/true) {
       if (initial == InitialOutputState::kReasoning)
         reasoning_end_ = state_->scheduler->runner().Tokenize("</think>");
     }
@@ -3170,6 +3236,10 @@ struct InferenceBackend::Impl {
     std::shared_ptr<TpResponseBroker> response_broker_;
     std::shared_ptr<TpOperationLease> operation_;
     std::uint64_t sequence_{0};
+    /// Declared last so it is destroyed FIRST, releasing the step channel
+    /// before the operation scope is ended: a token must never be published
+    /// into a scope that is being torn down.
+    TpStepArm step_arm_;
   };
 
   [[nodiscard]] std::shared_ptr<const State> Snapshot() const {
@@ -3272,21 +3342,11 @@ struct InferenceBackend::Impl {
         // Armed only once rank 1 is committed to start, and only around rank
         // 0's own decode: an armed publisher outliving the request would send a
         // step naming a sequence nothing is decoding.
-        auto step_publisher =
-            std::make_shared<TpControlStepPublisher>(current->control);
+        // Armed once rank 1 is committed to start, and held for exactly this
+        // request's decode. `TpStepArm` disarms on every exit path.
+        TpStepArm step_arm(current->flash_next_runner, current->control,
+                           sequence, /*publish=*/true);
         std::optional<TextGenerationScheduler::Request> submitted;
-        if (current->flash_next_runner != nullptr) {
-          current->flash_next_runner->SetStepChannel(step_publisher, nullptr,
-                                                     sequence);
-        }
-        struct StepDisarm {
-          std::shared_ptr<QwenFlashNextTextRunner> runner;
-          ~StepDisarm() {
-            if (runner != nullptr) {
-              runner->SetStepChannel(nullptr, nullptr, 0);
-            }
-          }
-        } disarm{current->flash_next_runner};
         submitted = current->scheduler->Submit(
             std::move(prompt_tokens), max_tokens, sampling, {},
             static_cast<bool>(on_token),
@@ -3299,6 +3359,14 @@ struct InferenceBackend::Impl {
                 .cache_prefix_tokens = worker_cache_prefix_tokens,
             });
         request = std::move(submitted);
+        // Rank 0's OWN decode must complete before rank 1's reply is collected.
+        // Under the step plan the publisher only emits tokens while rank 0
+        // decodes, so waiting for the response first would deadlock: rank 1
+        // blocks for a token rank 0 has not published, and rank 0 would block
+        // for a response rank 1 cannot send until it has that token. The ranks
+        // now run genuinely concurrently, each driving the other one step at a
+        // time, which is the point of the plan.
+        result = request->Wait(on_token);
         TpControlResponse response;
         if (!current->response_broker->WaitForResponse(sequence, &response,
                                                        &control_error)) {
@@ -3309,7 +3377,6 @@ struct InferenceBackend::Impl {
         if (!response.error.empty()) {
           throw std::runtime_error("TP worker failed: " + response.error);
         }
-        result = request->Wait(on_token);
         if (response.tokens.size() != result.tokens.size()) {
           throw std::runtime_error("TP worker token count mismatch");
         }
@@ -3390,7 +3457,11 @@ struct InferenceBackend::Impl {
   mutable std::mutex state_mutex;
   mutable std::shared_ptr<std::mutex> tp_submit_mutex{
       std::make_shared<std::mutex>()};
-  mutable std::uint64_t tp_sequence{0};
+  /// Starts at 1: zero is reserved. A zero scope means "unset" to the control
+  /// layer, and a step command is required to name a live request, so a first
+  /// sequence of zero would make every per-token message of the first request
+  /// fail validation.
+  mutable std::uint64_t tp_sequence{1};
   std::shared_ptr<const State> state;
 #endif
 };
@@ -4066,20 +4137,8 @@ bool InferenceBackend::run_worker(std::string* error) {
       // response is sent, so the two windows nest. Disarming restores
       // independent sampling on every exit, so a consumer never outlives the
       // request that armed it.
-      auto step_consumer =
-          std::make_shared<TpControlStepConsumer>(state->control);
-      struct StepDisarm {
-        std::shared_ptr<QwenFlashNextTextRunner> runner;
-        ~StepDisarm() {
-          if (runner != nullptr) {
-            runner->SetStepChannel(nullptr, nullptr, 0);
-          }
-        }
-      } disarm{state->flash_next_runner};
-      if (state->flash_next_runner != nullptr) {
-        state->flash_next_runner->SetStepChannel(nullptr, step_consumer,
-                                                 command.sequence);
-      }
+      TpStepArm step_arm(state->flash_next_runner, state->control,
+                         command.sequence, /*publish=*/false);
       auto request = state->scheduler->Submit(
           std::move(prompt_tokens), command.max_tokens, greedy, {}, false,
           TextRequestMetadata{
