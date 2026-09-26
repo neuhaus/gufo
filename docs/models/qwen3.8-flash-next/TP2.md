@@ -35,13 +35,13 @@ per-collective ordinal and the byte count. Any mismatch poisons both
 communicators and fails the request; a poisoned rank fails every later request
 until it is restarted.
 
-**Control channel.** An ordered, token-authenticated TCP channel (protocol v6)
-carries prepared prompts, per-token steps and responses. The handshake
-validates context, MTP use and draft width, cache policy and prefill chunk
-size. Rank 0 owns a single response reader that routes frames by command
-sequence; an unknown or duplicate sequence poisons the channel. After the
-handshake an idle rank waits without a timeout, and TCP keepalive reports a
-dead peer host.
+**Control channel.** An ordered, token-authenticated TCP channel (protocol
+v10, `TCP_NODELAY`, one write per frame) carries request commands, instructions,
+cache acknowledgements and responses. The handshake validates context, MTP use
+and draft width and prefill chunk size, and agrees the snapshot budget. Rank 0
+owns a single response reader that routes frames by command sequence; an
+unknown or duplicate sequence poisons the channel. After the handshake an idle
+rank waits without a timeout, and TCP keepalive reports a dead peer host.
 
 **Rank 1 as executor.** Rank 0 runs the ordinary scheduler and runner pool
 through `TpMirroredRunner`. Just before each call that changes model state, the
@@ -110,8 +110,7 @@ container with the repository mounted at `/workspace/gufo`.
 
 Start rank 0 first. `RANK0_ADDRESS` is the address rank 1 uses to reach rank
 0's TCP bootstrap; tensor data uses the IB queue pair. Both ranks need the same
-model files, `--tp-control-token`, `--prefill-chunk`, draft settings and cache
-policy.
+model files, `--tp-control-token`, `--prefill-chunk` and draft settings.
 
 ```sh
 # rank 0: public HTTP server
@@ -152,8 +151,9 @@ host. The server still refuses:
 
 ### Cache reuse
 
-Rank 0's continuation cache works exactly as on one host (live frontiers, prompt snapshots, restores, eviction), and every cache
-operation that touches model state is mirrored:
+Rank 0's continuation cache works exactly as on one host (live frontiers,
+prompt snapshots, restores, eviction), and every cache operation that touches
+model state is mirrored:
 
 | Rank-0 call | Instruction | Rank 1 |
 | --- | --- | --- |
@@ -181,9 +181,9 @@ Rules:
 - The capture runs on the pool's worker thread while the pool keeps the state
   frozen, so no call on that state can be sent before the capture is joined.
 - The digest includes snapshot ids and each restored or reused position.
-- TP2 must not change the cache's boundaries: an earlier design, where each
-  rank kept its own cache, cut the prompt snapshot before the generation
-  prompt, and TP2 then restored less than one host did.
+- TP2 must not change the cache's boundaries (`cache_prefix_tokens`, snapshot
+  positions). Rank 1 mirrors whatever rank 0's cache decides, so a TP2-only
+  boundary only makes TP2 cache less than one host does.
 
 Disk persistence stays refused. Cached and uncached outputs can differ on one
 host too (prefilling a short suffix runs different kernel shapes), so compare
@@ -241,8 +241,8 @@ python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
 
 The driver uses non-streaming JSON requests, records both rank fingerprints,
 redacts the token and bootstrap address, and refuses loading, memory, image
-and C>1 tables. `multi-*` tables
-run only at concurrency 1 with uncached requests.
+and C>1 tables. `multi-*` tables run only at concurrency 1 with uncached
+requests.
 
 ## Full Q8 checkpoint
 
@@ -271,8 +271,12 @@ one row in EXPERIMENTS.md (machine-readable detail in `artifacts/`).
 
 1. Build the release binary and the test targets from one commit on both hosts;
    record the commit and binary hash.
-2. Format check on a fresh `git archive` export of that commit, not on a mounted
-   checkout that may be stale.
+2. Format check on a fresh copy of the tree, not on a mounted checkout that
+   may be stale. On `fuzzy`, copy it into the `nixbox` container
+   (`git ls-files -z | tar --null -T - -cf - | podman exec -i -w /tmp/fmt
+   nixbox tar -xf -`, then `git init` there) and run `nix
+   --extra-experimental-features "nix-command flakes" shell --inputs-from .
+   nixpkgs#clang-tools nixpkgs#python3 -c python3 tools/ci/check-format.py`.
 3. Hosted tests on each host, with no skips: `tp_control_test`,
    `tp_executor_test`, `tp_cohort_plan_test`, `tp_cohort_worker_test`,
    `text_model_runner_test`, `text_generation_scheduler_test`,
@@ -302,5 +306,5 @@ commands: it has no scheduler to admit a cohort into, and it stops if it
 receives one. C2 returns on batched executor instructions (`AdvanceBatch`,
 `DecodeBatch`). The C2 probe's batched-decode spike (`--batched-w2`,
 `--serial-w2`, `--width`) does not use the worker and still runs; its cohort
-contract modes relied on the retired dispatch. The open design decisions are
-in [NEXT.md](NEXT.md).
+contract modes relied on the retired dispatch. What C2 needs now is in
+[NEXT.md](NEXT.md#next-c2-on-the-executor).
