@@ -47,6 +47,26 @@ ack described below.
 | Prefill from 0 to 32K tokens | 1,422–1,457 tok/s | 1,070 tok/s | 1,187 tok/s |
 | Decode at depth 32K, one stream | 24.3 tok/s | 24.1–24.5 tok/s | 24.9 tok/s |
 
+Batched decode at higher width (`--batched-w2 --width N`, probe default
+prompts of 9–13 tokens, 128 tokens per member, greedy). Every width produced
+identical tokens on both ranks, and batched matched serial token for token.
+Single-host Q4 figures are the HTTP sum of rates from BENCHMARKS.md
+(pp2048 prompts), so they are a reference, not a matched control.
+
+| Width | Q8 TP2 step | Q8 TP2 aggregate | Q4 TP2 aggregate | Q4 one host |
+|---|---|---|---|---|
+| 1 (serial) | 41.3 ms | 24.2 tok/s | 26.9 tok/s | 25.9 tok/s |
+| 2 | 50.1 ms | 37.2 tok/s | 44.8 tok/s | 45.7 tok/s |
+| 4 | 71.1 ms | 54.4 tok/s | 63.2 tok/s | 76.3 tok/s |
+| 8 | 103.3 ms | 76.2 tok/s | 87.7 tok/s | 108.7 tok/s |
+
+Full Q8 does not fit one host, so for Q8 these are the only figures: batching
+gives 3.15× at width 8. For Q4, TP2 falls behind one host as the width grows.
+The per-layer exchanges take about 10 ms of each step from width 4 up (5 ms at
+width 2), although a 4–8 row exchange is only 40–80 KiB; most of it is waiting
+for the rank whose experts received more rows. Rank balance, not the fabric,
+limits TP2 at higher concurrency.
+
 For Q4, TP2 is a capacity path, not yet a speed path. Profiles and
 microbenchmarks show why:
 
@@ -81,8 +101,13 @@ Proposed order for TP2 speed:
    other, since the link itself is at its limit. A Gen4 x4 NIC would halve the
    transfer time.
 4. Physical C2 (section 1) is feasible: the spike batched two streams with
-   identical tokens and schedules on both ranks, 1.67× over serial. On Q4 it
-   matches one host; it matters for full Q8, which needs two hosts.
+   identical tokens and schedules on both ranks, 1.67× over serial on Q4 and
+   1.54× on Q8, and widths 4 and 8 also stay in step (table above). On Q4 it
+   trails one host from width 4 up; it matters for full Q8, which needs two
+   hosts.
+5. Higher width: reduce the per-layer wait for the slower rank, for example by
+   overlapping the exchange with the next replicated work or by balancing
+   expert placement from measured routing.
 
 ## 1. Physical C2 — critical path
 
@@ -226,7 +251,8 @@ at width 2, then width 1 once a member stops. The only runtime input is the stop
 decision, which depends on tokens, so it relies on both ranks computing the same
 tokens. The communicator's host sum does not break that, since two operands add
 the same in either order. The full-Q8 divergence (section 3) shows it can still
-fail, so batched C2 should stay on Q4 until that is understood.
+fail; the full-Q8 divergence is now fixed and Q8 batching agrees across ranks
+at widths 2, 4 and 8.
 
 ### 4. Scheduler admits a cohort as a batch
 
