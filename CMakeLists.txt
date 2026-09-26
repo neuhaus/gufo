@@ -352,6 +352,13 @@ if (BUILD_TESTING)
   add_test(NAME tp_control_test COMMAND tp_control_test)
   set_tests_properties(tp_control_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 10)
 
+  # A measurement, not a gate: it asserts no threshold and never fails on a
+  # slow result, so it is labelled `perf` and kept out of the correctness run.
+  add_executable(tp_step_latency_test tests/cli/tp_step_latency_test.cpp)
+  target_link_libraries(tp_step_latency_test PRIVATE gufo_tp_control)
+  add_test(NAME tp_step_latency_test COMMAND tp_step_latency_test)
+  set_tests_properties(tp_step_latency_test PROPERTIES LABELS "cpu;tp2;perf" TIMEOUT 300)
+
   add_executable(tp_cohort_plan_test
     tests/cli/tp_cohort_plan_test.cpp
     src/cli/serve/tp_cohort_plan.cpp)

@@ -318,3 +318,21 @@ experimental and must not be rendered into the published benchmark tables.
   streams gives 1.67× the serial aggregate throughput. For Q4 the TP2 decode and
   prefill rates are no better than one host; see the performance section of
   [NEXT.md](NEXT.md#measured-tp2-performance) and `EXPERIMENTS.md`.
+- **Rank-0 step plan, per-token exchange cost.** The step plan replaces
+  independent per-rank sampling with rank 0 sampling and rank 1 consuming, so
+  every token costs one small control message and the ranks run in lockstep.
+  `tp_step_latency_test` measures that exchange over a loopback TCP pair on one
+  host: **1,517,045 steps/s** pipelined, publish and consume ~0.6 µs each, and a
+  **serialized round trip of 3.8 µs p50 / 5.3 µs p99**, i.e. ~1.9 µs one-way.
+  Against a 26 tok/s Q4 decode (~38 ms per token) that is ~0.005%, and even a
+  pessimistic 10× for the real cross-host path is ~0.05%, so lockstep is not a
+  throughput tax. The `max` outliers (56-71 µs) are container scheduler
+  preemption, not protocol cost.
+  **This is a lower bound and not the deciding number.** It excludes the
+  fuzzy/misty InfiniBand round trip and the peer host's scheduling delay; the
+  cross-host figure has to come from a two-host run. The measurement asserts no
+  threshold and is labelled `perf`, so it is excluded from the correctness run
+  with `ctest -LE perf`; a slow result is a result, not a failure. Protocol,
+  bounded receive and both role bridges are implemented and hosted-tested, but
+  nothing constructs them yet and the decode path is unchanged: `kStep` is still
+  refused as an unknown kind by the worker.
