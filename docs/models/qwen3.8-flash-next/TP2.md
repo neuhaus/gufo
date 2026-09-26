@@ -355,6 +355,24 @@ So the mechanism is proven rather than inferred, and the exchange costs nothing
 measurable: the per-token command is ~1.9 us one-way (a loopback lower bound,
 see the exchange-cost entry above), about 0.005% of a 26 tok/s token.
 
+**Steady-state baseline.** Ten consecutive identical greedy requests on one
+running pair, Q4 UD-Q4_K_XL, 64 tokens, AR, no MTP:
+
+| | tok/s |
+| --- | --- |
+| first request (cold) | 23.17 |
+| median of 10 | **26.69** |
+| mean of 10 | 26.35 |
+| max | 26.86 |
+
+All ten produced byte-identical output, sha256 prefix `ea5625561f01b420`, and
+zero divergence warnings on either rank. Nine of the ten fall in 26.63-26.86; the
+first request is about 13% slower cold, so a single sample understates the
+steady state and any later comparison should use the median of several runs
+rather than one. This is the baseline to compare a change against: the
+step-plan-off control measured 27.3 tok/s, so the exchange is within noise of
+independent per-rank sampling at this width.
+
 **What two-host runs cost to get here.** Four bugs, all in this work, found only
 on hardware because each one is invisible to a hosted test:
 
