@@ -52,7 +52,7 @@ namespace q = gufo::models::qwen38_flash_next;
 
 namespace {
 
-// Production path on both hosts (docs/models/qwen3.8-flash-next/Q8.md).
+// Production path on both hosts (docs/models/qwen3.8-flash-next/TP2.md).
 constexpr std::string_view kDefaultModel =
     "/opt/models/qwen3.8-flash-next/Q8_0/"
     "Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf";

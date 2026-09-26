@@ -1,56 +1,102 @@
-# TP=2 RDMA development probe
+# Qwen3.8-Flash-Next TP=2
 
-This is the first Qwen3.8-Flash-Next two-rank execution path. It is an
-experimental qualification topology, not a published single-host benchmark
-configuration.
+Two-host expert-parallel execution over InfiniBand. It is experimental and
+build-gated (`GUFO_ENABLE_TP2_RDMA`), and it is not a published benchmark
+configuration. This file is the reference: how TP2 works, how to run it and how
+to qualify a change. Current status and the plan are in [NEXT.md](NEXT.md);
+measurements are in [EXPERIMENTS.md](EXPERIMENTS.md).
+
+## Design
+
+**Partition.** Routed experts are split by rank (full Q8: rank 0 holds experts
+0–255, rank 1 experts 256–511). The shared expert's intermediate dimension is
+split in half. Dense, attention, GDN, HC, embedding, PLE and LM-head weights are
+replicated. Both hosts hold the complete checkpoint; RDMA carries activations,
+not weights. A rank with no locally selected experts contributes zeros and still
+takes part in the exchange.
+
+**Exchange.** Each MoE layer ends in one exchange of the ranks' partial outputs:
+48 per token, 10 KiB per decode row. Each rank stages its partial in host
+memory, reads the peer's partial with a one-sided RDMA read from a fixed IOVA
+window, and adds it on the GPU. A small ordered TCP header precedes each
+exchange and the read acknowledgement is deferred to the next one. Completion
+uses an RDMA completion channel, with bounded CQ polling as a provider
+fallback. HIP graph capture is disabled under TP2. Startup fails safely if a
+fixed staging address is already occupied.
+
+**Numerics.** The sum has two operands, so both ranks compute bit-identical
+results and replicated work stays identical on both. Splitting experts changes
+the reduction order relative to one host, so TP1 and TP2 logits are compared
+with an explicit tolerance, never claimed bit-identical.
+
+**Operation scope.** Every request binds an operation lease scoped to its
+control sequence. Each exchange header carries the scope, a monotonic
+per-collective ordinal and the byte count. Any mismatch poisons both
+communicators and fails the request; a poisoned rank fails every later request
+until it is restarted.
+
+**Control channel.** An ordered, token-authenticated TCP channel (protocol v6)
+carries prepared prompts, per-token steps and responses. The handshake
+validates context, MTP use and draft width, cache policy and prefill chunk
+size. Rank 0 owns a single response reader that routes frames by command
+sequence; an unknown or duplicate sequence poisons the channel. After the
+handshake an idle rank waits without a timeout, and TCP keepalive reports a
+dead peer host.
+
+**Rank-0 step plan (AR).** Rank 0 samples each token and publishes it as a
+`kStep` command; rank 1 consumes it in `SelectNext` instead of sampling, so both
+ranks run the stop test on the same token. Each consume is bounded by 5 s; a
+clean timeout does not poison the channel. `TpStepArm` arms the channel in all
+three request entry points (`GenerateScheduled`, `start_chat`, the rank-1
+worker) and disarms it on every exit. Two ordering rules are not enforced by the
+compiler:
+
+- Rank 0's publisher must be armed before its scheduler thread can decode.
+- The prefill preview (`PreviewFirstToken`, from `PrepareFirstSnapshot`) samples
+  a token that prefill discards. It must not publish or consume on either rank,
+  so `SelectNextImpl` takes `use_step_channel = false` for it.
+
+The MTP path (`DecodeStep`) does not use the step channel: each rank drafts and
+verifies on its own. The draft-length controller depends only on acceptance
+history, never on timing (`mtp_policy.hpp`), so identical tokens give identical
+draft lengths and identical collectives.
+
+**Agreement checks.** When a request ends, rank 0 compares rank 1's tokens and
+draft/cache telemetry with its own; any difference fails the request, since it
+means the exchanges combined partials from different states. Under the step
+plan rank 1 also compares its own greedy choice, made on a copy of its sampler,
+with each consumed token; the first disagreement fails the request after both
+ranks have finished its collective schedule. Both failures return HTTP 500 and
+leave the communicator usable.
+
+**Failure behaviour.** A lost peer surfaces within about a second as a TCP reset
+on the retained bootstrap socket; rank 0 returns 500 and later requests fail on
+the poisoned communicator. A scope mismatch fails on the first exchange, before
+any output.
 
 ## Build
 
-The optional adapter uses the pinned `rdma-core`/`libibverbs` package and is
-disabled in the default build.
+The adapter uses the pinned `rdma-core`/`libibverbs` and is off in the default
+build.
 
 ```sh
 nix develop --inputs-from .#tp2-rdma -c cmake --preset gpu-tp2
-nix develop --inputs-from .#tp2-rdma -c cmake --build --preset gpu-tp2 \
-  --target qwen38_flash_next_tp_probe qwen38_flash_next_gpu_probe
+nix develop --inputs-from .#tp2-rdma -c cmake --build --preset gpu-tp2 --target gufo
+
+# Release binary with TP2
+cmake --preset release -DGUFO_ENABLE_TP2_RDMA=ON
+cmake --build --preset release --parallel 4
 ```
 
-The target and MTP sidecar must be present on both hosts. The first run uses
-the verified `UD-Q4_K_XL` target and shared-Q8_0 MTP sidecar.
+On `fuzzy`/`misty` the same presets build inside the `gufo-tp2-dev:7.2.3`
+container with the repository mounted at `/workspace/gufo`.
 
-## Two-host probe
+## Run
 
-Run rank 0 first. `BOOTSTRAP_HOST` is the address rank 1 uses to reach rank
-0's TCP metadata endpoint; model data itself uses the native IB QP.
-
-```sh
-# host 0
-build/gpu-tp2/tests/models/qwen38_flash_next/qwen38_flash_next_tp_probe \
-  --model models/qwen3.8-flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  --prompt 'The capital of France is' --tokens 16 --context 4096 \
-  --tp-world-size 2 --tp-rank 0 --tp-bootstrap-port 18515
-
-# host 1
-build/gpu-tp2/tests/models/qwen38_flash_next/qwen38_flash_next_tp_probe \
-  --model models/qwen3.8-flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
-  --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  --prompt 'The capital of France is' --tokens 16 --context 4096 \
-  --tp-world-size 2 --tp-rank 1 --tp-bootstrap-host RANK0_ADDRESS \
-  --tp-bootstrap-port 18515
-```
-
-The loader discovers the remaining target shards beside the first shard. The
-lower-level `qwen38_flash_next_gpu_probe` remains available for prefill/logit-dump
-comparisons. Both TP probes accept `--tp-operation-id N`; pass the same value on
-both ranks for a normal run. A deliberate rank mismatch is a negative identity
-probe and must fail before producing model output.
-
-## C1 serving qualification
-
-After the probe passes, rank 0 can run the fail-stop HTTP worker path and
-rank 1 can run the worker-only path. The first serving slice is intentionally
-limited to one greedy, non-streaming, uncached request at a time:
+Start rank 0 first. `RANK0_ADDRESS` is the address rank 1 uses to reach rank
+0's TCP bootstrap; tensor data uses the IB queue pair. Both ranks need the same
+model files, `--tp-control-token`, `--prefill-chunk`, draft settings and cache
+policy.
 
 ```sh
 # rank 0: public HTTP server
@@ -63,35 +109,54 @@ build/gpu-tp2/gufo serve llm \
   --tp-control-token SHARED_TOKEN \
   --max-pending 1 --max-pending-per-client 1 --max-connections 1
 
-# rank 1: worker only; this process does not bind the public HTTP port
+# rank 1: worker only, no public HTTP port
 build/gpu-tp2/gufo serve llm \
   --model models/qwen3.8-flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   --speculative mtp \
   --mtp-model models/qwen3.8-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  --tp-world-size 2 --tp-rank 1 \
-  --tp-bootstrap-host RANK0_ADDRESS \
+  --tp-world-size 2 --tp-rank 1 --tp-bootstrap-host RANK0_ADDRESS \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
   --tp-control-token SHARED_TOKEN \
   --max-pending 1 --max-pending-per-client 1 --max-connections 1
 ```
 
-The worker uses a separate ordered TCP control channel for prepared prompt
-submissions. Both ranks must receive the same `--tp-control-token`, prefill
-chunk setting (`--prefill-chunk`), and cache policy. RDMA remains the tensor
-transport. Do not use this C1 path for streaming, cancellation, sampled
-decoding, vision, disk continuation, or multiple concurrent requests yet. For
-the controlled cache experiment, append `--tp-cache-reuse` to both rank
-commands; the flag is explicit and is not enabled by the default TP2
-configuration.
+For full Q8 use the first `Q8_0` shard; the Q8 PLE loader must be in the build.
+`--tp-cache-reuse` on both ranks enables symmetric rank-local live-prefix reuse
+and one retained snapshot boundary; no snapshot bytes cross hosts.
 
-## Experimental benchmark driver
+### Request limits
 
-The official model-bench driver can launch the paired ROCm containers through
-an experiment-only `gufo.tp2` overlay in a copied `bench.json`; the published
-`artifacts/bench.json`, `BENCHMARKS.md`, renderer, and target variants remain
-unchanged. The overlay requires `remote_host`, `bootstrap_host`,
-`container_image`, `workspace`, `container_workspace`, `binary`, and a
-non-empty `control_token`:
+The server refuses these with HTTP 400 (or at startup), because the TP2 path
+cannot yet keep both ranks in step for them:
+
+| Refused | Why |
+| --- | --- |
+| Sampling (`temperature` > 0) | Not enabled yet. The step plan makes sampled AR possible; sampled MTP also needs rank 0's draft and acceptance decisions. |
+| Streaming | Rank 1 must learn that a request ended early; there is no end marker yet. |
+| `stop` sequences | Rank 1 never receives the rules and would decode past rank 0's stop. |
+| More than one session, pending request or connection; request timeouts | Both ranks must run one identical collective schedule. |
+| Disk cache, vision | Not implemented for two ranks. |
+
+### Probes
+
+`tests/models/qwen38_flash_next/` builds these with the `gpu-tp2` preset:
+
+- `qwen38_flash_next_tp_probe`: prompt, decode and logit comparison on both
+  ranks (`--tp-world-size 2 --tp-rank N`, `--tp-operation-id N` for a
+  deliberate identity mismatch).
+- `qwen38_flash_next_tp_c2_probe`: the C2 cohort contract and the batched-decode
+  spike. `--batched-w2`/`--serial-w2` run the same program on both ranks,
+  batched or one member at a time; `--width N` (2–8) sets the member count;
+  `--allreduce-bench N` times the exchange without a model.
+- `qwen38_flash_next_ple_gather_probe --prompt-file F`: host-only hash of the
+  PLE rows a prompt gathers; diff stdout between hosts.
+- `tp_step_latency_test` (label `perf`): loopback cost of one step message.
+
+### Benchmark driver
+
+`tools/bench/model-bench.py` launches both ranks through an experiment-only
+`gufo.tp2` overlay in a copied `bench.json`. Results are experimental and must
+not be rendered into the published tables.
 
 ```json
 {
@@ -112,366 +177,69 @@ non-empty `control_token`:
 }
 ```
 
-Set `cache_reuse` to `true` only for the controlled live-prefix/snapshot
-experiment. It enables symmetric rank-local live-prefix reuse plus one
-retained immutable boundary through the v4 control handshake (the prior
-qualification was v3). Snapshot bytes
-stay in each rank's host memory; no snapshot payload is sent over TCP or
-RDMA. The default `false` setting preserves the uncached C1 boundary.
-
-Run only the supported experimental d0 cells, with a separate artifact
-directory:
-
 ```sh
-python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
-  --gufo build/gpu-tp2/gufo --config /tmp/bench-tp2.json \
-  --artifacts-dir /tmp/gufo-tp2-artifacts --gguf "$MODEL" --mtp "$MTP" \
-  run --target gufo --table single-ar --depths 0 --context 4096 --mode ar
-
 python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
   --gufo build/gpu-tp2/gufo --config /tmp/bench-tp2.json \
   --artifacts-dir /tmp/gufo-tp2-artifacts --gguf "$MODEL" --mtp "$MTP" \
   run --target gufo --table single-mtp --depths 0 --context 4096 --mode mtp
 ```
 
-For a live-prefix depth experiment, use the cache-enabled overlay and select a
-single-user depth explicitly:
+The driver uses non-streaming JSON requests, records both rank fingerprints,
+redacts the token and bootstrap address, and refuses loading, memory, image,
+C>1 and (unless `cache_reuse` is set) nonzero-depth tables. `multi-*` tables
+run only at concurrency 1 with uncached requests.
 
-```sh
-python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
-  --gufo build/gpu-tp2/gufo --config /tmp/bench-tp2-cache-reuse.json \
-  --artifacts-dir /tmp/gufo-tp2-cache-depth --gguf "$MODEL" --mtp "$MTP" \
-  run --target gufo --table single-ar --depths 4096 --context 8192 --mode ar
-```
+## Full Q8 checkpoint
 
-The qualified d4096 probe reused 4095 cached prompt tokens and prefilled 2043
-new tokens. A paired historical-branch probe also restored the older stable
-prompt boundary after a live continuation; both ranks reported the same
-cached-token count, and MTP retained its draft acceptance. Clean-source MTP
-d4096 measured 31.68 tok/s mixed and 39.07 tok/s repetitive in the fresh
-post-v3 run; these remain experimental results, not published cells.
+`/opt/models/qwen3.8-flash-next/Q8_0/` on both hosts: six shards, about 188 GB.
+SHA-256, computed independently on both hosts:
 
-For the C1 corpus path, use an experiment configuration whose selected
-`multi-ar`/`multi-mtp` concurrency is `[1]`; the driver forces
-`prefill_first=false` and `cache_prompt=false`:
+| Artifact | SHA-256 |
+|---|---|
+| `Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf` | `2dabcbb53ca537a7947bc7d20414fd464eeaf4d66d43021b5b2556cc87544ad2` |
+| `Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf` | `494ca4ed3dbf97bc28da88af3890b8877b9032f909812d00c0526a9ca5e91d2e` |
+| `Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf` | `34efd79a80a1ce540a517a5d56171924b66ce1c38b04c904f17ad6d8ef17cf20` |
+| `Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf` | `bfa634025fabbd2658bf7694bc80b90e571699c768723f844c934c7ef06c691a` |
+| `Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf` | `232a8f14cc0fa4262e7efe8593774b136fe40909e39c7a020342ddaa27259a97` |
+| `Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf` | `538a93bca918064983409a41187ad4c68640f9aced6f29564da8f551bf86d7a5` |
+| `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` | `5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6` |
 
-```sh
-python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
-  --gufo build/gpu-tp2/gufo --config /tmp/bench-tp2-c1-multi.json \
-  --artifacts-dir /tmp/gufo-tp2-c1-multi --gguf "$MODEL" --mtp "$MTP" \
-  run --target gufo --table multi-ar --context 4096 --mode ar
-```
+The PLE table `per_layer_token_embd.weight` (shard 3, `[320001536, 160]`, Q8_0,
+170-byte rows, about 54.4 GB) stays host-side and is read through direct I/O on
+each host; it needs the Q8 PLE loader. Full Q8 does not fit one 128 GiB host:
+at startup each TP2 rank uses 71,449 MiB of GPU memory, 72,856 MiB with MTP.
 
-The driver uses the JSON non-streaming request profile because the current TP2
-server rejects streaming. It records a topology block, both rank fingerprints,
-redacts the control token and bootstrap address, and rejects loading, memory,
-image, C>1 concurrent, and nonzero-depth tables before launch. C1 `multi-ar`
-and `multi-mtp` cells are supported only with forced uncached requests; the
-current server cannot replay a distributed prepared prefix. These artifacts are
-experimental and must not be rendered into the published benchmark tables.
+## Qualifying a change
 
-## Current boundaries
+Run this on both hosts for any change to the TP2 path, and record the result as
+one row in EXPERIMENTS.md (machine-readable detail in `artifacts/`).
 
-- Expert-parallel routed MoE with replicated dense, attention, GDN, HC,
-  embedding, and LM-head weights.
-- The shared expert's intermediate dimension is split across ranks. Its
-  partial outputs join the routed-expert output in the existing collective.
-- Host-staged synchronous RDMA reads use identical fixed IOVA windows for
-  send, receive, and result data, with a small ordered TCP control/ack
-  channel; an RDMA completion channel is used when available, with bounded
-  CQ polling as a provider fallback. HIP graph capture is disabled.
-  The probe fails safely if a fixed staging address is already occupied.
-- Each rank adds the peer partial on the GPU after the staged RDMA read; read
-  acknowledgements are consumed before the next exchange reuses the window.
-  Partitioning changes reduction order relative to TP1, so TP1/TP2 logits are
-  compared with an explicit tolerance rather than claimed bit-identical.
-- A rank with no locally selected experts emits a zero routed contribution
-  and still participates in the collective.
-- The serving runner marks distributed TP2 as serial-only. The CLI rejects
-  `--sessions 2` before creating the communicator or loading weights. The
-  default C1 path
-  disables snapshots, forks, prefix reuse, persistence, and batched decode.
-  `--tp-cache-reuse` enables symmetric rank-local live-prefix reuse and one
-  immutable in-process snapshot/fork boundary; both ranks must use the flag
-  and the control handshake rejects policy mismatches. No snapshot bytes cross
-  the host boundary. The C1 path uses a separate rank-1 worker control channel
-  and does not yet support streaming, cancellation, sampled decoding, or
-  concurrent requests. Rank 0 now owns one control-response reader and routes
-  final frames by command sequence; unknown or duplicate sequences poison the
-  channel rather than being delivered to the wrong request. The C1 path also
-  binds each RDMA collective to that command sequence and a per-collective
-  operation ordinal; a scope, operation, size, or acknowledgement mismatch fails
-  closed. This remains a response- and operation-ownership foundation only; it
-  does not enable C2.
-- Serialized/distributed disk snapshots, arbitrary historical-prefix indexes,
-  and vision remain rejected. Only the stable prompt boundary and current live
-  frontier are retained by this experimental C1 slice.
-- C>1 is intentionally rejected before communicator/model setup. Merely
-  changing `--sessions` is unsafe: a future cohort implementation must add a
-  cohort identity and ordered member plan, an ordered rank-local execution
-  plan, and explicit cache-plan parity before enabling physical batched
-  collectives. A single member request sequence is not a valid shared C2
-  collective scope.
-  The first qualification slice, if pursued, is fixed two-request C2, AR before
-  MTP, uncached and non-streaming, with repeated ordering/failure tests and
-  per-request hashes; it must not be enabled by a CLI alias alone.
-- C2 qualification is landing as three ordered layers, none of which enables a
-  shared collective or a second session:
-  - Protocol v5 validates a dormant two-member AR-only cohort envelope, canonical
-    execution/cache plan digests, ordered member results, and broker mismatch
-    poisoning.
-  - The scheduler atomically admits exactly two ordered, unique members under one
-    cohort identity, and rejects incomplete, duplicate, third-member, sampled,
-    streaming, cached, continued, cancelled, and deadline-bearing cohorts before
-    any model work. Admitted members still select `serial-c1` execution.
-  - A translation seam converts a validated command into ordered scheduler
-    members and two member results into a strict C2 response, rejecting any
-    member that does not report serial width and zero draft/cache telemetry. A
-    rejected cohort still returns both member envelopes.
+1. Build the release binary and the test targets from one commit on both hosts;
+   record the commit and binary hash.
+2. Format check on a fresh `git archive` export of that commit, not on a mounted
+   checkout that may be stale.
+3. Hosted tests on each host, with no skips: `tp_control_test`,
+   `tp_cohort_plan_test`, `tp_cohort_worker_test`, `text_model_runner_test`,
+   `text_generation_scheduler_test`, `serve_cli_test`,
+   `qwen38_flash_next.ngram`, `qwen38_flash_next.tp_partition`,
+   `qwen38_flash_next.mtp_sampling`.
+4. Serving on two hosts, greedy: Q4 and Q8, AR and MTP; a short prompt, its
+   repeat, and a prompt longer than one prefill chunk. Outputs must repeat, and
+   AR and MTP outputs must match within each quantization.
+5. Refusals: a sampled, a streaming and a `stop` request each return 400, and a
+   valid request succeeds afterwards.
+6. Failure paths: kill rank 1 mid-request (rank 0 returns 500 promptly); a
+   scope mismatch fails on the first exchange.
+7. For speed, report the median of several warm requests; the first request is
+   about 13% slower.
 
-  The rank-1 worker dispatches `kCohort2Ar` through those layers under exactly
-  one operation lease scoped to the command sequence, and fails closed when an
-  MTP sidecar is loaded because drafts cannot be represented by the C2 response
-  contract. It also refuses a cohort, before binding the lease, unless its
-  runner capacity is one. A wider pool would admit both members at once and
-  interleave them, and each rank's own scheduler decides that interleaving, so
-  the two ranks' collective sequences could diverge. TP2 loading already
-  requires one session, so this guard only matters once `--sessions 2` is
-  enabled. That path stays dormant: no producer constructs a C2 command. The
-  sequence itself is host-testable through injected lease, submission and send
-  hooks, with a single-release-site guard so a bound scope is released exactly
-  once on every path — including a member failure, which would otherwise leave
-  a scope bound and fail-stop the next C1 request.
+## C2 (dormant)
 
-  Three real fault injections are now verified on hardware, all fail-closed:
-  - **Admission refusal** (rank 1 `--worker-max-pending 1`): `SubmitCohort`
-    throws at admission, the seam releases the bound lease and sends a
-    wire-valid C2 error response that still carries both member envelopes.
-    Rank 0 observed `members=2`, error `text generation pending queue is full`
-    and no collective at all — 2 ms from command sent to response.
-  - **Operation-scope mismatch** (rank 0 `--tp-scope-override N`): the first
-    `AllReduceSum` header exchange fails on `scope_id` (`verbs.cpp:644-660`),
-    poisoning both communicators. Rank 0 failed 13 ms after send with
-    `outgoing=99/0/51200 incoming=1/0/51200`; rank 1, which injected nothing,
-    detected the mismatch and then failed its own lease release with
-    `verbs communicator is poisoned`, so the worker stopped instead of
-    degrading quietly. This is the case a fake lease cannot model, and it
-    confirms the exactly-one-`End` contract against a real poisoned
-    communicator.
-
-  - **MTP refusal** (rank 1 `--mtp-model`): TP2 plus MTP is a supported
-    shipping combination, and the C2 response contract cannot carry draft
-    telemetry at all, so a cohort must be refused rather than answered
-    malformed. With a real 2.79 GB sidecar loaded, the handshake presented
-    `use_mtp=true`/`max_draft_tokens=7`, rank 0 mirrored both fields, and rank 1
-    refused **before** `BeginOperation` — no lease bound, no collective. Rank 0
-    observed both member envelopes and the exact refusal string in 1 ms. The
-    probe compares that string verbatim, because every refusal path returns the
-    same exit code and a mode-1 refusal would otherwise read as this mode's
-    success.
-
-  Still covered by hosted tests only: peer cancel mid-cohort, member failure,
-  and the runner-capacity refusal. TP2 loading rejects more than one session,
-  so that refusal cannot be injected on hardware without relaxing the guard.
-  Multi-chunk C2 probe runs are recorded in [NEXT.md](NEXT.md); they do not
-  enable concurrent serving.
-
-- The dormant C2 path HAS now run end to end on hardware, three consecutive
-  times, via `qwen38_flash_next_tp_c2_probe` (rank 0 on `fuzzy`, rank 1 on
-  `misty`). `gufo serve` cannot host the worker: TP=2 forces `--max-pending 1`
-  while `SubmitCohort` needs `queued + 2 <= max_pending_requests`, so a cohort
-  is always refused at admission. The probe therefore hosts a real
-  `InferenceBackend` with `max_pending_requests = 2`, runner pool capacity 1 and
-  no MTP, and relaxes nothing in production. Per run: both digests matched, the
-  cohort was admitted, member 0 then member 1 executed serially in one operation
-  scope, and the ordered two-member response agreed token-for-token with rank 0's
-  local greedy output. Each member issued 8 forwards and 384 collectives
-  (48 layers), where 8 published tokens cost 7 decode advances because
-  `final_token_advance_required` is false on the distributed runner. Still
-  unproven in serving: batched/physical C2. Later probe batching and hardware
-  fault-injection evidence are recorded in [NEXT.md](NEXT.md).
-- MTP follows the same expert partition and collective path.
-- Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
-  routed source bytes and the device model reports post-conversion resident
-  bytes. Q8 memory fit and restricted AR/MTP serving passed on the combined
-  branch; independent quality and ordinary client support remain open. See
-  [INTEGRATION.md](INTEGRATION.md) for the fresh baseline.
-- Batched single-token advance was compared against serial advance on ONE host,
-  Q4 UD-Q4_K_XL, greedy, 64 new tokens, two prompts of 2106 and 78 prompt
-  tokens. `gufo serve -j 2` selected `plan=batched-w2 batch_width=2` with both
-  requests co-resident (`resident_at_admission=2`, 427 ms queue wait), and the
-  `-j 1` control logged `plan=serial-c1 batch_width=1`. All three paths --
-  `gufo prompt`, `serve -j 1`, `serve -j 2` -- produced identical
-  `reasoning_content`: sha256 `e83f2652...` (282 chars) and `731fb60a...`
-  (353 chars). Batching the advance therefore does not perturb greedy tokens
-  here. Scope, stated narrowly because it is narrow: the advance is the ONLY
-  operation batched on this path. `Prefill` is per-state
-  (`text_model_runner.hpp:262`) and has no batch form in the runner or the
-  engine, so prefill ran serially in every arm and this result says nothing
-  about prefill. `DecodeBatch` fell back to the serial base loop because
-  `use_mtp_` was false (`inference_backend.cpp:2802`), so batched decode is
-  untested. Single host, so no AllReduce and no distributed reduction order; 64
-  greedy tokens, all of them `reasoning_content`; one run per prompt. Reference
-  numbers only, not a like-for-like comparison: `prefill_tps=950.1` at width 2,
-  and `cache_snapshot_bytes` 172425656 and 121428488 per resident session,
-  which bounds how wide a batch can ever be.
-- The same batched advance now also runs across two hosts. With
-  `qwen38_flash_next_tp_c2_probe --batched-w2`, both ranks produce identical
-  tokens and per-step member sets, including the routed-expert all-reduce inside
-  `MoeBatch`, and match the `--serial-w2` baseline token for token. Batching two
-  streams gives 1.67× the serial aggregate throughput. For Q4 the TP2 decode and
-  prefill rates are no better than one host; see the performance section of
-  [NEXT.md](NEXT.md#measured-tp2-performance) and `EXPERIMENTS.md`.
-- **Rank-0 step plan, per-token exchange cost.** The step plan replaces
-  independent per-rank sampling with rank 0 sampling and rank 1 consuming, so
-  every token costs one small control message and the ranks run in lockstep.
-  `tp_step_latency_test` measures that exchange over a loopback TCP pair on one
-  host: **1,517,045 steps/s** pipelined, publish and consume ~0.6 µs each, and a
-  **serialized round trip of 3.8 µs p50 / 5.3 µs p99**, i.e. ~1.9 µs one-way.
-  Against a 26 tok/s Q4 decode (~38 ms per token) that is ~0.005%, and even a
-  pessimistic 10× for the real cross-host path is ~0.05%, so lockstep is not a
-  throughput tax. The `max` outliers (56-71 µs) are container scheduler
-  preemption, not protocol cost.
-  **This is a lower bound and not the deciding number.** It excludes the
-  fuzzy/misty InfiniBand round trip and the peer host's scheduling delay; the
-  cross-host figure has to come from a two-host run. The measurement asserts no
-  threshold and is labelled `perf`, so it is excluded from the correctness run
-  with `ctest -LE perf`; a slow result is a result, not a failure. Protocol,
-  bounded receive and both role bridges are implemented, hosted-tested, and now
-  verified on two hosts; see "Rank-0 step plan: verified on two hosts" below.
-
-### Rank-0 step plan: verified on two hosts
-
-The step plan is **implemented and verified on hardware**. Rank 0 samples each
-token and publishes it as a `kStep` control command; rank 1 consumes that token
-in `SelectNext` instead of sampling its own. Because the token originates on
-rank 0, the stop test runs on the shared token and both ranks stop together with
-no separate stop message, and the two ranks no longer need bit-identical logits.
-
-Measured on `fuzzy`/`misty`, Q4 UD-Q4_K_XL, greedy, 64 tokens, AR, no MTP:
-
-- rank 0 published 64 tokens, rank 1 consumed 64, first and last agreeing
-  (`1596` ... `4971`), `sequence=1`, both ranks armed and cleanly disarmed
-- **27.44 tok/s, `execution_plan: serial-c1`**, output byte-identical to the
-  step-plan-off control at 27.3 tok/s
-
-So the mechanism is proven rather than inferred, and the exchange costs nothing
-measurable: the per-token command is ~1.9 us one-way (a loopback lower bound,
-see the exchange-cost entry above), about 0.005% of a 26 tok/s token.
-
-**Steady-state baseline.** Ten consecutive identical greedy requests on one
-running pair, Q4 UD-Q4_K_XL, 64 tokens, AR, no MTP:
-
-| | tok/s |
-| --- | --- |
-| first request (cold) | 23.17 |
-| median of 10 | **26.69** |
-| mean of 10 | 26.35 |
-| max | 26.86 |
-
-All ten produced byte-identical output, sha256 prefix `ea5625561f01b420`, and
-zero divergence warnings on either rank. Nine of the ten fall in 26.63-26.86; the
-first request is about 13% slower cold, so a single sample understates the
-steady state and any later comparison should use the median of several runs
-rather than one. This is the baseline to compare a change against: the
-step-plan-off control measured 27.3 tok/s, so the exchange is within noise of
-independent per-rank sampling at this width.
-
-**What two-host runs cost to get here.** Four bugs, all in this work, found only
-on hardware because each one is invisible to a hosted test:
-
-1. **`SO_RCVTIMEO` leaked on the failure path.** `ReceiveCommandWithin` cleared
-   the per-token bound only on success, so a timed-out consume left a 5 s timeout
-   on the socket and rank 1's *idle command wait* — which must wait
-   indefinitely — failed with `EAGAIN` and the worker exited.
-2. **Clean timeouts poisoned the channel.** A receive that expired with nothing
-   read leaves the byte stream intact, so poisoning it was both wrong and
-   unnecessary; only a failure that may have landed mid-frame may poison.
-3. **Rank 0 deadlocked on the response.** It waited for rank 1's reply before
-   waiting on its own decode, so under the step plan each rank waited on the
-   other. The order is now: send the command, submit, wait on rank 0's own
-   decode, then collect rank 1's response.
-4. **The step channel was armed in the wrong function.** TP2 has three request
-   entry points -- `GenerateScheduled`, `start_chat` and the rank-one worker --
-   and the arming existed in only one. HTTP goes through `start_chat`, so rank 0
-   never armed its publisher at all and rank 1 starved. `TpStepArm` is now a
-   single RAII type used by all three, so a new entry point cannot forget the
-   disarm; `ScheduledGenerationRequest` holds it as a member because
-   `start_chat` returns lazily and decodes inside `Wait`.
-
-A fifth defect was a plain counter bug with an unhelpful symptom: the step
-validator rejects `sequence == 0`, and `tp_sequence` started at 0, so the first
-request a server ever served had every per-token message refused. The peer simply
-starved. The counter now starts at 1, with a hosted test.
-
-**How the failures were isolated.** A two-host bisect on one binary, with the
-step channel behind an env gate, against the base branch as control:
-
-| Arm | Reordering | Step channel | Result |
-| --- | --- | --- | --- |
-| base `d73562ab` | absent | absent | 27.3 tok/s, `serial-c1` |
-| A `69cfcab1` | on | off | 27.3 tok/s, `serial-c1` |
-| B `69cfcab1` | on | on | fail, 30.5 s, `bootstrap receive` |
-
-Arm A matching the control exactly is what proved the reordering and the
-own-wait ordering were correct and the step channel alone was at fault. Arm B then
-failed on the *collective*, not the control channel, which is what pointed at
-prefill and the preview rather than at the exchange. The env gate and the
-`[step-trace]` tracing that made this possible are **removed**; they were
-diagnostic scaffolding and must not ship in a serving path. Re-adding tracing is
-the first step if the plan ever regresses.
-
-One ordering hazard is worth keeping, because it is not enforced by the compiler:
-the publisher must be armed before rank 0's scheduler thread can decode. Both
-ranks run a speculative prefill lookahead (`PreviewFirstToken`, called from
-`PrepareFirstSnapshot` at `text_generation_scheduler.cpp:818`) which delegates to
-`SelectNext`. It samples a token the prefill path discards, so it must **not**
-participate in the exchange on either rank; `SelectNextImpl` takes an explicit
-`use_step_channel` flag for exactly this, and `PreviewFirstToken` passes false.
-
-**Rank agreement.** The rank token comparison fails the request again. It had been demoted to a
-logged warning on the reasoning that the token originates on rank 0, but the
-step plan covers AR only: with MTP the runner decodes through `DecodeStep`,
-which never touches the step channel, so each rank still selects its own
-tokens and a divergence would have been served. A difference is never benign:
-either a token bypassed the plan or a step was stale or mis-sequenced, and
-either way the collectives combined partials from different states. Under the
-plan rank 1 also compares its own greedy choice, made on a copy of its sampler,
-with each token it consumes, because consuming rank 0's token would otherwise
-hide a numerical divergence such as the full-Q8 bug. The first disagreement
-fails the request at its end, after both ranks finished the collective schedule
-together. Fault injection on two hosts: a forced rank-1 disagreement at step 5
-returned HTTP 500 naming the step and both tokens, a corrupted rank-1 token
-under MTP returned 500 with the index logged, and in both runs the next request
-succeeded with the usual output.
-
-The request restrictions themselves are still enforced. The
-`TP2 requires greedy text without stop sequences` guard still refuses sampling,
-stop sequences and streaming, and that refusal is load-bearing rather than
-incidental:
-
-- **Removing the stop-sequence part of the guard makes stop sequences silently
-  ignored, not working.** Measured on two hosts: a request with `stop: ["banana"]`
-  whose 200-token essay contained "banana" was accepted and still finished
-  `finish: length`. A client asking for a stop would get a full-length response,
-  which is worse than the 400 it replaced.
-- **The cause is structural.** `TpControlCommand` carries no stop rules -- the
-  struct has no stop field at all -- so rank 1 never receives them. The non-TP
-  path passes `.stop_sequences` into `Submit`; both TP2 paths omitted it, which
-  is what the experiment exposed. Rank 0 had the rules locally and rank 1 had
-  none, so the ranks would stop at different steps and desync at scope teardown.
-
-So stop sequences need the rules to travel on the wire: a field on
-`TpControlCommand`, a `kVersion` bump, encoder/decoder/validator changes, and
-rank 1 passing them into its own `Submit`. Even then nothing forces both ranks
-to stop on the same step -- identical rules and identical tokens should make
-them agree, and the token comparison is what would show it if they did not.
-Rather than shipping the rules, rank 0 can send the decision: it already
-evaluates stop sequences, cancellation and client disconnects, and rank 1 always
-waits for the next step, so an end marker in place of the next token ends the
-request on both ranks at the same step. One mechanism then covers stop
-sequences, cancellation and streaming, and nothing depends on both ranks
-evaluating the rules identically.
-Streaming and cancellation have the same shape, since both need rank 1 to learn
-that a request is over rather than waiting for a token that is not coming, so
-they are worth designing together.
+C2 runs two requests as one cohort under a single operation lease. What exists:
+a validated two-member AR-only command envelope with execution/cache plan
+digests (protocol v6), atomic two-member scheduler admission, a translation seam
+to ordered member responses, and rank-1 dispatch that refuses a cohort when an
+MTP sidecar is loaded or its runner capacity is not one. No producer builds a
+C2 command, and TP2 loading requires one session, so the path is dormant. The
+C2 probe runs the contract and the batched-decode spike on hardware. The design
+decisions that remain are in [NEXT.md](NEXT.md).
