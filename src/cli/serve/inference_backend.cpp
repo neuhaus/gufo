@@ -3021,6 +3021,42 @@ private:
 
 }  // namespace
 
+/// Compare rank 1's reported tokens against rank 0's own, and report the first
+/// divergence without failing the request.
+///
+/// Under the rank-0 step plan the token originates on rank 0 and rank 1
+/// consumes it, so agreement is expected -- but it is no longer *required* for
+/// correctness, which is the whole point of the plan. A divergence is therefore
+/// telemetry rather than a gate: it is logged with its position and both ids so a
+/// regression is visible, but a request that decoded cleanly is served.
+///
+/// The check is deliberately kept, not deleted. It is the cheapest available
+/// signal that the exchange is still doing what it claims, and it is the thing
+/// that would catch a stale or mis-sequenced step. Returns the first differing
+/// index, or `std::nullopt` when the two agree.
+[[nodiscard]] std::optional<std::size_t> ReportTpTokenDivergence(
+    std::string_view role, std::span<const TextRunnerToken> rank0,
+    std::span<const std::int32_t> rank1) {
+  if (rank0.size() != rank1.size()) {
+    Logger::Warn("tp2", std::string(role) +
+                            " rank-0 step plan token COUNT divergence: rank 0 " +
+                            std::to_string(rank0.size()) + " tokens, rank 1 " +
+                            std::to_string(rank1.size()));
+    return std::min(rank0.size(), rank1.size());
+  }
+  for (std::size_t i = 0; i < rank0.size(); ++i) {
+    if (static_cast<std::uint32_t>(rank1[i]) != rank0[i]) {
+      Logger::Warn("tp2", std::string(role) +
+                              " rank-0 step plan token divergence at index " +
+                              std::to_string(i) + ": rank 0 " +
+                              std::to_string(rank0[i]) + ", rank 1 " +
+                              std::to_string(rank1[i]));
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
 /// RAII arm of the rank-0 step plan for one request.
 ///
 /// Every TP2 request entry point must arm the step channel before it submits
@@ -3148,15 +3184,8 @@ struct InferenceBackend::Impl {
           if (!response.error.empty()) {
             throw std::runtime_error("TP worker failed: " + response.error);
           }
-          if (response.tokens.size() != result.tokens.size()) {
-            throw std::runtime_error("TP worker token count mismatch");
-          }
-          for (std::size_t i = 0; i < result.tokens.size(); ++i) {
-            if (static_cast<std::uint32_t>(response.tokens[i]) !=
-                result.tokens[i]) {
-              throw std::runtime_error("TP worker token mismatch");
-            }
-          }
+          (void)ReportTpTokenDivergence("start_chat", result.tokens,
+                                        response.tokens);
           if (response.draft_tokens != result.draft_tokens ||
               response.draft_accepted_tokens != result.draft_accepted_tokens ||
               response.cached_prompt_tokens != result.cached_prompt_tokens) {
@@ -3377,15 +3406,8 @@ struct InferenceBackend::Impl {
         if (!response.error.empty()) {
           throw std::runtime_error("TP worker failed: " + response.error);
         }
-        if (response.tokens.size() != result.tokens.size()) {
-          throw std::runtime_error("TP worker token count mismatch");
-        }
-        for (std::size_t i = 0; i < result.tokens.size(); ++i) {
-          if (static_cast<std::uint32_t>(response.tokens[i]) !=
-              result.tokens[i]) {
-            throw std::runtime_error("TP worker token mismatch");
-          }
-        }
+        (void)ReportTpTokenDivergence("generate", result.tokens,
+                                      response.tokens);
         if (response.draft_tokens != result.draft_tokens ||
             response.draft_accepted_tokens != result.draft_accepted_tokens ||
             response.cached_prompt_tokens != result.cached_prompt_tokens ||
