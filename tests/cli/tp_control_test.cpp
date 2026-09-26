@@ -211,18 +211,42 @@ int main() {
               received.client_id == command.client_id,
           "TP control command round trip");
 
-  // A C1 command carries whether the request samples, because rank 1 checks
-  // rank 0's tokens against its own greedy choice only for greedy requests.
+  // A C1 command carries the request's whole sampling configuration: rank 1
+  // builds the same sampler for multi-token decoding, bit for bit.
   {
     TpControlCommand sampled = command;
     sampled.sequence = 8;
-    sampled.sampled = true;
+    sampled.sampling = {.temperature = 0.8F,
+                        .top_k = 40,
+                        .top_p = 0.9F,
+                        .min_p = 0.05F,
+                        .min_keep = 2,
+                        .seed = 7,
+                        .repeat_penalty = 1.1F,
+                        .repeat_last_n = 32,
+                        .frequency_penalty = 0.2F,
+                        .presence_penalty = -0.3F};
     Require(server->SendCommand(sampled, &server_error), server_error);
-    TpControlCommand received_sampled;
-    Require(client->ReceiveCommand(&received_sampled, &client_error),
-            client_error);
-    Require(received_sampled.sampled && !received.sampled,
-            "TP C1 command preserves the sampling flag");
+    TpControlCommand got;
+    Require(client->ReceiveCommand(&got, &client_error), client_error);
+    const auto& want = sampled.sampling;
+    Require(got.sampling.temperature == want.temperature &&
+                got.sampling.top_k == want.top_k &&
+                got.sampling.top_p == want.top_p &&
+                got.sampling.min_p == want.min_p &&
+                got.sampling.min_keep == want.min_keep &&
+                got.sampling.seed == want.seed &&
+                got.sampling.repeat_penalty == want.repeat_penalty &&
+                got.sampling.repeat_last_n == want.repeat_last_n &&
+                got.sampling.frequency_penalty == want.frequency_penalty &&
+                got.sampling.presence_penalty == want.presence_penalty &&
+                received.sampling.can_use_unmodified_argmax(),
+            "TP C1 command preserves the sampling configuration");
+    TpControlCommand invalid = sampled;
+    invalid.sampling.top_p = 0.0F;
+    std::string why;
+    Require(!server->SendCommand(invalid, &why) && !why.empty(),
+            "TP C1 command with invalid sampling is refused");
   }
 
   // An instruction is one model call for rank 1 to execute within the request
@@ -257,8 +281,11 @@ int main() {
            .op = TpInstructionOp::kAdvance, .index = 10, .token = 248068}});
   round_trip({.sequence = command.sequence,
               .kind = TpControlCommandKind::kInstruction,
-              .instruction = {
-                  .op = TpInstructionOp::kDecode, .index = 11, .count = 8}});
+              .instruction = {.op = TpInstructionOp::kDecode,
+                              .index = 11,
+                              .count = 8,
+                              .rng = 0x0123456789abcdefULL,
+                              .pending = 248067}});
   round_trip({.sequence = command.sequence,
               .kind = TpControlCommandKind::kInstruction,
               .instruction = {.op = TpInstructionOp::kEnd,
@@ -302,7 +329,12 @@ int main() {
   refuses("a cache prefix",
           with([](auto& bad) { bad.cache_prefix_tokens = 2; }));
   refuses("a client id", with([](auto& bad) { bad.client_id = "probe"; }));
-  refuses("a sampling flag", with([](auto& bad) { bad.sampled = true; }));
+  refuses("a sampling configuration",
+          with([](auto& bad) { bad.sampling.temperature = 0.5F; }));
+  refuses("a draw state outside a decode",
+          with([](auto& bad) { bad.instruction.rng = 1; }));
+  refuses("a pending draw outside a decode",
+          with([](auto& bad) { bad.instruction.pending = 3; }));
   refuses("a cohort scope", with([](auto& bad) { bad.cohort_id = 3; }));
   refuses("an execution-plan digest",
           with([&](auto& bad) { bad.execution_plan_digest = nonzero_digest; }));

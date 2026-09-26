@@ -78,6 +78,8 @@ void DigestTpCall(TpExecutionDigest& digest, const TpInstruction& instruction,
   digest.Add(instruction.offset);
   digest.Add(instruction.count);
   digest.Add(instruction.prompt_size);
+  digest.Add(instruction.rng);
+  digest.Add(static_cast<std::uint32_t>(instruction.pending));
   if (instruction.op == TpInstructionOp::kPrefill) {
     digest.Add(prefill_prompt);
   }
@@ -416,19 +418,30 @@ void TpMirroredRunner::Advance(TextRunnerState& state,
 TextDecodeStep TpMirroredRunner::DecodeStep(
     TextRunnerState& state, std::size_t max_tokens,
     sampling::SamplerState& sampler) const {
-  // Greedy multi-token decoding makes the same draft and acceptance decisions
-  // on both ranks, so the whole cycle is one instruction. Anything else runs
-  // token by token: the base implementation selects here, on rank 0 only, and
-  // mirrors each `Advance`. Forwarding it to the wrapped runner instead would
-  // let its `Advance` bypass this wrapper.
-  if (max_tokens < 2 || !multi_token_decode_ ||
-      !sampler.config().can_use_unmodified_argmax()) {
+  // A multi-token cycle is one instruction. It carries the sampler's draw
+  // state, so rank 1, whose sampler otherwise matches, draws what rank 0 draws
+  // and makes the same draft and acceptance decisions. A one-token budget runs
+  // through the base implementation instead, which selects here, on rank 0
+  // only, and mirrors the `Advance`; forwarding it to the wrapped runner would
+  // let that `Advance` bypass this wrapper.
+  if (max_tokens < 2 || !multi_token_decode_) {
     return TextModelRunner::DecodeStep(state, max_tokens, sampler);
   }
   auto& mirrored = Mirrored(state);
   const auto count = ToWire(max_tokens, "decode budget");
-  Send(
-      {.op = TpInstructionOp::kDecode, .state = mirrored.id(), .count = count});
+  const auto draw = sampler.SaveDrawState();
+  if (draw.pending.has_value() &&
+      *draw.pending > static_cast<sampling::TokenId>(
+                          std::numeric_limits<std::int32_t>::max())) {
+    throw std::invalid_argument("TP2 pending draw exceeds the protocol range");
+  }
+  Send({.op = TpInstructionOp::kDecode,
+        .state = mirrored.id(),
+        .count = count,
+        .rng = draw.rng,
+        .pending = draw.pending.has_value()
+                       ? static_cast<std::int32_t>(*draw.pending)
+                       : -1});
   TextDecodeStep step;
   try {
     step = inner_->DecodeStep(mirrored.inner(), count, sampler);
@@ -547,8 +560,11 @@ bool TpExecutor::RunRequest(const TpControlCommand& begin,
   // what both ranks feed, so without this check a numerical divergence (the
   // full-Q8 bug was one) would go unnoticed. The choice is made after each call
   // while rank 0 is still selecting, so it costs rank 1 idle time only.
-  const bool greedy = !begin.sampled;
-  sampling::SamplerState decode_sampler{sampling::SamplingConfig{}};
+  const bool greedy = begin.sampling.can_use_unmodified_argmax();
+  // Built as rank 0's pool builds the request's sampler, and fed the same
+  // accepted tokens, so a multi-token decode sees the same history; each
+  // `decode` instruction supplies rank 0's draw state.
+  sampling::SamplerState sampler{begin.sampling, prompt};
   std::vector<std::optional<OwnChoice>> own(states_.size());
   TpExecutionDigest digest;
   std::uint64_t count = 0;
@@ -633,6 +649,7 @@ bool TpExecutor::RunRequest(const TpControlCommand& begin,
           }
           choice.reset();
           runner_->Advance(state, token);
+          sampler.Accept(token);
           DigestTpAdvance(digest, runner_->CheckpointPosition(state));
           if (greedy) {
             choice = ChooseGreedy(state);
@@ -640,14 +657,23 @@ bool TpExecutor::RunRequest(const TpControlCommand& begin,
           break;
         }
         case TpInstructionOp::kDecode: {
-          if (!greedy) {
-            throw std::logic_error("TP2 does not mirror sampled MTP decoding");
-          }
           choice.reset();
+          sampler.RestoreDrawState(
+              {.rng = instruction.rng,
+               .pending = instruction.pending >= 0
+                              ? std::optional<sampling::TokenId>(
+                                    static_cast<sampling::TokenId>(
+                                        instruction.pending))
+                              : std::nullopt});
           const auto step =
-              runner_->DecodeStep(state, instruction.count, decode_sampler);
+              runner_->DecodeStep(state, instruction.count, sampler);
+          for (const auto& selection : step.selections) {
+            sampler.Accept(selection.token);
+          }
           DigestTpDecode(digest, step, runner_->CheckpointPosition(state));
-          choice = ChooseGreedy(state);
+          if (greedy) {
+            choice = ChooseGreedy(state);
+          }
           break;
         }
         case TpInstructionOp::kEnd:

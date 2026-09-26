@@ -3072,7 +3072,7 @@ struct InferenceBackend::Impl {
     TpControlCommand begin{
         .max_tokens = static_cast<std::uint32_t>(max_tokens),
         .client_id = client_id,
-        .sampled = !sampling.can_use_unmodified_argmax(),
+        .sampling = sampling,
     };
     begin.prompt_tokens.reserve(prompt.size());
     for (const auto token : prompt) {

@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "src/core/sampling.hpp"
+
 namespace gufo::server {
 
 struct TpControlConfig {
@@ -45,8 +47,9 @@ enum class TpInstructionOp : std::uint8_t {
   kPrefill = 2,
   /// `Advance(state, token)`.
   kAdvance = 3,
-  /// `DecodeStep(state, count)` with greedy sampling: one MTP draft-verify
-  /// cycle, whose decisions both ranks make identically.
+  /// `DecodeStep(state, count)`: one MTP draft-verify cycle. It carries rank
+  /// 0's sampler draw state (`rng`, `pending`) from just before the call, so
+  /// rank 1's draws, and therefore its decisions, are rank 0's.
   kDecode = 4,
   /// The request is over. `count` is the number of instructions rank 0 sent
   /// for it and `digest` its execution digest; rank 1 compares both.
@@ -63,6 +66,10 @@ struct TpInstruction {
   std::uint32_t count{0};
   std::uint32_t prompt_size{0};
   std::uint64_t digest{0};
+  /// kDecode only: the sampler's RNG state and pending deferred draw (-1 for
+  /// none) before the call.
+  std::uint64_t rng{0};
+  std::int32_t pending{-1};
 
   bool operator==(const TpInstruction&) const = default;
 };
@@ -108,9 +115,10 @@ struct TpControlCommand {
   TpPlanDigest execution_plan_digest{};
   TpPlanDigest cache_plan_digest{};
   std::vector<TpControlMemberRequest> members;
-  /// kSingle only: the request samples, so rank 1 cannot check rank 0's tokens
-  /// against its own greedy choice.
-  bool sampled{false};
+  /// kSingle only: the request's sampling configuration. Rank 1 builds the
+  /// same sampler for multi-token decoding, and checks rank 0's tokens against
+  /// its own choice only when this is greedy.
+  sampling::SamplingConfig sampling{};
   /// kInstruction only. An instruction belongs to the `kSingle` request named
   /// by `sequence` (or to none, for a reset between requests) and carries no
   /// request fields of its own.

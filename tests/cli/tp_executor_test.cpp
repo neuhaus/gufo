@@ -218,10 +218,12 @@ public:
     auto& toy = Toy(state);
     TextDecodeStep step;
     std::string produced;
+    // Like Flash-Next: draw on a working copy, leave a deferred draw for the
+    // next call when sampling at random, and publish the draw state back.
+    gufo::sampling::SamplerState working = sampler;
     for (std::size_t i = 0; i < std::min<std::size_t>(max_tokens, 3); ++i) {
-      gufo::sampling::SamplerState greedy{gufo::sampling::SamplingConfig{}};
       const auto token =
-          static_cast<TextRunnerToken>(greedy.Sample(Logits(toy.tokens)));
+          static_cast<TextRunnerToken>(working.Sample(Logits(toy.tokens)));
       if (token == kEos) {
         step.stop = true;
         break;
@@ -230,6 +232,11 @@ public:
       step.selections.push_back({.token = token, .piece = Piece(token)});
       produced += " " + std::to_string(token);
     }
+    if (!step.stop && sampler.config().uses_random_sampling()) {
+      working.DeferSample(working.Sample(Logits(toy.tokens)));
+      produced += " deferred";
+    }
+    sampler.CopyDrawStateFrom(working);
     step.draft_tokens = 3;
     step.draft_accepted_tokens =
         step.selections.empty() ? 0 : step.selections.size() - 1;
@@ -351,7 +358,7 @@ public:
     TpControlCommand begin{.sequence = sequence,
                            .max_tokens = static_cast<std::uint32_t>(max_tokens),
                            .client_id = "executor-test",
-                           .sampled = !sampling.can_use_unmodified_argmax()};
+                           .sampling = sampling};
     for (const auto token : prompt) {
       begin.prompt_tokens.push_back(static_cast<std::int32_t>(token));
     }
@@ -457,6 +464,9 @@ gufo::sampling::SamplingConfig Sampled() {
   gufo::sampling::SamplingConfig config;
   config.temperature = 0.9F;
   config.seed = 42;
+  // History matters only with a penalty, so this also checks that rank 1's
+  // sampler accepts the same tokens as rank 0's.
+  config.repeat_penalty = 1.3F;
   return config;
 }
 
@@ -539,8 +549,8 @@ int main() {
             "rank 1 executed the reset sent between requests");
   }
 
-  // Greedy multi-token decoding is one instruction per cycle; a sampled
-  // request with the same runner decodes token by token.
+  // Multi-token decoding is one instruction per cycle, greedy or sampled; a
+  // sampled cycle carries rank 0's draw state.
   {
     Pair pair({.mtp = true}, {.mtp = true});
     const auto greedy = pair.Run(prompt, 7);
@@ -550,10 +560,29 @@ int main() {
             "greedy MTP decodes in multi-token cycles");
     pair.RequireSameCalls("MTP greedy");
 
-    const auto sampled = pair.Run(prompt, 5, Sampled());
+    const auto decodes = Count(pair.rank0().Log(), "decode");
+    const auto sampled = pair.Run(prompt, 9, Sampled());
     Require(sampled.worker_error.empty(),
             "MTP sampled: " + sampled.worker_error);
+    Require(sampled.result.tokens.size() == 9, "MTP sampled completes");
+    Require(Count(pair.rank0().Log(), "decode") > decodes,
+            "sampled MTP decodes in multi-token cycles too");
     pair.RequireSameCalls("MTP sampled");
+    const auto again = pair.Run(prompt, 9, Sampled());
+    Require(
+        again.worker_error.empty() &&
+            again.result.tokens == sampled.result.tokens,
+        "a seeded sampled MTP request is reproducible: " + again.worker_error);
+    pair.RequireSameCalls("MTP sampled again");
+
+    // Without a seed each rank's sampler starts from its own random state, so
+    // only rank 0's draw state, carried by each decode, keeps them together.
+    auto unseeded = Sampled();
+    unseeded.seed = -1;
+    const auto random_draws = pair.Run(prompt, 9, unseeded);
+    Require(random_draws.worker_error.empty(),
+            "unseeded sampled MTP: " + random_draws.worker_error);
+    pair.RequireSameCalls("MTP sampled without a seed");
   }
 
   // Rank 1's own greedy choice catches a numerical divergence.

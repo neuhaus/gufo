@@ -31,7 +31,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 7;          // C1/C2 envelopes plus rank-1
+constexpr std::uint16_t kVersion = 8;          // C1/C2 envelopes plus rank-1
                                                // executor instructions
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
@@ -147,10 +147,34 @@ bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
                              [](std::uint8_t byte) { return byte == 0; });
 }
 
+[[nodiscard]] bool IsDefaultSampling(const sampling::SamplingConfig& config) {
+  const sampling::SamplingConfig defaults;
+  return config.temperature == defaults.temperature &&
+         config.top_k == defaults.top_k && config.top_p == defaults.top_p &&
+         config.min_p == defaults.min_p &&
+         config.min_keep == defaults.min_keep && config.seed == defaults.seed &&
+         config.repeat_penalty == defaults.repeat_penalty &&
+         config.repeat_last_n == defaults.repeat_last_n &&
+         config.frequency_penalty == defaults.frequency_penalty &&
+         config.presence_penalty == defaults.presence_penalty;
+}
+
 [[nodiscard]] bool HasLegacyCommandFields(const TpControlCommand& command) {
   return command.max_tokens != 0 || command.cache_prompt ||
          command.cache_prefix_tokens != 0 || !command.prompt_tokens.empty() ||
-         !command.client_id.empty() || command.sampled;
+         !command.client_id.empty() || !IsDefaultSampling(command.sampling);
+}
+
+[[nodiscard]] std::uint32_t FloatBits(float value) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+[[nodiscard]] float BitsFloat(std::uint32_t bits) {
+  float value = 0.0F;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
 }
 
 /// An instruction names one model call and its arguments; every argument the
@@ -166,6 +190,12 @@ bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
            (prompt_size || instruction.prompt_size == 0) &&
            (digest || instruction.digest == 0);
   };
+  // Only a decode carries a draw state.
+  if (instruction.op != TpInstructionOp::kDecode &&
+      (instruction.rng != 0 || instruction.pending != -1)) {
+    SetError(error, "TP instruction carries a draw state it does not use");
+    return false;
+  }
   bool valid = false;
   switch (instruction.op) {
     case TpInstructionOp::kInvalidate:
@@ -180,7 +210,8 @@ bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
       valid = only(true, false, false, false, false) && instruction.token >= 0;
       break;
     case TpInstructionOp::kDecode:
-      valid = only(false, false, true, false, false) && instruction.count > 1;
+      valid = only(false, false, true, false, false) && instruction.count > 1 &&
+              instruction.pending >= -1;
       break;
     case TpInstructionOp::kEnd:
       valid = only(false, false, true, false, true);
@@ -369,6 +400,13 @@ bool ValidateTpControlCommand(const TpControlCommand& command,
     const auto members = EffectiveCommandMembers(command);
     if (members.size() != 1 || members.front().member_id != command.sequence) {
       SetError(error, "TP C1 command must contain its sequence-scoped member");
+      return false;
+    }
+    try {
+      command.sampling.Validate();
+    } catch (const std::exception& exception) {
+      SetError(error, std::string("TP C1 command sampling is invalid: ") +
+                          exception.what());
       return false;
     }
     return ValidateMemberRequest(members.front(), error);
@@ -855,7 +893,17 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
   // the kind, which is already on the wire, so both sides derive the same
   // framing without a separate encoder.
   if (command.kind == TpControlCommandKind::kSingle) {
-    AppendU32(&payload, command.sampled ? 1U : 0U);
+    const auto& config = command.sampling;
+    AppendU32(&payload, FloatBits(config.temperature));
+    AppendU32(&payload, static_cast<std::uint32_t>(config.top_k));
+    AppendU32(&payload, FloatBits(config.top_p));
+    AppendU32(&payload, FloatBits(config.min_p));
+    AppendU64(&payload, config.min_keep);
+    AppendU64(&payload, static_cast<std::uint64_t>(config.seed));
+    AppendU32(&payload, FloatBits(config.repeat_penalty));
+    AppendU64(&payload, config.repeat_last_n);
+    AppendU32(&payload, FloatBits(config.frequency_penalty));
+    AppendU32(&payload, FloatBits(config.presence_penalty));
   } else if (command.kind == TpControlCommandKind::kInstruction) {
     const auto& instruction = command.instruction;
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.op));
@@ -866,6 +914,8 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU32(&payload, instruction.count);
     AppendU32(&payload, instruction.prompt_size);
     AppendU64(&payload, instruction.digest);
+    AppendU64(&payload, instruction.rng);
+    AppendU32(&payload, static_cast<std::uint32_t>(instruction.pending));
   }
   return SendFrame(kCommand, command.sequence, payload, error);
 }
@@ -969,18 +1019,47 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
     offset += client_size;
   }
   if (parsed.kind == TpControlCommandKind::kSingle) {
-    std::uint32_t sampled = 0;
-    if (!ReadU32(command_prompt_, &offset, &sampled, error) || sampled > 1) {
+    auto& config = parsed.sampling;
+    std::uint32_t temperature = 0;
+    std::uint32_t top_k = 0;
+    std::uint32_t top_p = 0;
+    std::uint32_t min_p = 0;
+    std::uint64_t min_keep = 0;
+    std::uint64_t seed = 0;
+    std::uint32_t repeat_penalty = 0;
+    std::uint64_t repeat_last_n = 0;
+    std::uint32_t frequency_penalty = 0;
+    std::uint32_t presence_penalty = 0;
+    if (!ReadU32(command_prompt_, &offset, &temperature, error) ||
+        !ReadU32(command_prompt_, &offset, &top_k, error) ||
+        !ReadU32(command_prompt_, &offset, &top_p, error) ||
+        !ReadU32(command_prompt_, &offset, &min_p, error) ||
+        !ReadU64(command_prompt_, &offset, &min_keep, error) ||
+        !ReadU64(command_prompt_, &offset, &seed, error) ||
+        !ReadU32(command_prompt_, &offset, &repeat_penalty, error) ||
+        !ReadU64(command_prompt_, &offset, &repeat_last_n, error) ||
+        !ReadU32(command_prompt_, &offset, &frequency_penalty, error) ||
+        !ReadU32(command_prompt_, &offset, &presence_penalty, error)) {
       command_prompt_.clear();
       command_prompt_.shrink_to_fit();
-      SetError(error, "TP C1 command sampling flag is invalid");
+      SetError(error, "TP C1 command sampling is truncated");
       return false;
     }
-    parsed.sampled = sampled != 0;
+    config.temperature = BitsFloat(temperature);
+    config.top_k = static_cast<std::int32_t>(top_k);
+    config.top_p = BitsFloat(top_p);
+    config.min_p = BitsFloat(min_p);
+    config.min_keep = static_cast<std::size_t>(min_keep);
+    config.seed = static_cast<std::int64_t>(seed);
+    config.repeat_penalty = BitsFloat(repeat_penalty);
+    config.repeat_last_n = static_cast<std::size_t>(repeat_last_n);
+    config.frequency_penalty = BitsFloat(frequency_penalty);
+    config.presence_penalty = BitsFloat(presence_penalty);
   } else if (parsed.kind == TpControlCommandKind::kInstruction) {
     auto& instruction = parsed.instruction;
     std::uint32_t op = 0;
     std::uint32_t token_bits = 0;
+    std::uint32_t pending_bits = 0;
     if (!ReadU32(command_prompt_, &offset, &op, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.index, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.state, error) ||
@@ -989,6 +1068,8 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &instruction.count, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.prompt_size, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.digest, error) ||
+        !ReadU64(command_prompt_, &offset, &instruction.rng, error) ||
+        !ReadU32(command_prompt_, &offset, &pending_bits, error) ||
         op > static_cast<std::uint32_t>(TpInstructionOp::kEnd)) {
       command_prompt_.clear();
       command_prompt_.shrink_to_fit();
@@ -997,6 +1078,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
     }
     instruction.op = static_cast<TpInstructionOp>(op);
     instruction.token = static_cast<std::int32_t>(token_bits);
+    instruction.pending = static_cast<std::int32_t>(pending_bits);
   }
   if (offset != command_prompt_.size()) {
     command_prompt_.clear();
