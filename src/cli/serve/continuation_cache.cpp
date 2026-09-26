@@ -413,6 +413,30 @@ ContinuationCache::Lease ContinuationCache::Acquire(
   }
 }
 
+void ContinuationCache::Clear() {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->reserved_snapshot_bytes != 0 ||
+      std::ranges::any_of(impl_->entries, [](const auto& entry) {
+        return !entry->available;
+      })) {
+    throw std::logic_error(
+        "cannot clear a continuation cache with active leases");
+  }
+  for (auto& entry : impl_->entries) {
+    entry->snapshot.reset();
+    entry->snapshot_bytes = 0;
+    entry->tokens.clear();
+    entry->input_identity.clear();
+    entry->live_tokens.clear();
+    entry->live_identity.clear();
+    entry->valid = false;
+    entry->dirty = false;
+    if (entry->state)
+      entry->state->Invalidate();
+  }
+  impl_->retained_snapshot_bytes = 0;
+}
+
 std::size_t ContinuationCache::capacity() const noexcept {
   return impl_->entries.size();
 }

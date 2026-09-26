@@ -403,6 +403,7 @@ public:
   TextRunnerPool(TextRunnerPool&&) = delete;
   TextRunnerPool& operator=(TextRunnerPool&&) = delete;
 
+  void ClearCache();
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(

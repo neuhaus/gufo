@@ -1141,6 +1141,10 @@ const TextModelRunner& TextRunnerPool::runner() const noexcept {
   return *impl_->validated.runner;
 }
 
+void TextRunnerPool::ClearCache() {
+  impl_->cache.Clear();
+}
+
 std::size_t TextRunnerPool::capacity() const noexcept {
   return impl_->cache.capacity();
 }

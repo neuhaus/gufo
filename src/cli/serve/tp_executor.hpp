@@ -4,11 +4,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "src/cli/serve/text_model_runner.hpp"
@@ -47,9 +49,13 @@ void DigestTpFailure(TpExecutionDigest& digest);
 
 /// Where rank 0's instructions go: the control channel in production, a
 /// capture in tests.
+bool TpCacheAcknowledged(TpInstructionOp op) noexcept;
+
 class TpInstructionSink {
 public:
   virtual ~TpInstructionSink() = default;
+  virtual void Synchronize(std::uint64_t sequence, TpInstruction instruction,
+                           const std::function<void()>& local) = 0;
   /// Sends one instruction for `sequence` (zero between requests) and assigns
   /// its channel-wide index.
   [[nodiscard]] virtual bool Send(std::uint64_t sequence,
@@ -59,14 +65,18 @@ public:
 
 class TpControlInstructionSink final : public TpInstructionSink {
 public:
-  explicit TpControlInstructionSink(std::shared_ptr<TpControlChannel> channel)
-      : channel_(std::move(channel)) {}
+  explicit TpControlInstructionSink(std::shared_ptr<TpControlChannel> channel,
+                                    std::shared_ptr<TpResponseBroker> broker)
+      : channel_(std::move(channel)), broker_(std::move(broker)) {}
+  void Synchronize(std::uint64_t sequence, TpInstruction instruction,
+                   const std::function<void()>& local) override;
 
   [[nodiscard]] bool Send(std::uint64_t sequence, TpInstruction instruction,
                           std::string* error) override;
 
 private:
   std::shared_ptr<TpControlChannel> channel_;
+  std::shared_ptr<TpResponseBroker> broker_;
   std::mutex mutex_;
   std::uint64_t next_index_{0};
 };
@@ -81,15 +91,19 @@ private:
 /// cancellation and length decisions reach rank 1 simply as the calls rank 0
 /// no longer makes.
 ///
-/// Mirroring does not cover snapshots, forks or prefix reuse, so this runner
-/// reports none of them and refuses a wrapped runner that needs them. It never
+/// Cache operations are acknowledged before the next forward. Snapshot bytes
+/// stay local; only their monotonic IDs cross the control channel. It never
 /// forwards a request's cancellation check to the model session: a session
 /// aborting between layers would strand rank 1 inside an exchange, so
 /// cancellation acts only between calls, where the scheduler already checks.
-class TpMirroredRunner final : public TextModelRunner {
+class TpMirroredRunner final
+    : public TextModelRunner,
+      public std::enable_shared_from_this<TpMirroredRunner> {
 public:
-  TpMirroredRunner(std::shared_ptr<TextModelRunner> inner,
-                   std::shared_ptr<TpInstructionSink> sink);
+  TpMirroredRunner(
+      std::shared_ptr<TextModelRunner> inner,
+      std::shared_ptr<TpInstructionSink> sink,
+      std::size_t snapshot_budget = std::numeric_limits<std::size_t>::max());
 
   /// Attributes the following model calls to `sequence`, the request rank 1
   /// was just told about. Requests do not overlap.
@@ -136,9 +150,18 @@ public:
   [[nodiscard]] std::size_t CheckpointPosition(
       const TextRunnerState& state) const override;
   void PrepareCancellation(TextRunnerState& state) const override;
+  std::size_t SnapshotPayloadBytes(const TextRunnerState& state) const override;
+  std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override;
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override;
 
 private:
   class State;
+  class SnapshotHandle;
+  void Drop(std::uint64_t id) const noexcept;
+  void CacheCall(const TpInstruction& instruction,
+                 const std::function<void()>& local) const;
 
   [[nodiscard]] static State& Mirrored(TextRunnerState& state);
   [[nodiscard]] static const State& Mirrored(const TextRunnerState& state);
@@ -155,6 +178,9 @@ private:
 
   std::shared_ptr<TextModelRunner> inner_;
   std::shared_ptr<TpInstructionSink> sink_;
+  const std::size_t snapshot_budget_;
+  mutable std::uint64_t next_snapshot_id_{1};
+  mutable std::recursive_mutex call_mutex_;
   bool multi_token_decode_{false};
   mutable std::mutex mutex_;
   mutable std::uint32_t next_state_id_{0};
@@ -169,7 +195,13 @@ private:
 /// pool, so a state id names corresponding states on both ranks.
 class TpExecutor {
 public:
-  TpExecutor(std::shared_ptr<TextModelRunner> runner, std::size_t state_count);
+  TpExecutor(
+      std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
+      std::size_t snapshot_budget = std::numeric_limits<std::size_t>::max());
+
+  using Acknowledge =
+      std::function<bool(const TpControlResponse&, std::string*)>;
+  [[nodiscard]] std::size_t snapshot_count() const { return snapshots_.size(); }
 
   using Receive = std::function<bool(TpControlCommand*, std::string*)>;
 
@@ -183,8 +215,9 @@ public:
   /// failed or the stream broke the protocol; otherwise `*outcome` is empty
   /// when both ranks agree and describes the first difference or failure.
   [[nodiscard]] bool RunRequest(const TpControlCommand& begin,
-                                const Receive& receive, std::string* outcome,
-                                std::string* error);
+                                const Receive& receive,
+                                const Acknowledge& acknowledge,
+                                std::string* outcome, std::string* error);
 
 private:
   struct OwnChoice {
@@ -201,6 +234,12 @@ private:
   std::shared_ptr<TextModelRunner> runner_;
   std::vector<std::unique_ptr<TextRunnerState>> states_;
   std::uint64_t next_index_{0};
+  std::uint64_t last_snapshot_id_{0};
+  const std::size_t snapshot_budget_;
+  std::size_t snapshot_bytes_{0};
+  void DropSnapshot(std::uint64_t id);
+  std::unordered_map<std::uint64_t, std::unique_ptr<TextRunnerSnapshot>>
+      snapshots_;
 };
 
 }  // namespace gufo::server

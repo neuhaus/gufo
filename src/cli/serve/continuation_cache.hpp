@@ -196,6 +196,8 @@ public:
       const std::function<void(ContinuationState&)>& prepare_state = {},
       bool reuse_prompt = true);
 
+  /// Drop all reuse state. Requires no outstanding leases or reservations.
+  void Clear();
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] std::size_t snapshot_capacity_bytes() const noexcept;
   [[nodiscard]] std::size_t retained_snapshot_bytes() const noexcept;

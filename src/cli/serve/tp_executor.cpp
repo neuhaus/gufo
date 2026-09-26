@@ -31,6 +31,16 @@ void SetError(std::string* error, std::string message) {
       return "advance";
     case TpInstructionOp::kDecode:
       return "decode";
+    case TpInstructionOp::kSnapshot:
+      return "snapshot";
+    case TpInstructionOp::kDrop:
+      return "drop";
+    case TpInstructionOp::kRestore:
+      return "restore";
+    case TpInstructionOp::kReuse:
+      return "reuse";
+    case TpInstructionOp::kCancelPrepare:
+      return "cancel-prepare";
     case TpInstructionOp::kEnd:
       return "end";
     case TpInstructionOp::kNone:
@@ -74,6 +84,7 @@ void DigestTpCall(TpExecutionDigest& digest, const TpInstruction& instruction,
                   std::span<const TextRunnerToken> prefill_prompt) {
   digest.Add(static_cast<std::uint64_t>(instruction.op));
   digest.Add(instruction.state);
+  digest.Add(instruction.snapshot_id);
   digest.Add(static_cast<std::uint32_t>(instruction.token));
   digest.Add(instruction.offset);
   digest.Add(instruction.count);
@@ -111,6 +122,43 @@ void DigestTpDecode(TpExecutionDigest& digest, const TextDecodeStep& step,
 
 void DigestTpFailure(TpExecutionDigest& digest) {
   digest.Add(kFailureMarker);
+}
+
+bool TpCacheAcknowledged(TpInstructionOp op) noexcept {
+  return op == TpInstructionOp::kSnapshot || op == TpInstructionOp::kRestore ||
+         op == TpInstructionOp::kReuse || op == TpInstructionOp::kCancelPrepare;
+}
+
+void TpControlInstructionSink::Synchronize(std::uint64_t sequence,
+                                           TpInstruction instruction,
+                                           const std::function<void()>& local) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  instruction.index = next_index_;
+  std::string error;
+  if (!broker_->RegisterInstruction(sequence, instruction.index, &error)) {
+    throw std::runtime_error(error);
+  }
+  if (!channel_->SendCommand({.sequence = sequence,
+                              .kind = TpControlCommandKind::kInstruction,
+                              .instruction = instruction},
+                             &error)) {
+    broker_->FailAll("TP cache instruction send failed: " + error);
+    throw std::runtime_error(error);
+  }
+  ++next_index_;
+  std::exception_ptr local_failure;
+  try {
+    local();
+  } catch (...) {
+    local_failure = std::current_exception();
+  }
+  // Drain even after a local failure: the next instruction must not overtake
+  // a worker copy, and its acknowledgement must not become an orphan.
+  const bool ok = broker_->WaitForInstruction(&error);
+  if (local_failure)
+    std::rethrow_exception(local_failure);
+  if (!ok)
+    throw std::runtime_error("TP cache worker failed: " + error);
 }
 
 bool TpControlInstructionSink::Send(std::uint64_t sequence,
@@ -158,20 +206,20 @@ private:
 };
 
 TpMirroredRunner::TpMirroredRunner(std::shared_ptr<TextModelRunner> inner,
-                                   std::shared_ptr<TpInstructionSink> sink)
-    : inner_(std::move(inner)), sink_(std::move(sink)) {
+                                   std::shared_ptr<TpInstructionSink> sink,
+                                   std::size_t snapshot_budget)
+    : inner_(std::move(inner)),
+      sink_(std::move(sink)),
+      snapshot_budget_(snapshot_budget) {
   if (inner_ == nullptr || sink_ == nullptr) {
     throw std::invalid_argument("TP mirrored runner needs a runner and a sink");
   }
   const auto capabilities = inner_->Descriptor().capabilities;
-  if (capabilities.snapshot || capabilities.fork) {
-    throw std::invalid_argument(
-        "TP2 does not mirror snapshots yet; run without --tp-cache-reuse");
-  }
   multi_token_decode_ = capabilities.multi_token_decode;
 }
 
 void TpMirroredRunner::BeginRequest(std::uint64_t sequence) {
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   const std::lock_guard<std::mutex> lock(mutex_);
   if (sequence == 0 || sequence_ != 0) {
     throw std::logic_error("TP request mirroring is already active or unnamed");
@@ -182,6 +230,7 @@ void TpMirroredRunner::BeginRequest(std::uint64_t sequence) {
 }
 
 bool TpMirroredRunner::EndRequest(std::string* error) {
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   const std::lock_guard<std::mutex> lock(mutex_);
   const auto sequence = std::exchange(sequence_, 0);
   if (sequence == 0) {
@@ -245,6 +294,7 @@ void TpMirroredRunner::Send(
 }
 
 void TpMirroredRunner::SendInvalidate(std::uint32_t state) const noexcept {
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
   try {
     lock.lock();
@@ -280,10 +330,6 @@ void TpMirroredRunner::Record(
 TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   auto descriptor = inner_->Descriptor();
   auto& capabilities = descriptor.capabilities;
-  capabilities.snapshot = false;
-  capabilities.fork = false;
-  capabilities.prefix_reuse = false;
-  capabilities.preserve_snapshot_prefix = false;
   capabilities.batched_multi_token_decode = false;
   capabilities.batched_multi_token_decode_max_width = 0;
   descriptor.persistence.reset();
@@ -292,7 +338,8 @@ TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
 
 TextRunnerResourceClaim TpMirroredRunner::ResourceClaim() const {
   auto claim = inner_->ResourceClaim();
-  claim.retained_snapshot_capacity_bytes = 0;
+  claim.retained_snapshot_capacity_bytes = std::min(
+      claim.retained_snapshot_capacity_bytes.value_or(0), snapshot_budget_);
   return claim;
 }
 
@@ -349,8 +396,16 @@ std::optional<TextDecodeSelection> TpMirroredRunner::PreviewFirstToken(
 }
 
 void TpMirroredRunner::PreparePrefixReuse(
-    TextRunnerState&, std::span<const TextRunnerToken>) const {
-  throw std::logic_error("TP2 does not mirror prefix reuse");
+    TextRunnerState& state, std::span<const TextRunnerToken> prefix) const {
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
+  auto& mirrored = Mirrored(state);
+  CacheCall({.op = TpInstructionOp::kReuse,
+             .state = mirrored.id(),
+             .prompt_size = ToWire(prefix.size(), "reuse prefix")},
+            [&] { inner_->PreparePrefixReuse(mirrored.inner(), prefix); });
+  Record([&](TpExecutionDigest& digest) {
+    digest.Add(inner_->CheckpointPosition(mirrored.inner()));
+  });
 }
 
 void TpMirroredRunner::PrepareBatchExecution(TextRunnerState& state) const {
@@ -360,6 +415,7 @@ void TpMirroredRunner::PrepareBatchExecution(TextRunnerState& state) const {
 TextPrefillStep TpMirroredRunner::Prefill(
     TextRunnerState& state, std::span<const TextRunnerToken> prompt,
     std::size_t offset, std::size_t max_input_tokens) const {
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   auto& mirrored = Mirrored(state);
   if (offset >= prompt.size() || max_input_tokens == 0) {
     // Nothing to prefill: runners reject the call before any model work, so
@@ -396,6 +452,7 @@ TextDecodeSelection TpMirroredRunner::SelectNext(
 
 void TpMirroredRunner::Advance(TextRunnerState& state,
                                TextRunnerToken token) const {
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   auto& mirrored = Mirrored(state);
   if (token >
       static_cast<TextRunnerToken>(std::numeric_limits<std::int32_t>::max())) {
@@ -418,6 +475,7 @@ void TpMirroredRunner::Advance(TextRunnerState& state,
 TextDecodeStep TpMirroredRunner::DecodeStep(
     TextRunnerState& state, std::size_t max_tokens,
     sampling::SamplerState& sampler) const {
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   // A multi-token cycle is one instruction. It carries the sampler's draw
   // state, so rank 1, whose sampler otherwise matches, draws what rank 0 draws
   // and makes the same draft and acceptance decisions. A one-token budget runs
@@ -477,13 +535,118 @@ std::size_t TpMirroredRunner::CheckpointPosition(
 }
 
 void TpMirroredRunner::PrepareCancellation(TextRunnerState& state) const {
-  // Only reached with prefix reuse, which this runner does not report.
-  inner_->PrepareCancellation(Mirrored(state).inner());
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
+  auto& mirrored = Mirrored(state);
+  CacheCall({.op = TpInstructionOp::kCancelPrepare, .state = mirrored.id()},
+            [&] { inner_->PrepareCancellation(mirrored.inner()); });
+}
+
+class TpMirroredRunner::SnapshotHandle final : public TextRunnerSnapshot {
+public:
+  SnapshotHandle(std::shared_ptr<const TpMirroredRunner> owner,
+                 std::unique_ptr<TextRunnerSnapshot> inner, std::uint64_t id)
+      : owner(std::move(owner)), inner(std::move(inner)), id(id) {}
+  ~SnapshotHandle() override { owner->Drop(id); }
+  std::size_t PayloadBytes() const noexcept override {
+    return inner->PayloadBytes();
+  }
+  std::shared_ptr<const TpMirroredRunner> owner;
+  std::unique_ptr<TextRunnerSnapshot> inner;
+  std::uint64_t id;
+};
+
+void TpMirroredRunner::CacheCall(const TpInstruction& instruction,
+                                 const std::function<void()>& local) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (sequence_ == 0 || !failure_.empty()) {
+    throw std::logic_error("TP cache call outside a healthy request");
+  }
+  DigestTpCall(digest_, instruction);
+  ++count_;
+  try {
+    sink_->Synchronize(sequence_, instruction, local);
+  } catch (...) {
+    DigestTpFailure(digest_);
+    throw;
+  }
+}
+
+void TpMirroredRunner::Drop(std::uint64_t id) const noexcept {
+  try {
+    const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!failure_.empty())
+      return;
+    const TpInstruction instruction{.op = TpInstructionOp::kDrop,
+                                    .snapshot_id = id};
+    if (sequence_ != 0) {
+      DigestTpCall(digest_, instruction);
+      ++count_;
+    }
+    std::string error;
+    if (!sink_->Send(sequence_, instruction, &error))
+      failure_ = "snapshot drop failed: " + error;
+  } catch (...) {
+    // Match reset's deferred channel failure behavior; destructors must not
+    // throw.
+    try {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      failure_ = "snapshot drop failed";
+    } catch (...) {
+    }
+  }
+}
+
+std::size_t TpMirroredRunner::SnapshotPayloadBytes(
+    const TextRunnerState& state) const {
+  return inner_->SnapshotPayloadBytes(Mirrored(state).inner());
+}
+
+std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::Snapshot(
+    const TextRunnerState& state) const {
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
+  const auto& mirrored = Mirrored(state);
+  if (next_snapshot_id_ == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::overflow_error("TP snapshot ID exhausted");
+  }
+  const auto id = next_snapshot_id_++;
+  std::unique_ptr<TextRunnerSnapshot> snapshot;
+  try {
+    CacheCall({.op = TpInstructionOp::kSnapshot,
+               .state = mirrored.id(),
+               .snapshot_id = id},
+              [&] {
+                snapshot = inner_->Snapshot(mirrored.inner());
+                if (!snapshot)
+                  throw std::runtime_error("snapshot capture returned null");
+              });
+    return std::make_unique<SnapshotHandle>(shared_from_this(),
+                                            std::move(snapshot), id);
+  } catch (...) {
+    Drop(id);
+    throw;
+  }
+}
+
+void TpMirroredRunner::RestoreOrFork(TextRunnerState& state,
+                                     const TextRunnerSnapshot& snapshot) const {
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
+  const auto* handle = dynamic_cast<const SnapshotHandle*>(&snapshot);
+  if (!handle || handle->owner.get() != this)
+    throw std::invalid_argument("foreign TP snapshot");
+  auto& mirrored = Mirrored(state);
+  CacheCall({.op = TpInstructionOp::kRestore,
+             .state = mirrored.id(),
+             .snapshot_id = handle->id},
+            [&] { inner_->RestoreOrFork(mirrored.inner(), *handle->inner); });
+  Record([&](TpExecutionDigest& digest) {
+    digest.Add(inner_->CheckpointPosition(mirrored.inner()));
+  });
 }
 
 TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
-                       std::size_t state_count)
-    : runner_(std::move(runner)) {
+                       std::size_t state_count, std::size_t snapshot_budget)
+    : runner_(std::move(runner)), snapshot_budget_(snapshot_budget) {
   if (runner_ == nullptr || state_count == 0) {
     throw std::invalid_argument("TP executor needs a runner and a state");
   }
@@ -523,11 +686,22 @@ TpExecutor::OwnChoice TpExecutor::ChooseGreedy(TextRunnerState& state) const {
   return {.stop = selection.stop, .token = selection.token};
 }
 
+void TpExecutor::DropSnapshot(std::uint64_t id) {
+  if (id == 0 || id > last_snapshot_id_)
+    throw std::logic_error("unknown snapshot drop ID");
+  const auto found = snapshots_.find(id);
+  if (found != snapshots_.end()) {
+    snapshot_bytes_ -= found->second->PayloadBytes();
+    snapshots_.erase(found);
+  }
+}
+
 bool TpExecutor::ExecuteIdle(const TpControlCommand& command,
                              std::string* error) {
   if (command.kind != TpControlCommandKind::kInstruction ||
       command.sequence != 0 ||
-      command.instruction.op != TpInstructionOp::kInvalidate) {
+      (command.instruction.op != TpInstructionOp::kInvalidate &&
+       command.instruction.op != TpInstructionOp::kDrop)) {
     SetError(error, "TP worker received a model call outside a request");
     return false;
   }
@@ -535,7 +709,11 @@ bool TpExecutor::ExecuteIdle(const TpControlCommand& command,
     return false;
   }
   try {
-    StateFor(command.instruction.state).Invalidate();
+    if (command.instruction.op == TpInstructionOp::kDrop) {
+      DropSnapshot(command.instruction.snapshot_id);
+    } else {
+      StateFor(command.instruction.state).Invalidate();
+    }
   } catch (const std::exception& exception) {
     SetError(error, exception.what());
     return false;
@@ -544,8 +722,9 @@ bool TpExecutor::ExecuteIdle(const TpControlCommand& command,
 }
 
 bool TpExecutor::RunRequest(const TpControlCommand& begin,
-                            const Receive& receive, std::string* outcome,
-                            std::string* error) {
+                            const Receive& receive,
+                            const Acknowledge& acknowledge,
+                            std::string* outcome, std::string* error) {
   std::vector<TextRunnerToken> prompt;
   prompt.reserve(begin.prompt_tokens.size());
   for (const auto token : begin.prompt_tokens) {
@@ -613,10 +792,54 @@ bool TpExecutor::RunRequest(const TpControlCommand& begin,
                   instruction.prompt_size)
             : std::span<const TextRunnerToken>{};
     DigestTpCall(digest, instruction, prefill_prompt);
+    std::string call_error;
     try {
       auto& state = StateFor(instruction.state);
       auto& choice = own[instruction.state];
       switch (instruction.op) {
+        case TpInstructionOp::kSnapshot: {
+          if (instruction.snapshot_id <= last_snapshot_id_)
+            throw std::logic_error("reused snapshot ID");
+          last_snapshot_id_ = instruction.snapshot_id;
+          const auto estimate = runner_->SnapshotPayloadBytes(state);
+          if (estimate > snapshot_budget_ - snapshot_bytes_)
+            throw std::runtime_error("worker snapshot budget exhausted");
+          auto snapshot = runner_->Snapshot(state);
+          if (!snapshot)
+            throw std::runtime_error("snapshot capture returned null");
+          const auto bytes = snapshot->PayloadBytes();
+          if (bytes > snapshot_budget_ - snapshot_bytes_)
+            throw std::runtime_error("worker snapshot exceeds reserved budget");
+          snapshots_.emplace(instruction.snapshot_id, std::move(snapshot));
+          snapshot_bytes_ += bytes;
+          break;
+        }
+        case TpInstructionOp::kDrop:
+          DropSnapshot(instruction.snapshot_id);
+          break;
+        case TpInstructionOp::kRestore: {
+          choice.reset();
+          const auto found = snapshots_.find(instruction.snapshot_id);
+          if (found == snapshots_.end())
+            throw std::logic_error("unknown snapshot ID");
+          runner_->RestoreOrFork(state, *found->second);
+          digest.Add(runner_->CheckpointPosition(state));
+          break;
+        }
+        case TpInstructionOp::kReuse:
+          choice.reset();
+          if (!prompt_fits)
+            throw std::invalid_argument("reuse exceeds request prompt");
+          runner_->PreparePrefixReuse(
+              state, std::span<const TextRunnerToken>(prompt).first(
+                         instruction.prompt_size));
+          digest.Add(runner_->CheckpointPosition(state));
+          if (greedy)
+            choice = ChooseGreedy(state);
+          break;
+        case TpInstructionOp::kCancelPrepare:
+          runner_->PrepareCancellation(state);
+          break;
         case TpInstructionOp::kInvalidate:
           choice.reset();
           state.Invalidate();
@@ -682,8 +905,18 @@ bool TpExecutor::RunRequest(const TpControlCommand& begin,
       }
     } catch (const std::exception& exception) {
       DigestTpFailure(digest);
-      note("rank 1 " + std::string(OpName(instruction.op)) +
-           " failed: " + exception.what());
+      call_error = "rank 1 " + std::string(OpName(instruction.op)) +
+                   " failed: " + exception.what();
+      note(call_error);
+    }
+    if (TpCacheAcknowledged(instruction.op)) {
+      const TpControlResponse response{
+          .instruction_index = instruction.index,
+          .sequence = begin.sequence,
+          .error = call_error,
+          .kind = TpControlResponseKind::kInstruction};
+      if (!acknowledge(response, error))
+        return false;
     }
   }
 }

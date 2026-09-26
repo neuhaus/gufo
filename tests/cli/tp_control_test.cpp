@@ -170,7 +170,8 @@ int main() {
   Require(server != nullptr, server_error);
   Require(client != nullptr, client_error);
 
-  TpControlConfig rank0{.rank = 0,
+  TpControlConfig rank0{.snapshot_budget_bytes = 8192,
+                        .rank = 0,
                         .world_size = 2,
                         .max_context = 4096,
                         .max_draft_tokens = 7,
@@ -180,6 +181,7 @@ int main() {
                         .prefill_chunk_tokens = 512};
   TpControlConfig rank1 = rank0;
   rank1.rank = 1;
+  rank1.snapshot_budget_bytes = 4096;
   bool server_handshake = false;
   bool client_handshake = false;
   std::thread server_handshake_thread(
@@ -190,6 +192,9 @@ int main() {
   client_handshake_thread.join();
   Require(server_handshake, server_error);
   Require(client_handshake, client_error);
+  Require(server->snapshot_budget_bytes() == 4096 &&
+              client->snapshot_budget_bytes() == 4096,
+          "cache budget is the smaller host budget");
 
   TpControlCommand command{.sequence = 7,
                            .max_tokens = 4,
@@ -299,6 +304,40 @@ int main() {
        .instruction = {
            .op = TpInstructionOp::kInvalidate, .index = 13, .state = 0}});
 
+  for (const auto op : {TpInstructionOp::kSnapshot, TpInstructionOp::kRestore,
+                        TpInstructionOp::kDrop}) {
+    round_trip(
+        {.sequence = command.sequence,
+         .kind = TpControlCommandKind::kInstruction,
+         .instruction = {
+             .op = op, .index = 14, .snapshot_id = 0xffffffffffffffffULL}});
+  }
+  round_trip(
+      {.sequence = 0,
+       .kind = TpControlCommandKind::kInstruction,
+       .instruction = {
+           .op = TpInstructionOp::kDrop, .index = 15, .snapshot_id = 19}});
+  round_trip(
+      {.sequence = command.sequence,
+       .kind = TpControlCommandKind::kInstruction,
+       .instruction = {
+           .op = TpInstructionOp::kReuse, .index = 16, .prompt_size = 2048}});
+  round_trip(
+      {.sequence = command.sequence,
+       .kind = TpControlCommandKind::kInstruction,
+       .instruction = {.op = TpInstructionOp::kCancelPrepare, .index = 17}});
+  const TpControlResponse ack{.instruction_index = 17,
+                              .sequence = command.sequence,
+                              .error = "capture failed",
+                              .kind = TpControlResponseKind::kInstruction};
+  Require(client->SendResponse(ack, &client_error), client_error);
+  TpControlResponse got_ack;
+  Require(server->ReceiveResponse(&got_ack, &server_error), server_error);
+  Require(got_ack.kind == ack.kind && got_ack.sequence == ack.sequence &&
+              got_ack.instruction_index == ack.instruction_index &&
+              got_ack.error == ack.error,
+          "cache acknowledgement round trip");
+
   // A malformed instruction must be refused by the validator and on the wire,
   // because the wire is the path a peer exercises.
   TpPlanDigest nonzero_digest{};
@@ -352,6 +391,16 @@ int main() {
           }));
   refuses("a one-token decode", with([](auto& bad) {
             bad.instruction = {.op = TpInstructionOp::kDecode, .count = 1};
+          }));
+  refuses("a snapshot with ID zero", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kSnapshot};
+          }));
+  refuses("a stray snapshot ID",
+          with([](auto& bad) { bad.instruction.snapshot_id = 1; }));
+  refuses("idle restore", with([](auto& bad) {
+            bad.sequence = 0;
+            bad.instruction = {.op = TpInstructionOp::kRestore,
+                               .snapshot_id = 1};
           }));
   refuses("a missing operation", with([](auto& bad) { bad.instruction = {}; }));
   refuses("a model call outside a request",
