@@ -24,8 +24,8 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
-#include "src/cli/serve/tp_cohort_worker.hpp"
 #include "src/cli/serve/tp_control.hpp"
+#include "src/cli/serve/tp_executor.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
@@ -48,14 +48,6 @@ namespace gufo::server {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-
-/// Bound on rank 1's wait for one token from rank 0, on the per-token path.
-/// Generous enough to survive a scheduler hiccup or a busy peer, and short
-/// enough to fail the request well before a client gives up. This is NOT the
-/// control channel's idle command wait, which is deliberately unbounded: a
-/// worker waiting for its next command should not time out, but a worker
-/// waiting mid-decode is holding a request open and must not hang.
-constexpr std::chrono::milliseconds kStepTokenTimeout{5000};
 
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
@@ -129,81 +121,6 @@ private:
   const std::uint64_t scope_id_;
   bool active_{false};
   std::mutex mutex_;
-};
-
-/// Adapts one scheduler cohort to the C2 worker seam.
-///
-/// The cohort owns its members, so the handles borrow stable request addresses
-/// and the admitted members stay alive for every `Wait` and `Cancel` the seam
-/// performs.
-class SchedulerCohortSubmission final : public TpCohortSubmission {
-public:
-  explicit SchedulerCohortSubmission(TextGenerationScheduler::Cohort cohort)
-      : cohort_(std::move(cohort)) {
-    for (std::size_t index = 0; index < kCohort2MemberCount; ++index) {
-      handles_[index] =
-          std::make_unique<MemberHandle>(&cohort_.members()[index]);
-    }
-  }
-
-  SchedulerCohortSubmission(const SchedulerCohortSubmission&) = delete;
-  SchedulerCohortSubmission& operator=(const SchedulerCohortSubmission&) =
-      delete;
-  SchedulerCohortSubmission(SchedulerCohortSubmission&&) = delete;
-  SchedulerCohortSubmission& operator=(SchedulerCohortSubmission&&) = delete;
-  ~SchedulerCohortSubmission() override = default;
-
-  [[nodiscard]] TpCohortMemberHandle& Member(std::size_t index) override {
-    return *handles_[index];
-  }
-
-private:
-  class MemberHandle final : public TpCohortMemberHandle {
-  public:
-    explicit MemberHandle(TextGenerationScheduler::Request* request)
-        : request_(request) {}
-
-    [[nodiscard]] TextGenerationBackend::Result Wait() override {
-      return request_->Wait({});
-    }
-
-    void Cancel() override { request_->Cancel(); }
-
-  private:
-    TextGenerationScheduler::Request* request_;
-  };
-
-  TextGenerationScheduler::Cohort cohort_;
-  std::array<std::unique_ptr<MemberHandle>, kCohort2MemberCount> handles_;
-};
-
-/// Adapts the command-sequence operation scope to the C2 worker seam. The lease
-/// owns its scope state, so the seam only sees one bind and one release.
-class TpOperationScopeLease final : public TpCohortLease {
-public:
-  TpOperationScopeLease(
-      const std::shared_ptr<models::qwen38_flash_next::rocm::Communicator>&
-          communicator,
-      std::uint64_t sequence)
-      : operation_(std::make_unique<TpOperationLease>(communicator, sequence)) {
-  }
-
-  TpOperationScopeLease(const TpOperationScopeLease&) = delete;
-  TpOperationScopeLease& operator=(const TpOperationScopeLease&) = delete;
-  TpOperationScopeLease(TpOperationScopeLease&&) = delete;
-  TpOperationScopeLease& operator=(TpOperationScopeLease&&) = delete;
-  ~TpOperationScopeLease() override = default;
-
-  [[nodiscard]] bool Begin(std::string* error) override {
-    return operation_->Begin(error);
-  }
-
-  [[nodiscard]] bool End(std::string* error) override {
-    return operation_->End(error);
-  }
-
-private:
-  std::unique_ptr<TpOperationLease> operation_;
 };
 
 struct QwenImageContext final : TextPromptContext {
@@ -2632,19 +2549,6 @@ public:
 
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
-    return SelectNextImpl(state, sampler, /*use_step_channel=*/true);
-  }
-
-  /// `use_step_channel` is false ONLY for the prefill preview. The preview is a
-  /// speculative lookahead whose token the prefill path discards, so it must
-  /// sample locally and must never publish or consume. Were it to participate,
-  /// rank 0 would produce a token outside the exchange during prefill, rank 1
-  /// would already be blocked in `Consume`, and the two would be a step out of
-  /// phase until rank 1's bounded receive expired. Both ranks run the preview,
-  /// so both must opt out.
-  [[nodiscard]] TextDecodeSelection SelectNextImpl(
-      TextRunnerState& state, sampling::SamplerState& sampler,
-      bool use_step_channel) const {
     auto& qfn = RequireQwenFlashNextState(state);
     if (qfn.position() >= max_context_) {
       return {.stop = true, .piece = {}};
@@ -2654,55 +2558,7 @@ public:
       throw std::runtime_error(
           "Qwen3.8-Flash-Next token selection has no logits");
     }
-    std::int32_t token = 0;
-    {
-      // Held for the exchange only. Arming happens before Submit and disarming
-      // after Wait, so this is not contended in the normal path; the lock is
-      // here so the ordering does not have to be re-argued at each call site.
-      const std::lock_guard<std::mutex> guard(step_mutex_);
-      if (!use_step_channel) {
-        // Prefill preview: local sample only, deliberately not exchanged.
-        token = static_cast<std::int32_t>(sampler.Sample(logits));
-      } else if (step_consumer_ != nullptr) {
-        // Rank 1 does not sample. Rank 0's token is authoritative, so the stop
-        // test below runs on the shared token and both ranks stop on it
-        // together, with no separate stop message needed.
-        std::string step_error;
-        if (!step_consumer_->Consume(step_sequence_, &token, &step_final_,
-                                     kStepTokenTimeout, &step_error)) {
-          throw std::runtime_error("TP worker step token unavailable: " +
-                                   step_error);
-        }
-        // Consuming rank 0's token makes the emitted tokens agree by
-        // construction, which would hide a numerical divergence between the
-        // ranks. Under greedy decoding the logits are bit-identical on both
-        // ranks, so rank 1's own choice must equal rank 0's: a copy of the
-        // sampler makes that choice without touching the request's state. The
-        // first disagreement is kept and fails the request at its end, so both
-        // ranks still finish the collective schedule in step.
-        if (sampler.config().can_use_unmodified_argmax()) {
-          sampling::SamplerState own_sampler = sampler;
-          const auto own =
-              static_cast<std::int32_t>(own_sampler.Sample(logits));
-          if (own != token && step_divergence_.empty()) {
-            step_divergence_ = "rank 1 selected token " + std::to_string(own) +
-                               " where rank 0 sent " + std::to_string(token) +
-                               " at step " + std::to_string(step_index_);
-          }
-        }
-        ++step_index_;
-      } else {
-        token = static_cast<std::int32_t>(sampler.Sample(logits));
-        if (step_publisher_ != nullptr) {
-          std::string step_error;
-          if (!step_publisher_->Publish(step_sequence_, token, false,
-                                        &step_error)) {
-            throw std::runtime_error("TP step token send failed: " +
-                                     step_error);
-          }
-        }
-      }
-    }
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
     if (model_->IsStopToken(token)) {
       return {.stop = true, .token = 0, .piece = {}};
     }
@@ -2711,27 +2567,6 @@ public:
         .token = static_cast<TextRunnerToken>(token),
         .piece = model_->TokenText(token),
     };
-  }
-
-  /// Arm or disarm the rank-0 step plan for one request. Passing null pointers
-  /// restores independent per-rank sampling, which is the pre-step-plan
-  /// behaviour and what a rank uses when it is not the one being driven.
-  void SetStepChannel(std::shared_ptr<server::TpStepPublisher> publisher,
-                      std::shared_ptr<server::TpStepConsumer> consumer,
-                      std::uint64_t sequence) {
-    const std::lock_guard<std::mutex> guard(step_mutex_);
-    step_publisher_ = std::move(publisher);
-    step_consumer_ = std::move(consumer);
-    step_sequence_ = sequence;
-    step_index_ = 0;
-    step_divergence_.clear();
-  }
-
-  /// The first step at which rank 1's own greedy choice differed from the
-  /// token rank 0 sent, or empty. Read it before disarming, which clears it.
-  [[nodiscard]] std::string TakeStepDivergence() const {
-    const std::lock_guard<std::mutex> guard(step_mutex_);
-    return std::exchange(step_divergence_, {});
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -2750,9 +2585,7 @@ public:
 
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
-    // Opts out of the step exchange: this token is a prefill lookahead that the
-    // prefill path discards, so exchanging it would desynchronise the ranks.
-    return SelectNextImpl(state, sampler, /*use_step_channel=*/false);
+    return SelectNext(state, sampler);
   }
 
   [[nodiscard]] TextDecodeStep DecodeStep(
@@ -3034,115 +2867,106 @@ private:
   bool distributed_{false};
   bool allow_distributed_snapshots_{false};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
-  /// Rank-0 step plan. At most one of these is set while a request is in
-  /// flight: rank 0 publishes the token it sampled, rank 1 consumes that token
-  /// instead of sampling its own. Both null means independent per-rank
-  /// sampling, which is what a single-host rank and every non-TP rank use.
-  /// `step_final_` is scratch for the consumer's out-parameter.
-  mutable std::mutex step_mutex_;
-  std::shared_ptr<server::TpStepPublisher> step_publisher_;
-  std::shared_ptr<server::TpStepConsumer> step_consumer_;
-  std::uint64_t step_sequence_{0};
-  mutable bool step_final_{false};
-  /// Consumer-side check: the index of the next consumed step, and the first
-  /// disagreement between rank 1's own greedy choice and rank 0's token.
-  mutable std::size_t step_index_{0};
-  mutable std::string step_divergence_;
 };
 #endif
 
 }  // namespace
 
-/// Fails the request unless rank 1 reported exactly rank 0's tokens.
-///
-/// Under the rank-0 step plan rank 1 emits the tokens rank 0 sent, so the two
-/// agree by construction whenever the plan carried every token. A difference
-/// therefore means either a token that bypassed the plan -- the MTP decode path
-/// still selects on each rank independently -- or a stale or mis-sequenced
-/// step. Either way the collectives combined partials computed from different
-/// sequences, so the output cannot be trusted and the request fails. The first
-/// differing index and both ids are logged before the failure.
-void RequireTpTokenAgreement(std::string_view role,
-                             std::span<const TextRunnerToken> rank0,
-                             std::span<const std::int32_t> rank1) {
-  if (rank0.size() != rank1.size()) {
-    Logger::Warn("tp2", std::string(role) + " token count mismatch: rank 0 " +
-                            std::to_string(rank0.size()) + " tokens, rank 1 " +
-                            std::to_string(rank1.size()));
-    throw std::runtime_error("TP worker token count mismatch");
-  }
-  for (std::size_t i = 0; i < rank0.size(); ++i) {
-    if (static_cast<std::uint32_t>(rank1[i]) != rank0[i]) {
-      Logger::Warn("tp2", std::string(role) + " token mismatch at index " +
-                              std::to_string(i) + ": rank 0 " +
-                              std::to_string(rank0[i]) + ", rank 1 " +
-                              std::to_string(rank1[i]));
-      throw std::runtime_error("TP worker token mismatch");
-    }
-  }
-}
-
-/// RAII arm of the rank-0 step plan for one request.
-///
-/// Every TP2 request entry point must arm the step channel before it submits
-/// and disarm before it returns, and getting that wrong in one copy is
-/// invisible: the request still decodes, it just decodes without exchanging
-/// tokens, and the peer starves. Centralising it here means a new entry point
-/// cannot forget the disarm, and the exchange is armed in exactly one place.
-#if defined(ENGINE_ENABLE_HIP)
-class TpStepArm {
-public:
-  TpStepArm(std::shared_ptr<QwenFlashNextTextRunner> runner,
-            std::shared_ptr<TpControlChannel> control, std::uint64_t sequence,
-            bool publish)
-      : runner_(std::move(runner)) {
-    if (runner_ == nullptr || control == nullptr) {
-      return;
-    }
-    if (publish) {
-      runner_->SetStepChannel(
-          std::make_shared<TpControlStepPublisher>(std::move(control)), nullptr,
-          sequence);
-    } else {
-      runner_->SetStepChannel(
-          nullptr, std::make_shared<TpControlStepConsumer>(std::move(control)),
-          sequence);
-    }
-  }
-  TpStepArm(const TpStepArm&) = delete;
-  TpStepArm& operator=(const TpStepArm&) = delete;
-  ~TpStepArm() {
-    if (runner_ != nullptr) {
-      runner_->SetStepChannel(nullptr, nullptr, 0);
-    }
-  }
-
-private:
-  std::shared_ptr<QwenFlashNextTextRunner> runner_;
-};
-#endif
-
 struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
     std::shared_ptr<TextGenerationScheduler> scheduler;
-    /// Non-null only for the Qwen3.8-Flash-Next runner, which is the one whose
-    /// `SelectNext` can publish or consume a step token. Held so the request
-    /// path can arm the rank-0 step plan without a mutable pool accessor.
-    std::shared_ptr<QwenFlashNextTextRunner> flash_next_runner;
+    /// Rank 0 of a TP2 pair: the runner that sends rank 1 each model call.
+    std::shared_ptr<TpMirroredRunner> tp_runner;
+    /// Rank 1 of a TP2 pair: executes rank 0's model calls. Rank 1 serves no
+    /// requests of its own, so it has no scheduler.
+    std::shared_ptr<TpExecutor> tp_executor;
     std::shared_ptr<TpControlChannel> control;
     std::shared_ptr<TpResponseBroker> response_broker;
     std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> communicator;
     std::uint32_t tp_rank{0};
     std::uint32_t tp_world_size{1};
-    bool tp_allow_cache_reuse{false};
-    /// True when the loaded model carries an MTP draft sidecar. Dormant C2
-    /// cohort AR cannot coexist with it, so the worker fails closed.
-    bool tp_use_mtp{false};
     std::string model_id;
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
     ReasoningOptions reasoning_defaults;
+  };
+
+  /// One TP2 request on rank 0, from the command that starts it on rank 1 to
+  /// rank 1's verdict. Requests do not overlap: rank 1 executes one request's
+  /// model calls at a time, so the serial lock is held for the whole request.
+  class TpRequest {
+  public:
+    TpRequest(std::shared_ptr<const State> state,
+              std::shared_ptr<std::mutex> serial_mutex,
+              std::unique_lock<std::mutex> serial, std::uint64_t sequence,
+              std::unique_ptr<TpOperationLease> operation)
+        : state_(std::move(state)),
+          serial_mutex_(std::move(serial_mutex)),
+          serial_(std::move(serial)),
+          sequence_(sequence),
+          operation_(std::move(operation)) {}
+
+    TpRequest(const TpRequest&) = delete;
+    TpRequest& operator=(const TpRequest&) = delete;
+
+    [[nodiscard]] bool finished() const noexcept { return finished_; }
+
+    /// Ends the request on rank 1 (`kEnd` with rank 0's instruction count and
+    /// digest), collects rank 1's verdict and releases the operation scope.
+    /// Call once rank 0 makes no further model calls for the request. Returns
+    /// the first problem, or an empty string when both ranks agree.
+    [[nodiscard]] std::string Finish() noexcept {
+      if (finished_) {
+        return {};
+      }
+      finished_ = true;
+      std::string problem;
+      try {
+        const auto note = [&](std::string message) {
+          if (problem.empty()) {
+            problem = std::move(message);
+          }
+        };
+        std::string error;
+        if (!state_->tp_runner->EndRequest(&error)) {
+          note(error);
+          state_->response_broker->FailAll("TP request end failed: " + error);
+        } else {
+          TpControlResponse response;
+          if (!state_->response_broker->WaitForResponse(sequence_, &response,
+                                                        &error)) {
+            note("TP worker response failed: " + error);
+          } else if (!response.error.empty()) {
+            note("TP worker failed: " + response.error);
+          }
+        }
+        if (!operation_->End(&error)) {
+          note("TP operation scope cleanup failed: " + error);
+          state_->response_broker->FailAll(
+              "TP operation scope cleanup failed: " + error);
+        }
+      } catch (...) {
+        try {
+          if (problem.empty()) {
+            problem = "TP request end failed";
+          }
+        } catch (...) {
+        }
+      }
+      if (serial_.owns_lock()) {
+        serial_.unlock();
+      }
+      return problem;
+    }
+
+  private:
+    std::shared_ptr<const State> state_;
+    std::shared_ptr<std::mutex> serial_mutex_;
+    std::unique_lock<std::mutex> serial_;
+    std::uint64_t sequence_{0};
+    std::unique_ptr<TpOperationLease> operation_;
+    bool finished_{false};
   };
 
   class ScheduledGenerationRequest final : public GenerationRequest {
@@ -3151,152 +2975,158 @@ struct InferenceBackend::Impl {
         std::shared_ptr<const State> model_state,
         TextGenerationScheduler::Request scheduled_request,
         InitialOutputState initial = InitialOutputState::kContent,
-        std::shared_ptr<TpResponseBroker> response_broker = {},
-        std::shared_ptr<TpOperationLease> operation = {},
-        std::uint64_t sequence = 0)
+        std::unique_ptr<TpRequest> tp = {})
         : state_(std::move(model_state)),
           request_(std::move(scheduled_request)),
-          response_broker_(std::move(response_broker)),
-          operation_(std::move(operation)),
-          sequence_(sequence),
-          // Held for the lifetime of the request, so the step channel stays
-          // armed across `Wait` -- which is where this path decodes -- and is
-          // released when the request is destroyed. `start_chat` returns this
-          // lazily, so the arm cannot live at the call site the way it does in
-          // the synchronous path.
-          step_arm_(state_->flash_next_runner, state_->control, sequence,
-                    /*publish=*/true) {
+          tp_(std::move(tp)) {
       if (initial == InitialOutputState::kReasoning)
         reasoning_end_ = state_->scheduler->runner().Tokenize("</think>");
     }
 
     ~ScheduledGenerationRequest() override {
-      if (operation_ != nullptr) {
-        Cancel();
+      // A TP2 request whose result was never collected must still end on rank
+      // 1, which otherwise keeps waiting for its next model call.
+      if (tp_ != nullptr && !tp_->finished()) {
+        request_.Cancel();
+        try {
+          (void)request_.Wait({});
+        } catch (...) {
+        }
+        (void)tp_->Finish();
       }
     }
 
     Result Wait(const TokenCallback& on_token) override {
+      std::exception_ptr local_error;
+      Result result;
       try {
-        std::exception_ptr local_error;
-        Result result;
-        try {
-          result = request_.Wait(on_token);
-        } catch (...) {
-          local_error = std::current_exception();
-        }
-        if (response_broker_ != nullptr) {
-          TpControlResponse response;
-          std::string control_error;
-          const bool received = response_broker_->WaitForResponse(
-              sequence_, &response, &control_error);
-          if (local_error != nullptr) {
-            if (!received) {
-              response_broker_->FailAll(
-                  "rank-0 request failed and TP response drain failed: " +
-                  control_error);
-              throw std::runtime_error(
-                  "rank-0 request failed and TP response drain failed: " +
-                  control_error);
-            }
-            std::rethrow_exception(local_error);
-          }
-          if (!received) {
-            throw std::runtime_error("TP worker response failed: " +
-                                     control_error);
-          }
-          if (!response.error.empty()) {
-            throw std::runtime_error("TP worker failed: " + response.error);
-          }
-          RequireTpTokenAgreement("start_chat", result.tokens, response.tokens);
-          if (response.draft_tokens != result.draft_tokens ||
-              response.draft_accepted_tokens != result.draft_accepted_tokens ||
-              response.cached_prompt_tokens != result.cached_prompt_tokens) {
-            throw std::runtime_error(
-                "TP worker cache/draft telemetry mismatch");
-          }
-        } else if (local_error != nullptr) {
-          std::rethrow_exception(local_error);
-        }
-        if (!reasoning_end_.empty()) {
-          const auto end =
-              std::search(result.tokens.begin(), result.tokens.end(),
-                          reasoning_end_.begin(), reasoning_end_.end());
-          result.reasoning_tokens =
-              static_cast<std::size_t>(end - result.tokens.begin());
-        }
-        if (!EndOperation()) {
-          throw std::runtime_error("TP operation scope cleanup failed");
-        }
-        return result;
+        result = request_.Wait(on_token);
       } catch (...) {
-        (void)EndOperation();
-        throw;
+        local_error = std::current_exception();
       }
+      if (tp_ != nullptr) {
+        // Rank 0 makes no further model calls for the request once its own
+        // wait returns, so the request can end on rank 1 too.
+        const auto problem = tp_->Finish();
+        if (local_error == nullptr && !problem.empty()) {
+          throw std::runtime_error(problem);
+        }
+      }
+      if (local_error != nullptr) {
+        std::rethrow_exception(local_error);
+      }
+      if (!reasoning_end_.empty()) {
+        const auto end =
+            std::search(result.tokens.begin(), result.tokens.end(),
+                        reasoning_end_.begin(), reasoning_end_.end());
+        result.reasoning_tokens =
+            static_cast<std::size_t>(end - result.tokens.begin());
+      }
+      return result;
     }
 
-    void Cancel() noexcept override {
-      if (operation_ == nullptr) {
-        request_.Cancel();
-        return;
-      }
-      try {
-        if (response_broker_ == nullptr) {
-          request_.Cancel();
-        } else {
-          // C1 has no symmetric cancellation command. Finish the rank-0
-          // request and consume the correlated worker response before
-          // returning.
-          try {
-            (void)request_.Wait({});
-          } catch (...) {
-          }
-          TpControlResponse response;
-          std::string error;
-          if (!response_broker_->WaitForResponse(sequence_, &response,
-                                                 &error)) {
-            response_broker_->FailAll(
-                "TP response drain failed during cancel: " + error);
-          }
-        }
-      } catch (...) {
-      }
-      (void)EndOperation();
-    }
+    /// Never blocks: it may run inside `Wait`'s token callback. The scheduler
+    /// stops the request between model calls, and `Wait` then ends it.
+    void Cancel() noexcept override { request_.Cancel(); }
 
   private:
-    bool EndOperation() noexcept {
-      if (operation_ == nullptr) {
-        return true;
-      }
-      std::string error;
-      const bool ended = operation_->End(&error);
-      if (!ended && response_broker_ != nullptr) {
-        try {
-          response_broker_->FailAll("TP operation scope cleanup failed: " +
-                                    error);
-        } catch (...) {
-        }
-      }
-      operation_.reset();
-      return ended;
-    }
-
     std::shared_ptr<const State> state_;
     TextGenerationScheduler::Request request_;
     std::vector<tokenization::TokenId> reasoning_end_;
-    std::shared_ptr<TpResponseBroker> response_broker_;
-    std::shared_ptr<TpOperationLease> operation_;
-    std::uint64_t sequence_{0};
-    /// Declared last so it is destroyed FIRST, releasing the step channel
-    /// before the operation scope is ended: a token must never be published
-    /// into a scope that is being torn down.
-    TpStepArm step_arm_;
+    std::unique_ptr<TpRequest> tp_;
   };
 
   [[nodiscard]] std::shared_ptr<const State> Snapshot() const {
     const std::lock_guard<std::mutex> lock(state_mutex);
     return state;
+  }
+
+  /// Starts a TP2 request on rank 0: tells rank 1 about it, then submits it to
+  /// the scheduler, whose model calls the mirrored runner sends to rank 1.
+  /// The scheduler decides everything else -- sampling, stop sequences,
+  /// cancellation between model calls, streaming -- exactly as on one host.
+  [[nodiscard]] std::shared_ptr<ScheduledGenerationRequest> StartTpRequest(
+      const std::shared_ptr<const State>& state,
+      std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
+      const sampling::SamplingConfig& sampling,
+      const CancellationCheck& is_cancelled, bool stream_output,
+      const std::string& client_id, std::vector<std::string> stop_sequences,
+      InitialOutputState initial, Clock::time_point request_start) const {
+    if (state->tp_runner == nullptr || state->response_broker == nullptr ||
+        state->communicator == nullptr || state->scheduler == nullptr) {
+      throw std::logic_error("TP2 rank 0 is not fully configured");
+    }
+    // The scheduler would refuse these too, but only after rank 1 was told
+    // about the request, and a refused command is a failed request rather than
+    // a client error.
+    if (prompt.size() >= state->max_context) {
+      throw std::length_error(
+          "prompt has " + std::to_string(prompt.size()) +
+          " tokens but the context is " + std::to_string(state->max_context) +
+          "; increase --context or shorten the conversation");
+    }
+    if (max_tokens > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::invalid_argument(
+          "TP2 token budget exceeds the protocol range");
+    }
+    TpControlCommand begin{
+        .max_tokens = static_cast<std::uint32_t>(max_tokens),
+        .client_id = client_id,
+        .sampled = !sampling.can_use_unmodified_argmax(),
+    };
+    begin.prompt_tokens.reserve(prompt.size());
+    for (const auto token : prompt) {
+      if (token > static_cast<TextRunnerToken>(
+                      std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument(
+            "TP2 prompt token exceeds the protocol range");
+      }
+      begin.prompt_tokens.push_back(static_cast<std::int32_t>(token));
+    }
+    std::unique_lock<std::mutex> serial(*tp_request_mutex);
+    begin.sequence = tp_sequence++;
+    auto operation =
+        std::make_unique<TpOperationLease>(state->communicator, begin.sequence);
+    std::string error;
+    if (!operation->Begin(&error)) {
+      throw std::runtime_error("TP operation scope bind failed: " + error);
+    }
+    if (!state->response_broker->RegisterPendingResponse(begin.sequence,
+                                                         &error)) {
+      throw std::runtime_error("TP response registration failed: " + error);
+    }
+    // Rank 1 must know the request before its first model call, so the command
+    // goes out before the scheduler can run anything for it.
+    if (!state->control->SendCommand(begin, &error)) {
+      std::string cancel_error;
+      (void)state->response_broker->CancelUnsentResponse(begin.sequence,
+                                                         &cancel_error);
+      throw std::runtime_error("TP worker command failed: " + error);
+    }
+    state->tp_runner->BeginRequest(begin.sequence);
+    auto tp =
+        std::make_unique<TpRequest>(state, tp_request_mutex, std::move(serial),
+                                    begin.sequence, std::move(operation));
+    try {
+      auto scheduled = state->scheduler->Submit(
+          std::move(prompt), max_tokens, sampling, is_cancelled, stream_output,
+          TextRequestMetadata{
+              .client_id = client_id,
+              .deadline = std::nullopt,
+              .request_start = request_start,
+              .prompt_context = nullptr,
+              .cache_prompt = false,
+              .cache_prefix_tokens = 0,
+              .stop_sequences = std::move(stop_sequences),
+          });
+      return std::make_shared<ScheduledGenerationRequest>(
+          state, std::move(scheduled), initial, std::move(tp));
+    } catch (...) {
+      // Rank 0 made no model call for the request, so it ends on rank 1 with
+      // none either.
+      (void)tp->Finish();
+      throw;
+    }
   }
 
   Result GenerateScheduled(
@@ -3322,163 +3152,14 @@ struct InferenceBackend::Impl {
     }
 
     if (current->control != nullptr) {
-      const bool use_cache_reuse =
-          current->tp_allow_cache_reuse && cache_prompt;
-      // Without cache reuse both ranks run uncached with no prefix, so a
-      // prefix computed for tool calls or unpreserved reasoning is dropped
-      // rather than refused.
-      const std::size_t worker_cache_prefix_tokens =
-          use_cache_reuse ? cache_prefix_tokens : 0;
-      if (!sampling.can_use_unmodified_argmax() || context != nullptr ||
-          !stop_sequences.empty() ||
-          max_tokens > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::invalid_argument(
-            "TP2 requires greedy text without stop sequences");
+      if (context != nullptr) {
+        throw std::invalid_argument("TP2 does not support image input");
       }
-      std::vector<std::int32_t> worker_prompt;
-      worker_prompt.reserve(prompt_tokens.size());
-      for (const auto token : prompt_tokens) {
-        if (token > static_cast<TextRunnerToken>(
-                        std::numeric_limits<std::int32_t>::max())) {
-          throw std::invalid_argument(
-              "TP2 prompt token exceeds the worker protocol range");
-        }
-        worker_prompt.push_back(static_cast<std::int32_t>(token));
-      }
-      const std::lock_guard<std::mutex> lock(*tp_submit_mutex);
-      const std::uint64_t sequence = tp_sequence++;
-      if (current->response_broker == nullptr ||
-          current->communicator == nullptr) {
-        throw std::logic_error(
-            "TP rank-zero response broker or communicator is missing");
-      }
-      TpOperationLease operation(current->communicator, sequence);
-      std::string control_error;
-      if (!operation.Begin(&control_error)) {
-        throw std::runtime_error("TP operation scope bind failed: " +
-                                 control_error);
-      }
-      // The command goes out BEFORE rank 0 submits its own request. The step
-      // plan makes the order load-bearing rather than incidental: an armed
-      // publisher would otherwise let rank 0's first `SelectNext` put a
-      // `kStep` on the wire ahead of the `kSingle` command, and rank 1 would
-      // read the step first and refuse it. Sending first also puts rank 1 in
-      // `Consume` before rank 0 has prefill to do, which is the lockstep this
-      // design intends. See the arming-order note in TP2.md.
-      bool send_started = false;
-      bool response_received = false;
-      // Declared outside the `try` so the `catch` can reach it: the command is
-      // sent before `Submit`, so a registration or send failure unwinds with
-      // no local request to cancel.
-      std::optional<TextGenerationScheduler::Request> request;
-      try {
-        if (!current->response_broker->RegisterPendingResponse(
-                sequence, &control_error)) {
-          throw std::runtime_error("TP response registration failed: " +
-                                   control_error);
-        }
-        TpControlCommand command{
-            .sequence = sequence,
-            .max_tokens = static_cast<std::uint32_t>(max_tokens),
-            .cache_prompt = use_cache_reuse,
-            .cache_prefix_tokens =
-                static_cast<std::uint32_t>(worker_cache_prefix_tokens),
-            .prompt_tokens = std::move(worker_prompt),
-            .client_id = client_id,
-        };
-        send_started = true;
-        if (!current->control->SendCommand(command, &control_error)) {
-          throw std::runtime_error("TP worker command failed: " +
-                                   control_error);
-        }
-        // Armed only once rank 1 is committed to start, and only around rank
-        // 0's own decode: an armed publisher outliving the request would send a
-        // step naming a sequence nothing is decoding.
-        // Armed once rank 1 is committed to start, and held for exactly this
-        // request's decode. `TpStepArm` disarms on every exit path.
-        TpStepArm step_arm(current->flash_next_runner, current->control,
-                           sequence, /*publish=*/true);
-        std::optional<TextGenerationScheduler::Request> submitted;
-        submitted = current->scheduler->Submit(
-            std::move(prompt_tokens), max_tokens, sampling, {},
-            static_cast<bool>(on_token),
-            TextRequestMetadata{
-                .client_id = client_id,
-                .deadline = std::nullopt,
-                .request_start = request_start,
-                .prompt_context = nullptr,
-                .cache_prompt = use_cache_reuse,
-                .cache_prefix_tokens = worker_cache_prefix_tokens,
-            });
-        request = std::move(submitted);
-        // Rank 0's OWN decode must complete before rank 1's reply is collected.
-        // Under the step plan the publisher only emits tokens while rank 0
-        // decodes, so waiting for the response first would deadlock: rank 1
-        // blocks for a token rank 0 has not published, and rank 0 would block
-        // for a response rank 1 cannot send until it has that token. The ranks
-        // now run genuinely concurrently, each driving the other one step at a
-        // time, which is the point of the plan.
-        result = request->Wait(on_token);
-        TpControlResponse response;
-        if (!current->response_broker->WaitForResponse(sequence, &response,
-                                                       &control_error)) {
-          throw std::runtime_error("TP worker response failed: " +
-                                   control_error);
-        }
-        response_received = true;
-        if (!response.error.empty()) {
-          throw std::runtime_error("TP worker failed: " + response.error);
-        }
-        RequireTpTokenAgreement("generate", result.tokens, response.tokens);
-        if (response.draft_tokens != result.draft_tokens ||
-            response.draft_accepted_tokens != result.draft_accepted_tokens ||
-            response.cached_prompt_tokens != result.cached_prompt_tokens ||
-            response.cache_snapshot_bytes != result.cache_snapshot_bytes) {
-          throw std::runtime_error("TP worker cache/draft telemetry mismatch");
-        }
-        if (initial == InitialOutputState::kReasoning) {
-          const auto reasoning_end =
-              current->scheduler->runner().Tokenize("</think>");
-          if (!reasoning_end.empty()) {
-            const auto end =
-                std::search(result.tokens.begin(), result.tokens.end(),
-                            reasoning_end.begin(), reasoning_end.end());
-            result.reasoning_tokens =
-                static_cast<std::size_t>(end - result.tokens.begin());
-          }
-        }
-        if (!operation.End(&control_error)) {
-          current->response_broker->FailAll(
-              "TP operation scope cleanup failed: " + control_error);
-          throw std::runtime_error("TP operation scope cleanup failed: " +
-                                   control_error);
-        }
-        return result;
-      } catch (...) {
-        // `request` may not exist: the command is now sent before `Submit`, so
-        // a failure to register or to send happens with no local request to
-        // cancel. The `StepDisarm` above has already restored independent
-        // sampling, so rank 0 is not left publishing into a dead exchange.
-        if (request.has_value()) {
-          try {
-            request->Cancel();
-            (void)request->Wait({});
-          } catch (...) {
-          }
-        }
-        if (!send_started) {
-          std::string cancel_error;
-          (void)current->response_broker->CancelUnsentResponse(sequence,
-                                                               &cancel_error);
-        } else if (!response_received) {
-          // Rank 1 was told to start and may be blocked in `Consume` holding
-          // the request open. `FailAll` discards its eventual reply so it is
-          // not correlated to whatever request runs next.
-          current->response_broker->FailAll(
-              "TP request failed before a correlated response arrived");
-        }
-        throw;
-      }
+      auto generation =
+          StartTpRequest(current, std::move(prompt_tokens), max_tokens,
+                         sampling, is_cancelled, static_cast<bool>(on_token),
+                         client_id, stop_sequences, initial, request_start);
+      return generation->Wait(on_token);
     }
 
     auto request = current->scheduler->Submit(
@@ -3499,12 +3180,11 @@ struct InferenceBackend::Impl {
   }
 
   mutable std::mutex state_mutex;
-  mutable std::shared_ptr<std::mutex> tp_submit_mutex{
+  /// Serializes TP2 requests on rank 0 for their whole lifetime.
+  mutable std::shared_ptr<std::mutex> tp_request_mutex{
       std::make_shared<std::mutex>()};
-  /// Starts at 1: zero is reserved. A zero scope means "unset" to the control
-  /// layer, and a step command is required to name a live request, so a first
-  /// sequence of zero would make every per-token message of the first request
-  /// fail validation.
+  /// Starts at 1: a request's sequence names its operation scope, and zero
+  /// means "between requests" to the instruction protocol.
   mutable std::uint64_t tp_sequence{1};
   std::shared_ptr<const State> state;
 #endif
@@ -3981,6 +3661,12 @@ bool InferenceBackend::load(
              "Qwen3.8-Flash-Next TP2 requires one session and no disk cache");
     return false;
   }
+  if (model->TpWorldSize() > 1 && tp_config.allow_cache_reuse) {
+    SetError(error,
+             "Qwen3.8-Flash-Next TP2 does not mirror snapshots yet; run "
+             "without --tp-cache-reuse");
+    return false;
+  }
   if (session_count == 0) {
     SetError(error, "HTTP session count must be at least one");
     return false;
@@ -4035,27 +3721,36 @@ bool InferenceBackend::load(
         tp_config.allow_cache_reuse);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
-    // Retained before the pool takes ownership: the request path arms the
-    // rank-0 step plan on the runner, and `TextRunnerPool::runner()` is const.
-    new_state->flash_next_runner = runner;
-    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
-    if (DiskCacheEnabled(disk_cache_config)) {
-      runner_disk_cache = TextRunnerDiskCacheOptions{
-          .directory = std::move(disk_cache_config.directory),
-          .capacity_bytes = disk_cache_config.capacity_bytes,
-          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
-      };
+    if (tp_world_size > 1 && tp_rank != 0) {
+      // Rank 1 serves nothing itself: it executes rank 0's model calls on as
+      // many states as rank 0's pool creates, and builds no pool of its own.
+      new_state->tp_executor =
+          std::make_shared<TpExecutor>(std::move(runner), session_count);
+    } else {
+      std::shared_ptr<TextModelRunner> pool_runner = runner;
+      if (tp_world_size > 1) {
+        new_state->tp_runner = std::make_shared<TpMirroredRunner>(
+            std::move(runner),
+            std::make_shared<TpControlInstructionSink>(tp_config.control));
+        pool_runner = new_state->tp_runner;
+      }
+      std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+      if (DiskCacheEnabled(disk_cache_config)) {
+        runner_disk_cache = TextRunnerDiskCacheOptions{
+            .directory = std::move(disk_cache_config.directory),
+            .capacity_bytes = disk_cache_config.capacity_bytes,
+            .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+        };
+      }
+      auto runner_pool = std::make_shared<TextRunnerPool>(
+          std::move(pool_runner), session_count, std::move(runner_disk_cache));
+      new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+          std::move(runner_pool), prefill_policy, scheduler_policy);
     }
-    auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache));
-    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
     new_state->control = tp_config.control;
     new_state->communicator = tp_config.communicator;
     new_state->tp_rank = tp_rank;
     new_state->tp_world_size = tp_world_size;
-    new_state->tp_allow_cache_reuse = tp_config.allow_cache_reuse;
-    new_state->tp_use_mtp = has_mtp;
     if (tp_world_size > 1) {
       const TpControlConfig control_config{
           .rank = tp_rank,
@@ -4093,11 +3788,15 @@ bool InferenceBackend::run_worker(std::string* error) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
   if (state == nullptr || state->control == nullptr ||
-      state->communicator == nullptr || state->tp_world_size != 2 ||
-      state->tp_rank != 1) {
+      state->communicator == nullptr || state->tp_executor == nullptr ||
+      state->tp_world_size != 2 || state->tp_rank != 1) {
     SetError(error, "TP worker requires a loaded rank-1 Flash-Next model");
     return false;
   }
+  const auto receive = [control = state->control](TpControlCommand* command,
+                                                  std::string* receive_error) {
+    return control->ReceiveCommand(command, receive_error);
+  };
   for (;;) {
     TpControlCommand command;
     std::string control_error;
@@ -4105,138 +3804,45 @@ bool InferenceBackend::run_worker(std::string* error) {
       SetError(error, "TP worker command receive failed: " + control_error);
       return false;
     }
-    if (command.kind == TpControlCommandKind::kCohort2Ar) {
-      // Dormant C2 slice: the cohort runs as two ordered serial C1 members in
-      // one operation scope, and the coordinator sends no such command yet.
-      using TpCohortAdmissions =
-          std::vector<TextGenerationScheduler::CohortMemberRequest>;
-      TpCohortWorkerHooks hooks;
-      hooks.submit =
-          [scheduler = state->scheduler](
-              TpCohortAdmissions admitted,
-              std::string* error) -> std::unique_ptr<TpCohortSubmission> {
-        try {
-          return std::make_unique<SchedulerCohortSubmission>(
-              scheduler->SubmitCohort(std::move(admitted)));
-        } catch (const std::exception& exception) {
-          SetError(error, exception.what());
-          return nullptr;
-        }
-      };
-      hooks.send = [control = state->control](const TpControlResponse& response,
-                                              std::string* error) {
-        std::string control_error;
-        if (!control->SendResponse(response, &control_error)) {
-          SetError(error, "TP worker response send failed: " + control_error);
-          return TpWorkerLoopStep::kStop;
-        }
-        return TpWorkerLoopStep::kContinue;
-      };
-      if (RunTpCohortCommand(
-              command, state->tp_use_mtp, state->scheduler->capacity(),
-              std::make_unique<TpOperationScopeLease>(state->communicator,
-                                                      command.sequence),
-              std::move(hooks), error) == TpWorkerLoopStep::kStop) {
+    if (command.kind == TpControlCommandKind::kInstruction) {
+      // Between requests only a state reset can arrive.
+      if (!state->tp_executor->ExecuteIdle(command, &control_error)) {
+        SetError(error, "TP worker: " + control_error);
         return false;
       }
       continue;
     }
     if (command.kind != TpControlCommandKind::kSingle) {
-      SetError(error, "TP C2 control command is not executable");
+      // C2 needs batched instructions, which the executor does not have yet.
+      SetError(error, "TP worker cannot execute a C2 command");
       return false;
     }
     TpControlResponse response{.sequence = command.sequence};
-    auto operation = std::make_shared<TpOperationLease>(state->communicator,
-                                                        command.sequence);
-    if (!operation->Begin(&control_error)) {
+    TpOperationLease operation(state->communicator, command.sequence);
+    if (!operation.Begin(&control_error)) {
       response.error =
           "TP worker operation scope bind failed: " + control_error;
-      if (response.error.size() > (1U << 20)) {
-        response.error.resize(1U << 20);
-      }
-      if (!state->control->SendResponse(response, &control_error)) {
-        SetError(error, "TP worker response send failed: " + control_error);
-        return false;
-      }
+      (void)state->control->SendResponse(response, &control_error);
       SetError(error, response.error);
       return false;
     }
-    try {
-      std::vector<TextRunnerToken> prompt_tokens;
-      prompt_tokens.reserve(command.prompt_tokens.size());
-      for (const auto token : command.prompt_tokens) {
-        if (token < 0 || static_cast<std::uint64_t>(token) >
-                             std::numeric_limits<TextRunnerToken>::max()) {
-          throw std::invalid_argument(
-              "TP worker received an out-of-range prompt token");
-        }
-        prompt_tokens.push_back(static_cast<TextRunnerToken>(token));
-      }
-      sampling::SamplingConfig greedy;
-      // Rank 0's token is authoritative: arm a consumer so this request's
-      // `SelectNext` takes rank 0's token instead of sampling its own, and the
-      // stop test then runs on that shared token, so both ranks stop together.
-      // Rank 1 starts before rank 0 and blocks in `Consume` through rank 0's
-      // prefill, and rank 0 holds its publisher armed until this request's
-      // response is sent, so the two windows nest. Disarming restores
-      // independent sampling on every exit, so a consumer never outlives the
-      // request that armed it.
-      TpStepArm step_arm(state->flash_next_runner, state->control,
-                         command.sequence, /*publish=*/false);
-      auto request = state->scheduler->Submit(
-          std::move(prompt_tokens), command.max_tokens, greedy, {}, false,
-          TextRequestMetadata{
-              .client_id = command.client_id,
-              .deadline = std::nullopt,
-              .request_start = Clock::now(),
-              .prompt_context = nullptr,
-              .cache_prompt = command.cache_prompt,
-              .cache_prefix_tokens = command.cache_prefix_tokens,
-          });
-      const auto result = request.Wait({});
-      if (state->flash_next_runner != nullptr) {
-        if (const auto divergence =
-                state->flash_next_runner->TakeStepDivergence();
-            !divergence.empty()) {
-          throw std::runtime_error("TP rank logits diverged: " + divergence);
-        }
-      }
-      response.tokens.reserve(result.tokens.size());
-      for (const auto token : result.tokens) {
-        if (token > static_cast<tokenization::TokenId>(
-                        std::numeric_limits<std::int32_t>::max())) {
-          throw std::invalid_argument(
-              "TP worker produced an out-of-range token");
-        }
-        response.tokens.push_back(static_cast<std::int32_t>(token));
-      }
-      response.draft_tokens = result.draft_tokens;
-      response.draft_accepted_tokens = result.draft_accepted_tokens;
-      if (result.cached_prompt_tokens >
-          std::numeric_limits<std::uint32_t>::max()) {
-        throw std::invalid_argument(
-            "TP worker cached prompt count is out of range");
-      }
-      response.cached_prompt_tokens =
-          static_cast<std::uint32_t>(result.cached_prompt_tokens);
-      response.cache_snapshot_bytes = result.cache_snapshot_bytes;
-      response.error = result.cancelled ? "worker request cancelled" : "";
-    } catch (const std::exception& exception) {
-      response.error = exception.what();
-      if (response.error.size() > (1U << 20)) {
-        response.error.resize(1U << 20);
-      }
+    std::string outcome;
+    if (!state->tp_executor->RunRequest(command, receive, &outcome,
+                                        &control_error)) {
+      SetError(error, "TP worker: " + control_error);
+      return false;
     }
+    response.error = std::move(outcome);
     std::string operation_error;
-    if (!operation->End(&operation_error)) {
+    if (!operation.End(&operation_error)) {
       if (!response.error.empty()) {
         response.error += "; ";
       }
       response.error +=
           "TP worker operation scope cleanup failed: " + operation_error;
-      if (response.error.size() > (1U << 20)) {
-        response.error.resize(1U << 20);
-      }
+    }
+    if (response.error.size() > (1U << 20)) {
+      response.error.resize(1U << 20);
     }
     if (!state->control->SendResponse(response, &control_error)) {
       SetError(error, "TP worker response send failed: " + control_error);
@@ -4444,98 +4050,13 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
   if (state->control != nullptr) {
-    const bool use_cache_reuse =
-        state->tp_allow_cache_reuse && request.cache_prompt;
-    // Without cache reuse both ranks run uncached with no prefix, so a prefix
-    // computed for tool calls or unpreserved reasoning is dropped rather than
-    // refused.
-    const std::size_t worker_cache_prefix_tokens =
-        use_cache_reuse ? prompt->cache_prefix_tokens : 0;
-    if (stream_output || !sampling_config.can_use_unmodified_argmax() ||
-        prompt->context != nullptr || !request.stop_sequences.empty() ||
-        max_tokens > std::numeric_limits<std::uint32_t>::max()) {
-      throw std::invalid_argument(
-          "TP2 start_chat requires one greedy, non-streaming text request "
-          "without stop sequences");
+    if (prompt->context != nullptr) {
+      throw std::invalid_argument("TP2 does not support image input");
     }
-    std::vector<std::int32_t> worker_prompt;
-    worker_prompt.reserve(prompt->tokens.size());
-    for (const auto token : prompt->tokens) {
-      if (token > static_cast<TextRunnerToken>(
-                      std::numeric_limits<std::int32_t>::max())) {
-        throw std::invalid_argument(
-            "TP2 prompt token exceeds the worker protocol range");
-      }
-      worker_prompt.push_back(static_cast<std::int32_t>(token));
-    }
-    const std::lock_guard<std::mutex> lock(*impl_->tp_submit_mutex);
-    const std::uint64_t sequence = impl_->tp_sequence++;
-    if (state->response_broker == nullptr || state->communicator == nullptr) {
-      throw std::logic_error(
-          "TP rank-zero response broker or communicator is missing");
-    }
-    auto operation =
-        std::make_shared<TpOperationLease>(state->communicator, sequence);
-    std::string control_error;
-    if (!operation->Begin(&control_error)) {
-      throw std::runtime_error("TP operation scope bind failed: " +
-                               control_error);
-    }
-    auto scheduled_request = state->scheduler->Submit(
-        std::move(prompt->tokens), max_tokens, sampling_config, {}, false,
-        TextRequestMetadata{
-            .client_id = client_id,
-            .deadline = std::nullopt,
-            .request_start = request_start,
-            .prompt_context = nullptr,
-            .cache_prompt = use_cache_reuse,
-            .cache_prefix_tokens = worker_cache_prefix_tokens,
-        });
-    if (!state->response_broker->RegisterPendingResponse(sequence,
-                                                         &control_error)) {
-      try {
-        scheduled_request.Cancel();
-        (void)scheduled_request.Wait({});
-      } catch (...) {
-      }
-      throw std::runtime_error("TP response registration failed: " +
-                               control_error);
-    }
-    bool send_started = false;
-    try {
-      TpControlCommand command{
-          .sequence = sequence,
-          .max_tokens = static_cast<std::uint32_t>(max_tokens),
-          .cache_prompt = use_cache_reuse,
-          .cache_prefix_tokens =
-              static_cast<std::uint32_t>(worker_cache_prefix_tokens),
-          .prompt_tokens = std::move(worker_prompt),
-          .client_id = client_id,
-      };
-      send_started = true;
-      if (!state->control->SendCommand(command, &control_error)) {
-        throw std::runtime_error("TP worker command failed: " + control_error);
-      }
-      return std::make_shared<Impl::ScheduledGenerationRequest>(
-          state, std::move(scheduled_request),
-          state->scheduler->runner().InitialOutputState(request),
-          state->response_broker, std::move(operation), sequence);
-    } catch (...) {
-      try {
-        scheduled_request.Cancel();
-        (void)scheduled_request.Wait({});
-      } catch (...) {
-      }
-      if (send_started) {
-        state->response_broker->FailAll(
-            "TP command send failed before request ownership transferred");
-      } else {
-        std::string cancel_error;
-        (void)state->response_broker->CancelUnsentResponse(sequence,
-                                                           &cancel_error);
-      }
-      throw;
-    }
+    return impl_->StartTpRequest(
+        state, std::move(prompt->tokens), max_tokens, sampling_config,
+        is_cancelled, stream_output, client_id, request.stop_sequences,
+        state->scheduler->runner().InitialOutputState(request), request_start);
   }
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt->tokens), max_tokens, sampling_config, is_cancelled,

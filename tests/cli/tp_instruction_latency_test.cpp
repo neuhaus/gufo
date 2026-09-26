@@ -1,4 +1,4 @@
-// Measures the cost of the rank-0 step plan's per-token exchange.
+// Measures the cost of the per-token instruction rank 0 sends rank 1.
 //
 // This is a MEASUREMENT, not a correctness test: nothing here asserts a
 // threshold, and a slow result is a result, not a failure. The correctness
@@ -11,9 +11,9 @@
 // what the two-host path costs. The cross-host number has to come from a
 // two-host run.
 //
-// The metric that decides whether the step plan is viable is sustained steps
-// per second, because the decode loop needs one exchange per token. The
-// latency percentiles say where that ceiling comes from.
+// Every decoded token costs one `kAdvance` instruction on the control channel,
+// so the metric that matters is sustained instructions per second; the latency
+// percentiles say where that ceiling comes from.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -36,11 +36,11 @@
 
 namespace {
 
-using namespace std::chrono_literals;
 using gufo::server::TpControlChannel;
+using gufo::server::TpControlCommand;
+using gufo::server::TpControlCommandKind;
 using gufo::server::TpControlConfig;
-using gufo::server::TpControlStepConsumer;
-using gufo::server::TpControlStepPublisher;
+using gufo::server::TpInstructionOp;
 
 std::uint16_t FreePort() {
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -87,6 +87,33 @@ struct Samples {
     return total / static_cast<double>(micros.size());
   }
 };
+
+/// One token's instruction, as rank 0 sends it.
+bool SendAdvance(TpControlChannel& channel, std::uint64_t index,
+                 std::int32_t token, std::string* error) {
+  const TpControlCommand command{
+      .sequence = 1,
+      .kind = TpControlCommandKind::kInstruction,
+      .instruction = {
+          .op = TpInstructionOp::kAdvance, .index = index, .token = token}};
+  return channel.SendCommand(command, error);
+}
+
+/// Receives one instruction and checks it is the advance that was sent.
+bool ReceiveAdvance(TpControlChannel& channel, std::uint64_t index,
+                    std::string* error) {
+  TpControlCommand command;
+  if (!channel.ReceiveCommand(&command, error)) {
+    return false;
+  }
+  if (command.kind != TpControlCommandKind::kInstruction ||
+      command.instruction.op != TpInstructionOp::kAdvance ||
+      command.instruction.index != index) {
+    *error = "unexpected instruction";
+    return false;
+  }
+  return true;
+}
 
 void Report(const char* label, const Samples& samples) {
   std::printf(
@@ -151,35 +178,30 @@ int main(int argc, char** argv) {
 
   // Warm the path so the first steps do not pay for first-touch page faults and
   // scheduler placement, which are not what the per-token ceiling is made of.
-  {
-    TpControlStepPublisher publisher(server);
-    TpControlStepConsumer consumer(client);
-    for (std::size_t i = 0; i < 256; ++i) {
-      std::string error;
-      std::thread publish([&] {
-        (void)publisher.Publish(1, static_cast<std::int32_t>(i), false, &error);
-      });
-      std::int32_t token = 0;
-      bool final = false;
-      (void)consumer.Consume(1, &token, &final, 30s, &error);
-      publish.join();
-    }
+  std::uint64_t index = 0;
+  for (std::size_t i = 0; i < 256; ++i, ++index) {
+    std::string error;
+    std::thread send([&] {
+      (void)SendAdvance(*server, index, static_cast<std::int32_t>(i), &error);
+    });
+    (void)ReceiveAdvance(*client, index, &error);
+    send.join();
   }
 
-  TpControlStepPublisher publisher(server);
-  TpControlStepConsumer consumer(client);
   Samples publish_samples;
   Samples consume_samples;
   std::atomic<bool> failed{false};
   std::string failure;
 
   const auto wall_start = std::chrono::steady_clock::now();
+  const std::uint64_t first = index;
   std::thread publish_thread([&] {
     for (std::size_t i = 0; i < steps; ++i) {
       const auto start = std::chrono::steady_clock::now();
       std::string error;
-      if (!publisher.Publish(1, static_cast<std::int32_t>(i), false, &error)) {
-        failure = "publish: " + error;
+      if (!SendAdvance(*server, first + i, static_cast<std::int32_t>(i),
+                       &error)) {
+        failure = "send: " + error;
         failed.store(true);
         return;
       }
@@ -189,12 +211,9 @@ int main(int argc, char** argv) {
   std::thread consume_thread([&] {
     for (std::size_t i = 0; i < steps; ++i) {
       const auto start = std::chrono::steady_clock::now();
-      std::int32_t token = 0;
-      bool final = false;
       std::string error;
-      if (!consumer.Consume(1, &token, &final, 30s, &error) ||
-          token != static_cast<std::int32_t>(i)) {
-        failure = "consume: " + error;
+      if (!ReceiveAdvance(*client, first + i, &error)) {
+        failure = "receive: " + error;
         failed.store(true);
         return;
       }
@@ -211,31 +230,32 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  std::printf("TP step exchange, %zu steps, loopback TCP on one host\n", steps);
+  index = first + steps;
+  std::printf(
+      "TP instruction exchange, %zu instructions, loopback TCP on one "
+      "host\n",
+      steps);
   std::printf("  LOWER BOUND: excludes the cross-host InfiniBand round trip\n");
-  Report("publish (send)", publish_samples);
-  Report("consume (recv+check)", consume_samples);
-  std::printf("  %-22s %.0f steps/s (%.3f s wall)\n", "sustained",
+  Report("send", publish_samples);
+  Report("receive (and check)", consume_samples);
+  std::printf("  %-22s %.0f instructions/s (%.3f s wall)\n", "sustained",
               static_cast<double>(steps) / wall.count(), wall.count());
 
   // The pipelined phase above measures the THROUGHPUT ceiling, not latency:
-  // the publisher runs ahead and the consumer only drains the socket buffer, so
+  // the sender runs ahead and the receiver only drains the socket buffer, so
   // its per-call cost hides how long a message actually takes to arrive. That
   // latency is what rank 1 waits on once per token in the decode loop, so
-  // measure it properly by serializing: publish, wait for the consumer to
+  // measure it properly by serializing: send, wait for the receiver to
   // confirm, repeat. Half the round trip approximates the one-way delay.
-  TpControlStepPublisher rt_publisher(server);
-  TpControlStepConsumer rt_consumer(client);
   Samples round_trip;
   std::atomic<std::size_t> consumed_count{0};
   const std::size_t rt_steps = std::min<std::size_t>(steps, 5000);
+  const std::uint64_t rt_first = index;
   std::thread rt_consumer_thread([&] {
     for (std::size_t i = 0; i < rt_steps; ++i) {
-      std::int32_t token = 0;
-      bool final = false;
       std::string error;
-      if (!rt_consumer.Consume(2, &token, &final, 30s, &error)) {
-        failure = "round-trip consume: " + error;
+      if (!ReceiveAdvance(*client, rt_first + i, &error)) {
+        failure = "round-trip receive: " + error;
         failed.store(true);
         return;
       }
@@ -245,8 +265,9 @@ int main(int argc, char** argv) {
   for (std::size_t i = 0; i < rt_steps && !failed.load(); ++i) {
     const auto start = std::chrono::steady_clock::now();
     std::string error;
-    if (!rt_publisher.Publish(2, static_cast<std::int32_t>(i), false, &error)) {
-      failure = "round-trip publish: " + error;
+    if (!SendAdvance(*server, rt_first + i, static_cast<std::int32_t>(i),
+                     &error)) {
+      failure = "round-trip send: " + error;
       failed.store(true);
       break;
     }

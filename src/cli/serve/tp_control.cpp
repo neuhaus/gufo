@@ -31,8 +31,8 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 6;          // ordered C1/C2 cohort envelopes
-                                       // plus the kStep per-token message
+constexpr std::uint16_t kVersion = 7;          // C1/C2 envelopes plus rank-1
+                                               // executor instructions
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
@@ -84,14 +84,6 @@ void SetStartupSocketOptions(int fd, std::chrono::milliseconds io_timeout) {
 void ClearReceiveTimeout(int fd) {
   const timeval none{};
   (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof(none));
-}
-
-/// Whether a receive failed purely because the bound expired with nothing
-/// read, as opposed to a real I/O error. Only the latter can leave the stream
-/// mid-frame, so only the latter may poison the channel.
-[[nodiscard]] bool IsTimeoutOnly(const std::string* error) {
-  return error != nullptr &&
-         error->find("Resource temporarily unavailable") != std::string::npos;
 }
 
 void AppendU32(std::vector<std::uint8_t>* out, std::uint32_t value) {
@@ -158,7 +150,55 @@ bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
 [[nodiscard]] bool HasLegacyCommandFields(const TpControlCommand& command) {
   return command.max_tokens != 0 || command.cache_prompt ||
          command.cache_prefix_tokens != 0 || !command.prompt_tokens.empty() ||
-         !command.client_id.empty();
+         !command.client_id.empty() || command.sampled;
+}
+
+/// An instruction names one model call and its arguments; every argument the
+/// call does not take must be zero, so two encodings of one call cannot differ.
+[[nodiscard]] bool ValidateInstruction(std::uint64_t sequence,
+                                       const TpInstruction& instruction,
+                                       std::string* error) {
+  const auto only = [&](bool token, bool offset, bool count, bool prompt_size,
+                        bool digest) {
+    return (token || instruction.token == 0) &&
+           (offset || instruction.offset == 0) &&
+           (count || instruction.count == 0) &&
+           (prompt_size || instruction.prompt_size == 0) &&
+           (digest || instruction.digest == 0);
+  };
+  bool valid = false;
+  switch (instruction.op) {
+    case TpInstructionOp::kInvalidate:
+      valid = only(false, false, false, false, false);
+      break;
+    case TpInstructionOp::kPrefill:
+      valid = only(false, true, true, true, false) && instruction.count != 0 &&
+              instruction.prompt_size > instruction.offset &&
+              instruction.prompt_size <= kMaxPromptTokens;
+      break;
+    case TpInstructionOp::kAdvance:
+      valid = only(true, false, false, false, false) && instruction.token >= 0;
+      break;
+    case TpInstructionOp::kDecode:
+      valid = only(false, false, true, false, false) && instruction.count > 1;
+      break;
+    case TpInstructionOp::kEnd:
+      valid = only(false, false, true, false, true);
+      break;
+    case TpInstructionOp::kNone:
+      break;
+  }
+  if (!valid) {
+    SetError(error, "TP instruction has invalid arguments for its operation");
+    return false;
+  }
+  // Only a reset can happen between requests: the continuation cache makes it
+  // on its own schedule. Every other call belongs to a request.
+  if (sequence == 0 && instruction.op != TpInstructionOp::kInvalidate) {
+    SetError(error, "TP instruction outside a request must be a reset");
+    return false;
+  }
+  return true;
 }
 
 [[nodiscard]] bool HasLegacyResponseFields(const TpControlResponse& response) {
@@ -315,6 +355,11 @@ TpPlanDigest ComputeTpCachePlanDigest(const TpControlCommand& command) {
 
 bool ValidateTpControlCommand(const TpControlCommand& command,
                               std::string* error) {
+  if (command.kind != TpControlCommandKind::kInstruction &&
+      command.instruction != TpInstruction{}) {
+    SetError(error, "TP request command carries an instruction");
+    return false;
+  }
   if (command.kind == TpControlCommandKind::kSingle) {
     if (command.members.size() > 1 ||
         (!command.members.empty() && HasLegacyCommandFields(command))) {
@@ -328,23 +373,21 @@ bool ValidateTpControlCommand(const TpControlCommand& command,
     }
     return ValidateMemberRequest(members.front(), error);
   }
-  if (command.kind == TpControlCommandKind::kStep) {
-    // A step is a bare instruction against a request that a previous kSingle
-    // already described. Anything else here would mean the two messages
-    // disagree about what is being decoded, so every other field must be
+  if (command.kind == TpControlCommandKind::kInstruction) {
+    // An instruction is one model call within a request that a previous
+    // kSingle already described. Anything else here would mean the two
+    // messages disagree about the request, so every request field must be
     // empty: no members, no prompt, no cache request, no plan digest, and no
     // cohort scope of its own.
     const TpPlanDigest zero_digest{};
-    if (command.sequence == 0 || !command.members.empty() ||
-        command.max_tokens != 0 || command.cache_prompt ||
-        command.cache_prefix_tokens != 0 || !command.prompt_tokens.empty() ||
-        !command.client_id.empty() || command.cohort_id != 0 ||
+    if (!command.members.empty() || HasLegacyCommandFields(command) ||
+        command.cohort_id != 0 ||
         command.execution_plan_digest != zero_digest ||
         command.cache_plan_digest != zero_digest) {
-      SetError(error, "TP step command carries fields a step must not have");
+      SetError(error, "TP instruction carries request fields");
       return false;
     }
-    return true;
+    return ValidateInstruction(command.sequence, command.instruction, error);
   }
   if (command.kind != TpControlCommandKind::kCohort2Ar) {
     SetError(error, "TP control command kind is invalid");
@@ -808,13 +851,21 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     payload.insert(payload.end(), member.client_id.begin(),
                    member.client_id.end());
   }
-  // kStep appends its three fields after the (empty) member block. The layout
-  // is a function of the kind byte, which is already on the wire, so both sides
-  // derive the same framing without a separate encoder.
-  if (command.kind == TpControlCommandKind::kStep) {
-    AppendU32(&payload, static_cast<std::uint32_t>(command.step_token));
-    AppendU64(&payload, command.step_index);
-    AppendU32(&payload, command.step_final ? 1U : 0U);
+  // Kind-specific fields follow the member block. The layout is a function of
+  // the kind, which is already on the wire, so both sides derive the same
+  // framing without a separate encoder.
+  if (command.kind == TpControlCommandKind::kSingle) {
+    AppendU32(&payload, command.sampled ? 1U : 0U);
+  } else if (command.kind == TpControlCommandKind::kInstruction) {
+    const auto& instruction = command.instruction;
+    AppendU32(&payload, static_cast<std::uint32_t>(instruction.op));
+    AppendU64(&payload, instruction.index);
+    AppendU32(&payload, instruction.state);
+    AppendU32(&payload, static_cast<std::uint32_t>(instruction.token));
+    AppendU32(&payload, instruction.offset);
+    AppendU32(&payload, instruction.count);
+    AppendU32(&payload, instruction.prompt_size);
+    AppendU64(&payload, instruction.digest);
   }
   return SendFrame(kCommand, command.sequence, payload, error);
 }
@@ -844,12 +895,12 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
                  error) ||
       !ReadBytes(command_prompt_, &offset, parsed.cache_plan_digest, error) ||
       !ReadU32(command_prompt_, &offset, &member_count, error) ||
-      // A step belongs to a request rather than to a member, so it is the one
-      // kind that legitimately carries none. The exact per-kind count is
-      // enforced once the kind is known, below.
+      // An instruction belongs to a request rather than to a member, so it is
+      // the one kind that legitimately carries none. The exact per-kind count
+      // is enforced once the kind is known, below.
       embedded != sequence ||
-      (member_count == 0 &&
-       kind != static_cast<std::uint32_t>(TpControlCommandKind::kStep)) ||
+      (member_count == 0 && kind != static_cast<std::uint32_t>(
+                                        TpControlCommandKind::kInstruction)) ||
       member_count > kMaxCohortMembers) {
     command_prompt_.clear();
     command_prompt_.shrink_to_fit();
@@ -861,16 +912,17 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
   } else if (kind ==
              static_cast<std::uint32_t>(TpControlCommandKind::kCohort2Ar)) {
     parsed.kind = TpControlCommandKind::kCohort2Ar;
-  } else if (kind == static_cast<std::uint32_t>(TpControlCommandKind::kStep)) {
-    parsed.kind = TpControlCommandKind::kStep;
+  } else if (kind ==
+             static_cast<std::uint32_t>(TpControlCommandKind::kInstruction)) {
+    parsed.kind = TpControlCommandKind::kInstruction;
   } else {
     command_prompt_.clear();
     command_prompt_.shrink_to_fit();
     SetError(error, "TP control command kind is invalid");
     return false;
   }
-  // A step belongs to a request, not to a member, so it carries none. kSingle
-  // always has exactly one and kCohort2Ar exactly two.
+  // An instruction belongs to a request, not to a member, so it carries none.
+  // kSingle always has exactly one and kCohort2Ar exactly two.
   const std::size_t expected_members =
       parsed.kind == TpControlCommandKind::kSingle      ? 1
       : parsed.kind == TpControlCommandKind::kCohort2Ar ? kMaxCohortMembers
@@ -916,20 +968,35 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         client_size);
     offset += client_size;
   }
-  if (parsed.kind == TpControlCommandKind::kStep) {
-    std::uint32_t token_bits = 0;
-    std::uint32_t final_flag = 0;
-    if (!ReadU32(command_prompt_, &offset, &token_bits, error) ||
-        !ReadU64(command_prompt_, &offset, &parsed.step_index, error) ||
-        !ReadU32(command_prompt_, &offset, &final_flag, error) ||
-        final_flag > 1) {
+  if (parsed.kind == TpControlCommandKind::kSingle) {
+    std::uint32_t sampled = 0;
+    if (!ReadU32(command_prompt_, &offset, &sampled, error) || sampled > 1) {
       command_prompt_.clear();
       command_prompt_.shrink_to_fit();
-      SetError(error, "TP control step command is invalid");
+      SetError(error, "TP C1 command sampling flag is invalid");
       return false;
     }
-    parsed.step_token = static_cast<std::int32_t>(token_bits);
-    parsed.step_final = final_flag != 0;
+    parsed.sampled = sampled != 0;
+  } else if (parsed.kind == TpControlCommandKind::kInstruction) {
+    auto& instruction = parsed.instruction;
+    std::uint32_t op = 0;
+    std::uint32_t token_bits = 0;
+    if (!ReadU32(command_prompt_, &offset, &op, error) ||
+        !ReadU64(command_prompt_, &offset, &instruction.index, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.state, error) ||
+        !ReadU32(command_prompt_, &offset, &token_bits, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.offset, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.count, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.prompt_size, error) ||
+        !ReadU64(command_prompt_, &offset, &instruction.digest, error) ||
+        op > static_cast<std::uint32_t>(TpInstructionOp::kEnd)) {
+      command_prompt_.clear();
+      command_prompt_.shrink_to_fit();
+      SetError(error, "TP control instruction is invalid");
+      return false;
+    }
+    instruction.op = static_cast<TpInstructionOp>(op);
+    instruction.token = static_cast<std::int32_t>(token_bits);
   }
   if (offset != command_prompt_.size()) {
     command_prompt_.clear();
@@ -967,35 +1034,6 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
     return false;
   }
   *command = std::move(parsed);
-  return true;
-}
-
-bool TpControlChannel::ReceiveCommandWithin(TpControlCommand* command,
-                                            std::chrono::milliseconds timeout,
-                                            std::string* error) {
-  if (receive_poisoned_.load(std::memory_order_acquire)) {
-    SetError(error, "TP control channel is unusable after a timed-out receive");
-    return false;
-  }
-  // `ReceiveFrame` takes `receive_mutex_` itself, so this must not hold it.
-  const auto bounded = std::max<std::int64_t>(timeout.count(), 1);
-  const timeval window{bounded / 1000, (bounded % 1000) * 1000};
-  (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &window, sizeof(window));
-  const bool received = ReceiveCommand(command, error);
-  // ALWAYS restore the unbounded wait, on failure as well as success. A leaked
-  // SO_RCVTIMEO does not just fail this step: it makes the worker's idle
-  // command wait time out too, so the peer exits with EAGAIN on a path that
-  // must wait indefinitely. The step plan depends on this, because every
-  // consume is a bounded receive on the same socket the command loop uses.
-  ClearReceiveTimeout(fd_);
-  if (!received) {
-    // Only a failure that may have landed mid-frame poisons the channel. A
-    // receive that timed out with nothing at all leaves the stream intact.
-    if (!IsTimeoutOnly(error)) {
-      receive_poisoned_.store(true, std::memory_order_release);
-    }
-    return false;
-  }
   return true;
 }
 
@@ -1169,61 +1207,6 @@ bool TpControlChannel::ReceiveResponse(TpControlResponse* response,
     return false;
   }
   *response = std::move(parsed);
-  return true;
-}
-
-bool TpControlStepPublisher::Publish(std::uint64_t sequence, std::int32_t token,
-                                     bool final, std::string* error) {
-  const TpControlCommand command{.sequence = sequence,
-                                 .kind = TpControlCommandKind::kStep,
-                                 .step_token = token,
-                                 .step_index = next_index_,
-                                 .step_final = final};
-  // The index advances only once the frame is on the wire. A send that fails
-  // must not consume an index, or the consumer's next expectation would skip
-  // one and refuse a perfectly good step.
-  if (!channel_->SendCommand(command, error)) {
-    return false;
-  }
-  ++next_index_;
-  return true;
-}
-
-bool TpControlStepConsumer::Consume(std::uint64_t sequence, std::int32_t* token,
-                                    bool* final,
-                                    std::chrono::milliseconds timeout,
-                                    std::string* error) {
-  if (token == nullptr || final == nullptr) {
-    SetError(error, "TP step consumer requires token and final outputs");
-    return false;
-  }
-  TpControlCommand step;
-  if (!channel_->ReceiveCommandWithin(&step, timeout, error)) {
-    return false;
-  }
-  if (step.kind != TpControlCommandKind::kStep) {
-    SetError(error, "TP step consumer expected a step command");
-    return false;
-  }
-  if (step.sequence != sequence) {
-    SetError(error, "TP step names sequence " + std::to_string(step.sequence) +
-                        " but request " + std::to_string(sequence) +
-                        " is decoding");
-    return false;
-  }
-  if (step.step_index != expected_index_) {
-    SetError(error, "TP step index " + std::to_string(step.step_index) +
-                        " arrived out of order, expected " +
-                        std::to_string(expected_index_));
-    return false;
-  }
-  ++expected_index_;
-  *token = step.step_token;
-  *final = step.step_final;
-  if (step.step_final) {
-    SetError(error, "TP step exchange ended by rank 0 with no token to decode");
-    return false;
-  }
   return true;
 }
 

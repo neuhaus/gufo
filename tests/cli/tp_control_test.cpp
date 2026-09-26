@@ -25,8 +25,7 @@ using gufo::server::TpControlCommandKind;
 using gufo::server::TpControlConfig;
 using gufo::server::TpControlResponse;
 using gufo::server::TpControlResponseKind;
-using gufo::server::TpControlStepConsumer;
-using gufo::server::TpControlStepPublisher;
+using gufo::server::TpInstructionOp;
 using gufo::server::TpPlanDigest;
 using gufo::server::TpResponseBroker;
 using gufo::server::TpResponseExpectation;
@@ -212,114 +211,123 @@ int main() {
               received.client_id == command.client_id,
           "TP control command round trip");
 
-  // kStep is the per-token message that makes rank 0 authoritative: it carries
-  // the token rank 0 sampled so rank 1 feeds that instead of sampling its own.
-  // It belongs to the request named by `sequence` and to no plan of its own, so
-  // the round trip must preserve the three step fields and invent no members.
-  const TpControlCommand step{.sequence = command.sequence,
-                              .kind = TpControlCommandKind::kStep,
-                              .step_token = 4242,
-                              .step_index = 9,
-                              .step_final = true};
-  std::string step_error;
-  Require(ValidateTpControlCommand(step, &step_error), step_error);
-  Require(server->SendCommand(step, &server_error), server_error);
-  TpControlCommand received_step;
-  Require(client->ReceiveCommand(&received_step, &client_error), client_error);
-  Require(received_step.sequence == step.sequence &&
-              received_step.kind == TpControlCommandKind::kStep &&
-              received_step.members.empty() &&
-              received_step.step_token == step.step_token &&
-              received_step.step_index == step.step_index &&
-              received_step.step_final == step.step_final,
-          "TP step command round trip");
+  // A C1 command carries whether the request samples, because rank 1 checks
+  // rank 0's tokens against its own greedy choice only for greedy requests.
+  {
+    TpControlCommand sampled = command;
+    sampled.sequence = 8;
+    sampled.sampled = true;
+    Require(server->SendCommand(sampled, &server_error), server_error);
+    TpControlCommand received_sampled;
+    Require(client->ReceiveCommand(&received_sampled, &client_error),
+            client_error);
+    Require(received_sampled.sampled && !received.sampled,
+            "TP C1 command preserves the sampling flag");
+  }
 
-  // A non-final step must not be mistaken for a final one, and a negative
-  // token must survive the u32 round trip by bit pattern rather than clamping.
-  const TpControlCommand mid_step{.sequence = command.sequence,
-                                  .kind = TpControlCommandKind::kStep,
-                                  .step_token = -7,
-                                  .step_index = 0,
-                                  .step_final = false};
-  Require(server->SendCommand(mid_step, &server_error), server_error);
-  TpControlCommand received_mid;
-  Require(client->ReceiveCommand(&received_mid, &client_error), client_error);
-  Require(received_mid.step_token == -7 && received_mid.step_index == 0 &&
-              !received_mid.step_final,
-          "TP step command preserves a negative token and a non-final flag");
+  // An instruction is one model call for rank 1 to execute within the request
+  // named by `sequence`. Every argument must survive the round trip exactly,
+  // and a negative token must survive by bit pattern for validation to see it.
+  const auto round_trip = [&](const TpControlCommand& sent) {
+    std::string why;
+    Require(ValidateTpControlCommand(sent, &why), why);
+    Require(server->SendCommand(sent, &server_error), server_error);
+    TpControlCommand got;
+    Require(client->ReceiveCommand(&got, &client_error), client_error);
+    Require(got.sequence == sent.sequence &&
+                got.kind == TpControlCommandKind::kInstruction &&
+                got.members.empty() && got.prompt_tokens.empty() &&
+                got.instruction == sent.instruction,
+            "TP instruction round trip");
+  };
+  const TpControlCommand prefill{
+      .sequence = command.sequence,
+      .kind = TpControlCommandKind::kInstruction,
+      .instruction = {.op = TpInstructionOp::kPrefill,
+                      .index = 9,
+                      .state = 1,
+                      .offset = 512,
+                      .count = 512,
+                      .prompt_size = 2054}};
+  round_trip(prefill);
+  round_trip(
+      {.sequence = command.sequence,
+       .kind = TpControlCommandKind::kInstruction,
+       .instruction = {
+           .op = TpInstructionOp::kAdvance, .index = 10, .token = 248068}});
+  round_trip({.sequence = command.sequence,
+              .kind = TpControlCommandKind::kInstruction,
+              .instruction = {
+                  .op = TpInstructionOp::kDecode, .index = 11, .count = 8}});
+  round_trip({.sequence = command.sequence,
+              .kind = TpControlCommandKind::kInstruction,
+              .instruction = {.op = TpInstructionOp::kEnd,
+                              .index = 12,
+                              .count = 3,
+                              .digest = 0xfedcba9876543210ULL}});
+  // A reset is the one call the continuation cache can make between requests.
+  round_trip(
+      {.sequence = 0,
+       .kind = TpControlCommandKind::kInstruction,
+       .instruction = {
+           .op = TpInstructionOp::kInvalidate, .index = 13, .state = 0}});
 
-  // Every field below belongs to the request a step belongs to, not to the step
-  // itself. A step carrying one is a disagreement between the two messages, so
-  // it must be refused rather than reconciled -- and refused on the wire, not
-  // only by the validator, because that is the path a peer exercises.
+  // A malformed instruction must be refused by the validator and on the wire,
+  // because the wire is the path a peer exercises.
   TpPlanDigest nonzero_digest{};
   nonzero_digest[0] = 1;
-  const auto refuses_step = [&](const std::string& what,
-                                const TpControlCommand& bad) {
+  const auto refuses = [&](const std::string& what,
+                           const TpControlCommand& bad) {
     std::string why;
-    Require(!ValidateTpControlCommand(bad, &why) && !why.empty(),
-            "TP step validation must refuse " + what + ", but said: " + why);
+    Require(
+        !ValidateTpControlCommand(bad, &why) && !why.empty(),
+        "TP instruction validation must refuse " + what + ", but said: " + why);
     std::string send_why;
-    Require(!server->SendCommand(bad, &send_why) && !send_why.empty(),
-            "TP step send must refuse " + what + ", but said: " + send_why);
+    Require(
+        !server->SendCommand(bad, &send_why) && !send_why.empty(),
+        "TP instruction send must refuse " + what + ", but said: " + send_why);
   };
+  const auto with = [&](auto change) {
+    TpControlCommand bad = prefill;
+    change(bad);
+    return bad;
+  };
+  // Fields that belong to the request, not to one of its calls.
+  refuses("a member", with([&](auto& bad) {
+            bad.members = {{.member_id = command.sequence, .max_tokens = 4}};
+          }));
+  refuses("a prompt", with([](auto& bad) { bad.prompt_tokens = {10, 11}; }));
+  refuses("a token budget", with([](auto& bad) { bad.max_tokens = 4; }));
+  refuses("a cache request", with([](auto& bad) { bad.cache_prompt = true; }));
+  refuses("a cache prefix",
+          with([](auto& bad) { bad.cache_prefix_tokens = 2; }));
+  refuses("a client id", with([](auto& bad) { bad.client_id = "probe"; }));
+  refuses("a sampling flag", with([](auto& bad) { bad.sampled = true; }));
+  refuses("a cohort scope", with([](auto& bad) { bad.cohort_id = 3; }));
+  refuses("an execution-plan digest",
+          with([&](auto& bad) { bad.execution_plan_digest = nonzero_digest; }));
+  refuses("a cache-plan digest",
+          with([&](auto& bad) { bad.cache_plan_digest = nonzero_digest; }));
+  // Arguments that do not fit the operation.
+  refuses("an empty prefill",
+          with([](auto& bad) { bad.instruction.count = 0; }));
+  refuses("a prefill past its prompt",
+          with([](auto& bad) { bad.instruction.prompt_size = 512; }));
+  refuses("a prefill carrying a token",
+          with([](auto& bad) { bad.instruction.token = 5; }));
+  refuses("a negative token", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kAdvance, .token = -7};
+          }));
+  refuses("a one-token decode", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kDecode, .count = 1};
+          }));
+  refuses("a missing operation", with([](auto& bad) { bad.instruction = {}; }));
+  refuses("a model call outside a request",
+          with([](auto& bad) { bad.sequence = 0; }));
   {
-    TpControlCommand bad = step;
-    bad.sequence = 0;
-    refuses_step("a zero sequence", bad);
-  }
-  // Rank zero's per-token messages name the request they belong to, and the
-  // first request a server serves is sequence 1, not 0. A step naming sequence
-  // zero is refused above, so a server whose sequence counter started at zero
-  // would fail every step of its first request -- found on hardware, where the
-  // symptom was the peer starving rather than an obvious counter bug.
-  Require(step.sequence != 0,
-          "TP step commands must name a live request, so the first served "
-          "sequence cannot be zero");
-  {
-    TpControlCommand bad = step;
-    bad.members = {{.member_id = command.sequence, .max_tokens = 4}};
-    refuses_step("a member", bad);
-  }
-  {
-    TpControlCommand bad = step;
-    bad.prompt_tokens = {10, 11, 12};
-    refuses_step("a prompt", bad);
-  }
-  {
-    TpControlCommand bad = step;
-    bad.max_tokens = 4;
-    refuses_step("a token budget", bad);
-  }
-  {
-    TpControlCommand bad = step;
-    bad.cache_prompt = true;
-    refuses_step("a cache request", bad);
-  }
-  {
-    TpControlCommand bad = step;
-    bad.cache_prefix_tokens = 2;
-    refuses_step("a cache prefix", bad);
-  }
-  {
-    TpControlCommand bad = step;
-    bad.client_id = "probe";
-    refuses_step("a client id", bad);
-  }
-  {
-    TpControlCommand bad = step;
-    bad.cohort_id = 3;
-    refuses_step("a cohort scope", bad);
-  }
-  {
-    TpControlCommand bad = step;
-    bad.execution_plan_digest = nonzero_digest;
-    refuses_step("an execution-plan digest", bad);
-  }
-  {
-    TpControlCommand bad = step;
-    bad.cache_plan_digest = nonzero_digest;
-    refuses_step("a cache-plan digest", bad);
+    TpControlCommand bad = command;
+    bad.instruction = {.op = TpInstructionOp::kAdvance, .token = 1};
+    refuses("an instruction on a request command", bad);
   }
 
   TpControlResponse response{.sequence = received.sequence,
@@ -758,168 +766,8 @@ int main() {
   Require(server->port() == port && client->port() == port,
           "TP control service port");
 
-  // A bounded receive must return a command that arrives inside the bound, and
-  // must hand the socket back to the unbounded command wait afterwards rather
-  // than leaking a per-token bound into the next one.
-  {
-    const TpControlCommand prompt_step{
-        .sequence = command.sequence,
-        .kind = TpControlCommandKind::kStep,
-        .step_token = 1234,
-        .step_index = 3,
-    };
-    std::thread prompt_sender(
-        [&] { (void)server->SendCommand(prompt_step, &server_error); });
-    TpControlCommand within;
-    std::string within_error;
-    Require(client->ReceiveCommandWithin(&within, std::chrono::seconds(10),
-                                         &within_error),
-            "TP bounded receive must return a command inside its bound: " +
-                within_error);
-    prompt_sender.join();
-    Require(within.kind == TpControlCommandKind::kStep &&
-                within.step_token == 1234 && within.step_index == 3,
-            "TP bounded receive preserves the step it waited for");
-
-    // The next command is not sent yet, so this must simply keep waiting: the
-    // bound applied to the step must not have become the command wait's bound.
-    std::thread late_sender([&] {
-      std::this_thread::sleep_for(std::chrono::milliseconds(400));
-      (void)server->SendCommand(command, &server_error);
-    });
-    TpControlCommand late;
-    std::string late_error;
-    Require(client->ReceiveCommand(&late, &late_error),
-            "TP command wait is unbounded again after a bounded receive: " +
-                late_error);
-    late_sender.join();
-    Require(
-        late.sequence == command.sequence,
-        "TP unbounded command wait returns the command sent after the step");
-  }
-
-  // A bounded receive that expires must fail closed, and must NOT poison the
-  // channel: a timeout with nothing read leaves the byte stream intact, so the
-  // next receive is still well defined. Poisoning here is what made the
-  // worker's idle command wait fail with EAGAIN on hardware -- a leaked
-  // per-token bound that ended a path required to wait indefinitely. Nor may
-  // the bound leak: the socket must be back to an unbounded wait.
-  {
-    TpControlCommand expired;
-    std::string expired_error;
-    Require(!client->ReceiveCommandWithin(
-                &expired, std::chrono::milliseconds(150), &expired_error) &&
-                !expired_error.empty(),
-            "TP bounded receive must fail when the bound expires");
-
-    // A later command must still arrive on the same socket. If the timeout had
-    // poisoned the channel this fails; if the bound had leaked it would time
-    // out here instead, since the sender is slower than a 150 ms bound.
-    std::thread late_sender([&] {
-      std::this_thread::sleep_for(std::chrono::milliseconds(300));
-      (void)server->SendCommand(command, &server_error);
-    });
-    TpControlCommand after_timeout;
-    std::string after_error;
-    const bool recovered = client->ReceiveCommandWithin(
-        &after_timeout, std::chrono::seconds(10), &after_error);
-    late_sender.join();
-    Require(recovered && after_timeout.sequence == command.sequence,
-            "TP bounded receive recovers after a clean timeout, and the bound "
-            "did not leak into the next wait: " +
-                after_error);
-  }
-
-  // The step bridge needs its own channel pair: the bounded-receive test above
-  // deliberately poisoned the first client, and a poisoned channel refuses
-  // every later receive by design.
-  {
-    const auto bridge_port = FreePort();
-    std::string bridge_client_error;
-    std::shared_ptr<TpControlChannel> bridge_client;
-    std::thread bridge_connector([&] {
-      bridge_client = TpControlChannel::Connect("127.0.0.1", bridge_port,
-                                                &bridge_client_error);
-    });
-    std::string bridge_server_error;
-    auto bridge_server =
-        TpControlChannel::Listen(bridge_port, &bridge_server_error);
-    bridge_connector.join();
-    Require(bridge_server != nullptr && bridge_client != nullptr,
-            "TP step bridge pair connects");
-    bool bridge_server_handshake = false;
-    bool bridge_client_handshake = false;
-    std::thread bridge_server_thread([&] {
-      bridge_server_handshake =
-          bridge_server->Handshake(rank0, &bridge_server_error);
-    });
-    std::thread bridge_client_thread([&] {
-      bridge_client_handshake =
-          bridge_client->Handshake(rank1, &bridge_client_error);
-    });
-    bridge_server_thread.join();
-    bridge_client_thread.join();
-    Require(bridge_server_handshake && bridge_client_handshake,
-            "TP step bridge pair handshakes: " + bridge_server_error);
-
-    TpControlStepPublisher publisher(bridge_server);
-    TpControlStepConsumer consumer(bridge_client);
-    const std::uint64_t exchange = 42;
-
-    // A token published by rank 0 is the token rank 1 decodes, in order.
-    for (const std::int32_t token : {11, 22, 33}) {
-      std::string publish_error;
-      std::thread publish_thread([&] {
-        (void)publisher.Publish(exchange, token, false, &publish_error);
-      });
-      std::int32_t consumed = 0;
-      bool final = true;
-      std::string consume_error;
-      Require(consumer.Consume(exchange, &consumed, &final,
-                               std::chrono::seconds(10), &consume_error),
-              "TP step bridge delivers a published token: " + consume_error);
-      publish_thread.join();
-      Require(consumed == token && !final,
-              "TP step bridge returns rank 0's token, not its own");
-    }
-
-    // A step naming another request must be refused: the protocol proves it is
-    // well formed, but only the in-flight sequence proves it belongs here.
-    {
-      std::string publish_error;
-      std::thread publish_thread([&] {
-        (void)publisher.Publish(exchange + 1, 44, false, &publish_error);
-      });
-      std::int32_t consumed = 0;
-      bool final = false;
-      std::string consume_error;
-      Require(!consumer.Consume(exchange, &consumed, &final,
-                                std::chrono::seconds(10), &consume_error) &&
-                  !consume_error.empty(),
-              "TP step bridge must refuse a step for another request");
-      publish_thread.join();
-    }
-
-    // Rank 0 ending the exchange is a failure for the consumer, not an empty
-    // token: it has nothing to hand the scheduler and must not pretend
-    // otherwise.
-    {
-      std::string publish_error;
-      std::thread publish_thread(
-          [&] { (void)publisher.Publish(exchange, 0, true, &publish_error); });
-      std::int32_t consumed = 0;
-      bool final = false;
-      std::string consume_error;
-      Require(!consumer.Consume(exchange, &consumed, &final,
-                                std::chrono::seconds(10), &consume_error) &&
-                  !consume_error.empty(),
-              "TP step bridge must fail when rank 0 ends the exchange");
-      publish_thread.join();
-    }
-  }
-
   std::puts(
-      "PASS: TP control handshake, C1/C2 envelopes, step messages, "
-      "bounded receive, step bridge, and broker routing");
+      "PASS: TP control handshake, C1/C2 envelopes, instructions, and "
+      "broker routing");
   return 0;
 }

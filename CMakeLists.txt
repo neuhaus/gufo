@@ -216,8 +216,7 @@ add_executable(gufo
   src/cli/serve/continuation_disk_store.cpp
   src/cli/serve/text_model_runner.cpp
   src/cli/serve/text_generation_scheduler.cpp
-  src/cli/serve/tp_cohort_plan.cpp
-  src/cli/serve/tp_cohort_worker.cpp
+  src/cli/serve/tp_executor.cpp
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
 )
@@ -354,10 +353,25 @@ if (BUILD_TESTING)
 
   # A measurement, not a gate: it asserts no threshold and never fails on a
   # slow result, so it is labelled `perf` and kept out of the correctness run.
-  add_executable(tp_step_latency_test tests/cli/tp_step_latency_test.cpp)
-  target_link_libraries(tp_step_latency_test PRIVATE gufo_tp_control)
-  add_test(NAME tp_step_latency_test COMMAND tp_step_latency_test)
-  set_tests_properties(tp_step_latency_test PROPERTIES LABELS "cpu;tp2;perf" TIMEOUT 300)
+  add_executable(tp_instruction_latency_test
+    tests/cli/tp_instruction_latency_test.cpp)
+  target_link_libraries(tp_instruction_latency_test PRIVATE gufo_tp_control)
+  add_test(NAME tp_instruction_latency_test
+    COMMAND tp_instruction_latency_test)
+  set_tests_properties(tp_instruction_latency_test PROPERTIES
+    LABELS "cpu;tp2;perf" TIMEOUT 300)
+
+  add_executable(tp_executor_test
+    tests/cli/tp_executor_test.cpp
+    src/cli/serve/continuation_cache.cpp
+    src/cli/serve/continuation_disk_store.cpp
+    src/cli/serve/text_model_runner.cpp
+    src/cli/serve/text_generation_scheduler.cpp
+    src/cli/serve/tp_executor.cpp)
+  target_link_libraries(tp_executor_test PRIVATE
+    gufo_logging gufo_core gufo_tp_control)
+  add_test(NAME tp_executor_test COMMAND tp_executor_test)
+  set_tests_properties(tp_executor_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 60)
 
   add_executable(tp_cohort_plan_test
     tests/cli/tp_cohort_plan_test.cpp
