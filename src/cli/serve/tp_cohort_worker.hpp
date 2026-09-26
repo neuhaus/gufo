@@ -88,8 +88,8 @@ struct TpCohortWorkerHooks {
 /// per-request `StepDecode` (text_generation_scheduler.cpp:709), one at a time,
 /// in whatever order the scheduler selects.
 ///
-/// That order is not carried on the wire, so the two ranks' collective sequences
-/// stop being guaranteed to match. A mismatch would also be silent: a
+/// That order is not carried on the wire, so the two ranks' collective
+/// sequences stop being guaranteed to match. A mismatch would also be silent: a
 /// single-row decode is `hidden * 4` bytes for either member, so ordinal N on
 /// one rank can pair with ordinal N on the other for a *different* member
 /// without tripping the communicator's scope/ordinal/bytes header check. Any

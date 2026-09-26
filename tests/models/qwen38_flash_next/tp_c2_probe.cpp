@@ -1068,9 +1068,8 @@ std::uint64_t TokenChecksum(std::span<const std::int32_t> tokens) {
   std::uint64_t hash = 1469598103934665603ULL;
   for (const std::int32_t token : tokens) {
     for (int byte = 0; byte < 4; ++byte) {
-      hash ^= static_cast<std::uint8_t>((static_cast<std::uint32_t>(token) >>
-                                          (8 * byte)) &
-                                         0xFFU);
+      hash ^= static_cast<std::uint8_t>(
+          (static_cast<std::uint32_t>(token) >> (8 * byte)) & 0xFFU);
       hash *= 1099511628211ULL;
     }
   }
@@ -1113,9 +1112,8 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
 
   std::array<std::unique_ptr<q::Session>, kMemberCount> session;
   for (std::size_t index = 0; index < kMemberCount; ++index) {
-    session[index] =
-        model->CreateSession(gufo::core::SessionMode::kAutoregressive, context,
-                             error);
+    session[index] = model->CreateSession(
+        gufo::core::SessionMode::kAutoregressive, context, error);
     if (!session[index]) {
       return kTransportFailure;
     }
@@ -1127,10 +1125,10 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
          std::to_string(kBatchedScope) + ": " + *error);
     return kTransportFailure;
   }
-  Say(role, "batched scope bound: " + std::to_string(kBatchedScope) +
-                ", prefill_capacity=" +
-                std::to_string(model->PrefillCapacity()) + " budget=" +
-                std::to_string(budget));
+  Say(role,
+      "batched scope bound: " + std::to_string(kBatchedScope) +
+          ", prefill_capacity=" + std::to_string(model->PrefillCapacity()) +
+          " budget=" + std::to_string(budget));
 
   // Prefill stays per-session and per-member: `Prefill` is per-state and has no
   // batch form in the runner or the engine, so a width-2 program chunks member
@@ -1206,8 +1204,8 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
     }
     // The per-step member set is the schedule. It must be identical on both
     // ranks, so it is logged rather than inferred.
-    Say(role, "batched step " + std::to_string(step) + " rows=" +
-                  std::to_string(rows) + " members=" +
+    Say(role, "batched step " + std::to_string(step) +
+                  " rows=" + std::to_string(rows) + " members=" +
                   (included.empty() ? std::string("none") : included));
     if (rows == 0) {
       break;
@@ -1227,14 +1225,14 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
     return kTransportFailure;
   }
   for (std::size_t index = 0; index < kMemberCount; ++index) {
-    Say(role, "batched member " + std::to_string(index) + " tokens=" +
-                  TokenListText(trace[index].tokens) + " count=" +
-                  std::to_string(trace[index].tokens.size()) + " checksum=" +
-                  std::to_string(TokenChecksum(trace[index].tokens)) +
-                  " decode_forwards=" +
-                  std::to_string(trace[index].decode_forwards) +
-                  (trace[index].stopped_on_token ? " stop_token" : "") +
-                  (trace[index].stopped_on_budget ? " budget" : ""));
+    Say(role,
+        "batched member " + std::to_string(index) +
+            " tokens=" + TokenListText(trace[index].tokens) +
+            " count=" + std::to_string(trace[index].tokens.size()) +
+            " checksum=" + std::to_string(TokenChecksum(trace[index].tokens)) +
+            " decode_forwards=" + std::to_string(trace[index].decode_forwards) +
+            (trace[index].stopped_on_token ? " stop_token" : "") +
+            (trace[index].stopped_on_budget ? " budget" : ""));
   }
   return kOk;
 }
@@ -1886,7 +1884,8 @@ int main(int argc, char** argv) {
         return kTransportFailure;
       }
       if (batched_model->HasMtp()) {
-        Warn("batched-w2 model reports an MTP sidecar, which this mode refuses");
+        Warn(
+            "batched-w2 model reports an MTP sidecar, which this mode refuses");
         return kInvalidArguments;
       }
       std::vector<std::int32_t> batched_prompt[kMemberCount];
@@ -1911,7 +1910,7 @@ int main(int argc, char** argv) {
         }
       }
       return RunBatchedW2("rank1", batched_model, batched_prompt, budget,
-                           context, collectives, &batched_error);
+                          context, collectives, &batched_error);
     }
     const MtpSidecar mtp{
         .model_path = mtp_model_path,
@@ -1995,8 +1994,8 @@ int main(int argc, char** argv) {
         return kInvalidArguments;
       }
     }
-    return RunBatchedW2("rank0", batched_model, batched_prompt, budget,
-                         context, collectives, &error);
+    return RunBatchedW2("rank0", batched_model, batched_prompt, budget, context,
+                        collectives, &error);
   }
 
   // 2. The rank-zero control peer listens; the worker connects and both
