@@ -56,7 +56,6 @@ struct TextTpConfig {
   std::uint32_t rank{0};
   std::uint32_t world_size{1};
   int hip_device{0};
-  bool allow_cache_reuse{false};
   std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> communicator;
   std::shared_ptr<TpControlChannel> control;
   std::string auth_token;

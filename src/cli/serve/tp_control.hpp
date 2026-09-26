@@ -16,12 +16,12 @@
 namespace gufo::server {
 
 struct TpControlConfig {
+  std::uint64_t snapshot_budget_bytes{0};
   std::uint32_t rank{0};
   std::uint32_t world_size{1};
   std::uint32_t max_context{4096};
   std::uint32_t max_draft_tokens{7};
   bool use_mtp{false};
-  bool allow_cache_reuse{false};
   std::string auth_token;
   std::uint32_t prefill_chunk_tokens{512};
 };
@@ -54,6 +54,11 @@ enum class TpInstructionOp : std::uint8_t {
   /// The request is over. `count` is the number of instructions rank 0 sent
   /// for it and `digest` its execution digest; rank 1 compares both.
   kEnd = 5,
+  kSnapshot = 6,
+  kDrop = 7,
+  kRestore = 8,
+  kReuse = 9,
+  kCancelPrepare = 10,
 };
 
 struct TpInstruction {
@@ -70,12 +75,15 @@ struct TpInstruction {
   /// none) before the call.
   std::uint64_t rng{0};
   std::int32_t pending{-1};
+  std::uint64_t snapshot_id{0};
 
   bool operator==(const TpInstruction&) const = default;
 };
 
 enum class TpControlResponseKind : std::uint8_t {
   kSingle = 1,
+  /// Completion of a cache operation, before either rank can forward again.
+  kInstruction = 3,
   /// Response envelope for the dormant C2 control contract.
   kCohort2Ar = 2,
 };
@@ -126,6 +134,7 @@ struct TpControlCommand {
 };
 
 struct TpControlResponse {
+  std::uint64_t instruction_index{0};
   /// Response broker correlation key. C1 worker fields remain
   /// source-compatible.
   std::uint64_t sequence{0};
@@ -217,6 +226,9 @@ public:
   /// Wake a blocked directional reader/writer during broker shutdown.
   void Interrupt() noexcept;
 
+  [[nodiscard]] std::uint64_t snapshot_budget_bytes() const noexcept {
+    return snapshot_budget_bytes_;
+  }
   [[nodiscard]] std::uint16_t port() const noexcept;
   [[nodiscard]] std::uint32_t rank() const noexcept;
   [[nodiscard]] std::uint32_t world_size() const noexcept;
@@ -240,6 +252,7 @@ private:
   std::uint32_t world_size_{1};
   std::uint32_t max_context_{0};
   bool handshaken_{false};
+  std::uint64_t snapshot_budget_bytes_{0};
   std::string auth_token_;
   std::mutex send_mutex_;
   std::mutex receive_mutex_;
@@ -261,6 +274,11 @@ public:
   TpResponseBroker& operator=(const TpResponseBroker&) = delete;
   TpResponseBroker(TpResponseBroker&&) = delete;
   TpResponseBroker& operator=(TpResponseBroker&&) = delete;
+
+  [[nodiscard]] bool RegisterInstruction(std::uint64_t sequence,
+                                         std::uint64_t index,
+                                         std::string* error);
+  [[nodiscard]] bool WaitForInstruction(std::string* error);
 
   [[nodiscard]] bool RegisterPendingResponse(std::uint64_t sequence,
                                              std::string* error);

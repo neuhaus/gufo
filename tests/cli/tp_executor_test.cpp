@@ -14,8 +14,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -83,11 +85,26 @@ using CallLog = std::vector<std::string>;
 
 struct ToyOptions {
   bool mtp{false};
+  bool cache{false};
+  bool fail_capture_once{false};
+  bool fail_restore_once{false};
+  std::size_t cache_budget{4096};
+  std::function<void()> capture_hook;
   std::size_t prefill_chunk{3};
   /// Rank-1 faults: shift the greedy choice once, at this sequence length.
   std::optional<std::size_t> diverge_at;
   /// Rank-1 fault: report one extra draft in the next multi-token step.
   bool extra_draft_once{false};
+};
+
+class ToySnapshot final : public gufo::server::TextRunnerSnapshot {
+public:
+  explicit ToySnapshot(std::vector<TextRunnerToken> tokens)
+      : tokens(std::move(tokens)) {}
+  std::size_t PayloadBytes() const noexcept override {
+    return tokens.size() * sizeof(TextRunnerToken);
+  }
+  std::vector<TextRunnerToken> tokens;
 };
 
 class ToyRunner;
@@ -130,10 +147,12 @@ public:
             .max_context = 256,
             .capabilities = TextRunnerCapabilities{
                 .incremental_prefill = true,
+                .snapshot = options_.cache,
+                .fork = options_.cache,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = options_.mtp,
-                .prefix_reuse = true,
+                .prefix_reuse = options_.cache,
             }};
   }
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
@@ -141,7 +160,8 @@ public:
             .state_capacity_bytes = 8 * 64,
             .per_request_state_bytes = 64,
             .temporary_scratch_bytes = 0,
-            .retained_snapshot_capacity_bytes = 0,
+            .retained_snapshot_capacity_bytes =
+                options_.cache ? options_.cache_budget : 0U,
             .requires_device_runtime_lock = true};
   }
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
@@ -169,9 +189,38 @@ public:
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
     return std::make_unique<ToyState>(this, next_state_++);
   }
-  void PreparePrefixReuse(TextRunnerState&,
-                          std::span<const TextRunnerToken>) const override {
-    Record("unexpected prefix reuse");
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    Require(std::ranges::equal(Toy(state).tokens, prefix),
+            "reused prefix equals state");
+    Record("reuse " + std::to_string(prefix.size()));
+  }
+  std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    return CheckpointPosition(state) * sizeof(TextRunnerToken);
+  }
+  std::unique_ptr<gufo::server::TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    if (options_.capture_hook)
+      options_.capture_hook();
+    if (options_.fail_capture_once) {
+      options_.fail_capture_once = false;
+      throw std::runtime_error("injected capture failure");
+    }
+    Record("snapshot " + std::to_string(CheckpointPosition(state)));
+    return std::make_unique<ToySnapshot>(
+        dynamic_cast<const ToyState&>(state).tokens);
+  }
+  void RestoreOrFork(
+      TextRunnerState& state,
+      const gufo::server::TextRunnerSnapshot& snapshot) const override {
+    if (options_.fail_restore_once) {
+      options_.fail_restore_once = false;
+      throw std::runtime_error("injected restore failure");
+    }
+    Toy(state).tokens = dynamic_cast<const ToySnapshot&>(snapshot).tokens;
+    Record("restore " + std::to_string(CheckpointPosition(state)));
   }
 
   [[nodiscard]] TextPrefillStep Prefill(
@@ -330,16 +379,19 @@ public:
     Require(server_ok && client_ok,
             "handshake: " + server_error + client_error);
 
-    sink_ = std::make_shared<TpControlInstructionSink>(server_);
+    broker_ = std::make_shared<gufo::server::TpResponseBroker>(server_, 1);
+    sink_ = std::make_shared<TpControlInstructionSink>(server_, broker_);
     mirrored_ = std::make_shared<TpMirroredRunner>(inner0_, sink_);
-    scheduler_ = std::make_shared<TextGenerationScheduler>(
-        std::make_shared<TextRunnerPool>(mirrored_, 1));
+    pool_ = std::make_shared<TextRunnerPool>(mirrored_, 1);
+    scheduler_ = std::make_shared<TextGenerationScheduler>(pool_);
     executor_ = std::make_unique<TpExecutor>(runner1_, 1);
     worker_ = std::thread([this] { Work(); });
   }
 
   ~Pair() {
     scheduler_.reset();
+    pool_.reset();
+    broker_->FailAll("test finished");
     server_.reset();
     client_->Interrupt();
     worker_.join();
@@ -353,7 +405,8 @@ public:
   Outcome Run(std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
               gufo::sampling::SamplingConfig sampling = {},
               std::vector<std::string> stop_sequences = {},
-              TextGenerationScheduler::CancellationCheck is_cancelled = {}) {
+              TextGenerationScheduler::CancellationCheck is_cancelled = {},
+              bool reuse = false, std::size_t prefix = 0) {
     const auto sequence = next_sequence_++;
     TpControlCommand begin{.sequence = sequence,
                            .max_tokens = static_cast<std::uint32_t>(max_tokens),
@@ -363,19 +416,32 @@ public:
       begin.prompt_tokens.push_back(static_cast<std::int32_t>(token));
     }
     std::string error;
+    Require(broker_->RegisterPendingResponse(sequence, &error),
+            "register: " + error);
     Require(server_->SendCommand(begin, &error), "begin: " + error);
     mirrored_->BeginRequest(sequence);
     TextRequestMetadata metadata;
-    metadata.cache_prompt = false;
+    metadata.cache_prompt = reuse;
+    metadata.cache_prefix_tokens = prefix;
     metadata.stop_sequences = std::move(stop_sequences);
     auto request = scheduler_->Submit(std::move(prompt), max_tokens, sampling,
-                                      is_cancelled, false, std::move(metadata));
-    Outcome outcome{.result = request.Wait(), .worker_error = {}};
+                                      is_cancelled, reuse, std::move(metadata));
+    Outcome outcome;
+    std::string local_error;
+    try {
+      outcome.result = request.Wait();
+    } catch (const std::exception& exception) {
+      local_error = exception.what();
+    }
     Require(mirrored_->EndRequest(&error), "end: " + error);
     TpControlResponse response;
-    Require(server_->ReceiveResponse(&response, &error), "response: " + error);
+    Require(broker_->WaitForResponse(sequence, &response, &error),
+            "response: " + error);
     Require(response.sequence == sequence, "response sequence");
-    outcome.worker_error = response.error;
+    outcome.worker_error =
+        response.error.empty() ? local_error : response.error;
+    if (!response.error.empty())
+      ClearCache();
     return outcome;
   }
 
@@ -404,6 +470,25 @@ public:
     Require(worker_failure_.empty(), what + ": worker " + worker_failure_);
   }
 
+  std::size_t snapshots() const { return worker_snapshots_.load(); }
+  void ClearCache() {
+    pool_->ClearCache();
+    // An empty execution request fences idle drops without taking another
+    // snapshot (cache_prompt=false only disables lookups, not capture).
+    const auto sequence = next_sequence_++;
+    std::string error;
+    Require(broker_->RegisterPendingResponse(sequence, &error), error);
+    Require(server_->SendCommand(
+                {.sequence = sequence, .max_tokens = 1, .prompt_tokens = {1}},
+                &error),
+            error);
+    mirrored_->BeginRequest(sequence);
+    Require(mirrored_->EndRequest(&error), error);
+    TpControlResponse response;
+    Require(broker_->WaitForResponse(sequence, &response, &error), error);
+    Require(response.error.empty(), response.error);
+  }
+
   const ToyRunner& rank0() const { return *inner0_; }
   const ToyRunner& rank1() const { return *runner1_; }
 
@@ -428,10 +513,14 @@ private:
               [this](TpControlCommand* next, std::string* receive_error) {
                 return client_->ReceiveCommand(next, receive_error);
               },
+              [this](const TpControlResponse& ack, std::string* error) {
+                return client_->SendResponse(ack, error);
+              },
               &outcome, &error)) {
         worker_failure_ = error;
         return;
       }
+      worker_snapshots_ = executor_->snapshot_count();
       const TpControlResponse response{.sequence = command.sequence,
                                        .error = outcome};
       if (!client_->SendResponse(response, &error)) {
@@ -445,12 +534,15 @@ private:
   std::shared_ptr<ToyRunner> runner1_;
   std::shared_ptr<TpControlChannel> server_;
   std::shared_ptr<TpControlChannel> client_;
+  std::shared_ptr<gufo::server::TpResponseBroker> broker_;
+  std::shared_ptr<TextRunnerPool> pool_;
   std::shared_ptr<TpControlInstructionSink> sink_;
   std::shared_ptr<TpMirroredRunner> mirrored_;
   std::shared_ptr<TextGenerationScheduler> scheduler_;
   std::unique_ptr<TpExecutor> executor_;
   std::thread worker_;
   std::string worker_failure_;
+  std::atomic<std::size_t> worker_snapshots_{0};
   std::uint64_t next_sequence_{1};
 };
 
@@ -474,6 +566,165 @@ gufo::sampling::SamplingConfig Sampled() {
 
 int main() {
   const std::vector<TextRunnerToken> prompt{5, 9, 13, 17, 21, 3, 8};
+
+  for (const bool mtp : {false, true}) {
+    Pair pair({.mtp = mtp, .cache = true}, {.mtp = mtp, .cache = true});
+    const auto sampling = mtp ? Sampled() : gufo::sampling::SamplingConfig{};
+    const auto first = pair.Run(prompt, 6, sampling, {}, {}, true);
+    Require(first.worker_error.empty(), "cached first: " + first.worker_error);
+    const auto again = pair.Run(prompt, 6, sampling, {}, {}, true);
+    Require(again.worker_error.empty(),
+            "cached restore: " + again.worker_error);
+    Require(first.result.tokens == again.result.tokens,
+            "restore preserves outputs");
+    Require(again.result.cached_prompt_tokens == prompt.size(),
+            "identical replay restores the whole prompt, as on one host");
+    pair.RequireSameCalls("snapshot reuse");
+    auto branch = prompt;
+    branch.push_back(11);
+    const auto fork = pair.Run(branch, 4, sampling, {}, {}, true);
+    Require(fork.worker_error.empty(), "branch: " + fork.worker_error);
+    Require(fork.result.cached_prompt_tokens == prompt.size(),
+            "older boundary restored");
+    pair.RequireSameCalls("branch reuse");
+    (void)pair.Run(prompt, 6, sampling, {}, {}, true);
+    auto continuation = prompt;
+    continuation.insert(continuation.end(), again.result.tokens.begin(),
+                        again.result.tokens.end());
+    continuation.push_back(7);
+    const auto live = pair.Run(continuation, 4, sampling, {}, {}, true);
+    Require(live.worker_error.empty(), "live: " + live.worker_error);
+    Require(live.result.cached_prompt_tokens > prompt.size(),
+            "live frontier reused");
+    pair.RequireSameCalls("live reuse");
+  }
+  // A capture that fails on either rank only skips the snapshot, as on one
+  // host: the request succeeds, and no rank keeps a copy the other lacks.
+  for (const bool rank0_fails : {false, true}) {
+    Pair pair({.cache = true, .fail_capture_once = rank0_fails},
+              {.cache = true, .fail_capture_once = !rank0_fails});
+    const auto first = pair.Run(prompt, 6, {}, {}, {}, true);
+    Require(first.worker_error.empty(),
+            "failed capture is not a failed request: " + first.worker_error);
+    Require(pair.snapshots() == 0, "failed capture leaves no worker copy");
+    const auto next = pair.Run(prompt, 6, {}, {}, {}, true);
+    Require(next.worker_error.empty(),
+            "request after failed capture: " + next.worker_error);
+    Require(next.result.cached_prompt_tokens == 0,
+            "a skipped snapshot is a miss");
+    Require(next.result.tokens == first.result.tokens,
+            "a skipped snapshot keeps outputs");
+    Require(pair.snapshots() == 1, "next capture succeeds on both ranks");
+  }
+  {
+    Pair pair({.cache = true}, {.cache = true, .fail_restore_once = true});
+    (void)pair.Run(prompt, 6, {}, {}, {}, true);
+    const auto failed = pair.Run(prompt, 6, {}, {}, {}, true);
+    Require(!failed.worker_error.empty(),
+            "worker restore failure reaches request verdict");
+    const auto recovered = pair.Run(prompt, 6, {}, {}, {}, true);
+    Require(recovered.worker_error.empty(),
+            "next request recovers: " + recovered.worker_error);
+    Require(recovered.result.cached_prompt_tokens == 0,
+            "failed request clears reuse");
+  }
+
+  {
+    Pair pair({.cache = true, .cache_budget = 32},
+              {.cache = true, .cache_budget = 32});
+    for (int i = 0; i < 4; ++i) {
+      auto distinct = prompt;
+      distinct[0] += i;
+      const auto run = pair.Run(distinct, 3, {}, {}, {}, true);
+      Require(run.worker_error.empty(), "eviction: " + run.worker_error);
+      Require(pair.snapshots() == 1, "eviction drops old worker copies");
+    }
+    pair.ClearCache();  // Drops outside an active request must work too.
+    Require(pair.snapshots() == 0, "idle drops empty worker table");
+  }
+  {
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    std::atomic<bool> cancelled{false};
+    ToyOptions held{.cache = true};
+    held.capture_hook = [&] {
+      entered.set_value();
+      released.wait();
+    };
+    Pair pair(held, {.cache = true});
+    auto pending = std::async(std::launch::async, [&] {
+      return pair.Run(
+          prompt, 6, {}, {}, [&] { return cancelled.load(); }, true);
+    });
+    Require(entered.get_future().wait_for(std::chrono::seconds(5)) ==
+                std::future_status::ready,
+            "asynchronous capture starts");
+    Require(Count(pair.rank0().Log(), "advance") == 0,
+            "capture freezes the state before advance");
+    cancelled = true;
+    release.set_value();
+    const auto stopped = pending.get();
+    Require(stopped.worker_error.empty(),
+            "cancel during capture: " + stopped.worker_error);
+    const auto next = pair.Run(prompt, 3, {}, {}, {}, true);
+    Require(next.worker_error.empty() && next.result.cached_prompt_tokens > 0,
+            "joined capture survives cancellation");
+    pair.RequireSameCalls("capture cancellation reuse");
+  }
+
+  // Mutating the instruction stream must fail even though every surviving
+  // frame is valid on its own and has a freshly contiguous transport index.
+  for (int mutation = 0; mutation < 4; ++mutation) {
+    auto runner = std::make_shared<ToyRunner>(ToyOptions{.cache = true});
+    TpExecutor executor(runner, 1);
+    const TpControlCommand begin{
+        .sequence = 1, .max_tokens = 1, .prompt_tokens = {5, 9}};
+    std::vector<gufo::server::TpInstruction> calls{
+        {.op = TpInstructionOp::kPrefill, .count = 2, .prompt_size = 2},
+        {.op = TpInstructionOp::kSnapshot, .snapshot_id = 1},
+        {.op = TpInstructionOp::kReuse, .prompt_size = 2},
+        {.op = TpInstructionOp::kRestore, .snapshot_id = 1},
+        {.op = TpInstructionOp::kDrop, .snapshot_id = 1}};
+    gufo::server::TpExecutionDigest digest;
+    for (const auto& call : calls) {
+      const std::vector<TextRunnerToken> prefix{5, 9};
+      gufo::server::DigestTpCall(digest, call, prefix);
+      if (call.op == TpInstructionOp::kPrefill)
+        gufo::server::DigestTpPrefill(
+            digest, {.consumed_tokens = 2, .decode_ready = true}, 2);
+      if (call.op == TpInstructionOp::kRestore ||
+          call.op == TpInstructionOp::kReuse)
+        digest.Add(2);
+    }
+    if (mutation == 1)
+      calls.pop_back();  // missing drop
+    if (mutation == 2)
+      calls.erase(calls.begin() + 2);  // missing reuse
+    if (mutation == 3)
+      calls[3].snapshot_id = 2;  // wrong restore
+    calls.push_back(
+        {.op = TpInstructionOp::kEnd, .count = 5, .digest = digest.value()});
+    std::size_t next = 0;
+    std::string outcome, error;
+    Require(executor.RunRequest(
+                begin,
+                [&](TpControlCommand* command, std::string*) {
+                  if (next == calls.size())
+                    return false;
+                  calls[next].index = next;
+                  *command = {.sequence = 1,
+                              .kind = TpControlCommandKind::kInstruction,
+                              .instruction = calls[next++]};
+                  return true;
+                },
+                [](const TpControlResponse&, std::string*) { return true; },
+                &outcome, &error),
+            error);
+    Require(outcome.empty() == (mutation == 0),
+            "instruction mutation is detected: " + outcome);
+    if (mutation == 0)
+      Require(executor.snapshot_count() == 0, "intact drop frees snapshot");
+  }
 
   // AR: greedy, sampled, stopped and cancelled requests on one pair.
   {

@@ -129,10 +129,6 @@ class Session:
         return self.tp2_config is not None
 
     @property
-    def tp2_cache_reuse(self) -> bool:
-        return bool((self.tp2_config or {}).get("cache_reuse"))
-
-    @property
     def stream_requests(self) -> bool:
         if self.request_transport == "json":
             return False
@@ -152,11 +148,6 @@ class Session:
             raise RuntimeError(
                 f"TP2 benchmark does not support {table.kind} tables; "
                 "the two-host topology is not comparable to the published one-host method"
-            )
-        if (table.kind == "single" and depths and any(depth != 0 for depth in depths)
-                and not self.tp2_cache_reuse):
-            raise RuntimeError(
-                "TP2 benchmark cached depths require the explicit cache_reuse experiment flag"
             )
         if table.kind == "multi" and users != 1:
             raise RuntimeError(
@@ -290,8 +281,6 @@ class Session:
             "--tp-control-port", str(config.get("control_port", 18516)),
             "--tp-control-token", str(config["control_token"]),
         ]
-        if config.get("cache_reuse"):
-            command.append("--tp-cache-reuse")
         if rank == 1:
             command += ["--tp-bootstrap-host", str(config["bootstrap_host"])]
         return command
@@ -470,15 +459,11 @@ class Session:
         if version:
             notes = [f"{self.config.reference_name}: {version}", *notes]
         if command and command[0] == "tp2":
-            cache_note = (
-                "symmetric live-prefix cache reuse is enabled"
-                if self.tp2_cache_reuse else
-                "requests are uncached"
-            )
             notes = [
                 *notes,
                 "TP2 paired topology: rank 0 owns HTTP and rank 1 is the remote worker; "
-                f"requests use the qualified non-streaming C1 path; {cache_note}; "
+                "requests use the qualified non-streaming C1 path; cache reuse "
+                "works as on one host; "
                 "control credentials and endpoint addresses are omitted",
             ]
         artifact = new_artifact(
@@ -487,10 +472,7 @@ class Session:
         )
         if command and command[0] == "tp2":
             limitations = ["C1 only", "greedy only", "non-streaming only"]
-            limitations.append(
-                "symmetric live-prefix cache; no snapshot-byte transfer"
-                if self.tp2_cache_reuse else "uncached d0 only"
-            )
+            limitations.append("memory cache only; snapshots stay on each host")
             limitations.append("no published benchmark comparison")
             artifact["topology"] = {
                 "id": "tp2",

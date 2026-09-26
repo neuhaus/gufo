@@ -695,28 +695,10 @@ check(local_tp2[local_tp2.index("--max-pending") + 1] == "1"
       "TP2 overrides the published C8 scheduling arguments")
 check(public_command(local_tp2).count("<redacted>") == 1,
       "TP2 token is redacted from the combined command")
-try:
-    tp2_session.check_tp2_scope(tp2_config.table("single-ar"), depths=[4096])
-except RuntimeError as failure:
-    check("cache_reuse" in str(failure), "TP2 cached-depth rows are rejected explicitly")
-else:
-    raise AssertionError("TP2 cached-depth rows must not be measured")
-tp2_config.data["gufo"]["tp2"]["cache_reuse"] = True
-local_cache, remote_cache, _, _, _, _ = tp2_session._tp2_commands(
-    tp2_config.table("single-ar"), mode="ar", context=8192, sessions=1,
-    port=18081, tag="cache",
-)
-check("--tp-cache-reuse" in local_cache and "--tp-cache-reuse" in remote_cache,
-      "cache reuse is explicitly forwarded to both ranks")
+check("--tp-cache-reuse" not in local_tp2,
+      "TP2 caches by default, without a cache flag")
 tp2_session.check_tp2_scope(tp2_config.table("single-ar"), depths=[4096])
-check(True, "cache-enabled TP2 accepts an explicit depth")
-try:
-    tp2_session.check_tp2_scope(tp2_config.table("multi-ar"), users=2)
-except RuntimeError as failure:
-    check("C1" in str(failure), "cache-enabled TP2 C>1 remains unqualified")
-else:
-    raise AssertionError("cache-enabled TP2 C>1 must remain rejected")
-tp2_config.data["gufo"]["tp2"].pop("cache_reuse")
+check(True, "TP2 accepts cached depths")
 try:
     tp2_session.check_tp2_scope(tp2_config.table("multi-ar"), users=2)
 except RuntimeError as failure:

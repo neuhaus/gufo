@@ -157,7 +157,6 @@ int main(int argc, char** argv) {
                               .max_context = 4096,
                               .max_draft_tokens = 7,
                               .use_mtp = false,
-                              .allow_cache_reuse = false,
                               .auth_token = "latency",
                               .prefill_chunk_tokens = 512};
   TpControlConfig rank1 = rank0;

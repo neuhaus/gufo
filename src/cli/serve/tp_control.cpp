@@ -31,7 +31,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 8;          // C1/C2 envelopes plus rank-1
+constexpr std::uint16_t kVersion = 10;         // C1/C2 envelopes plus rank-1
                                                // executor instructions
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
@@ -199,8 +199,25 @@ bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
     SetError(error, "TP instruction carries a draw state it does not use");
     return false;
   }
+  const bool snapshot_op = instruction.op == TpInstructionOp::kSnapshot ||
+                           instruction.op == TpInstructionOp::kRestore ||
+                           instruction.op == TpInstructionOp::kDrop;
+  if (snapshot_op != (instruction.snapshot_id != 0)) {
+    SetError(error, "TP instruction snapshot ID is invalid");
+    return false;
+  }
   bool valid = false;
   switch (instruction.op) {
+    case TpInstructionOp::kDrop:
+      valid = instruction.state == 0 && only(false, false, false, false, false);
+      break;
+    case TpInstructionOp::kReuse:
+      valid = only(false, false, false, true, false) &&
+              instruction.prompt_size <= kMaxPromptTokens;
+      break;
+    case TpInstructionOp::kSnapshot:
+    case TpInstructionOp::kRestore:
+    case TpInstructionOp::kCancelPrepare:
     case TpInstructionOp::kInvalidate:
       valid = only(false, false, false, false, false);
       break;
@@ -228,8 +245,11 @@ bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
   }
   // Only a reset can happen between requests: the continuation cache makes it
   // on its own schedule. Every other call belongs to a request.
-  if (sequence == 0 && instruction.op != TpInstructionOp::kInvalidate) {
-    SetError(error, "TP instruction outside a request must be a reset");
+  if (sequence == 0 && instruction.op != TpInstructionOp::kInvalidate &&
+      instruction.op != TpInstructionOp::kDrop) {
+    SetError(
+        error,
+        "TP instruction outside a request must be a reset or snapshot drop");
     return false;
   }
   return true;
@@ -468,6 +488,16 @@ bool ValidateTpControlResponse(const TpControlResponse& response,
                                std::string* error) {
   if (response.error.size() > kMaxErrorBytes) {
     SetError(error, "TP control response error is too large");
+    return false;
+  }
+  if (response.kind == TpControlResponseKind::kInstruction) {
+    return response.sequence != 0 && !HasLegacyResponseFields(response) &&
+           response.members.empty() && response.cohort_id == 0 &&
+           IsZeroDigest(response.execution_plan_digest) &&
+           IsZeroDigest(response.cache_plan_digest);
+  }
+  if (response.instruction_index != 0) {
+    SetError(error, "TP final response carries an instruction index");
     return false;
   }
   if (response.kind == TpControlResponseKind::kSingle) {
@@ -791,7 +821,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   AppendU32(&payload, config.prefill_chunk_tokens);
   AppendU32(&payload, config.max_draft_tokens);
   AppendU32(&payload, config.use_mtp ? 1U : 0U);
-  AppendU32(&payload, config.allow_cache_reuse ? 1U : 0U);
+  AppendU64(&payload, config.snapshot_budget_bytes);
   AppendU32(&payload, static_cast<std::uint32_t>(config.auth_token.size()));
   payload.insert(payload.end(), config.auth_token.begin(),
                  config.auth_token.end());
@@ -817,7 +847,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   std::uint32_t prefill_chunk = 0;
   std::uint32_t draft = 0;
   std::uint32_t mtp = 0;
-  std::uint32_t cache_reuse = 0;
+  std::uint64_t snapshot_budget = 0;
   std::uint32_t auth_size = 0;
   std::string peer_token;
   if (!ReadU32(peer, &offset, &rank, error) ||
@@ -826,7 +856,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
       !ReadU32(peer, &offset, &prefill_chunk, error) ||
       !ReadU32(peer, &offset, &draft, error) ||
       !ReadU32(peer, &offset, &mtp, error) ||
-      !ReadU32(peer, &offset, &cache_reuse, error) ||
+      !ReadU64(peer, &offset, &snapshot_budget, error) ||
       !ReadU32(peer, &offset, &auth_size, error) ||
       auth_size > kMaxAuthTokenBytes || peer.size() - offset != auth_size) {
     SetError(error, "TP control hello payload is invalid");
@@ -838,11 +868,12 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
       context != config.max_context ||
       prefill_chunk != config.prefill_chunk_tokens ||
       draft != config.max_draft_tokens || mtp != (config.use_mtp ? 1U : 0U) ||
-      cache_reuse != (config.allow_cache_reuse ? 1U : 0U) ||
       peer_token != auth_token_) {
     SetError(error, "TP control hello configuration mismatch");
     return false;
   }
+  snapshot_budget_bytes_ =
+      std::min(config.snapshot_budget_bytes, snapshot_budget);
   world_size_ = config.world_size;
   max_context_ = config.max_context;
   handshaken_ = true;
@@ -924,6 +955,7 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU32(&payload, instruction.offset);
     AppendU32(&payload, instruction.count);
     AppendU32(&payload, instruction.prompt_size);
+    AppendU64(&payload, instruction.snapshot_id);
     AppendU64(&payload, instruction.digest);
     AppendU64(&payload, instruction.rng);
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.pending));
@@ -1078,10 +1110,11 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &instruction.offset, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.count, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.prompt_size, error) ||
+        !ReadU64(command_prompt_, &offset, &instruction.snapshot_id, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.digest, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.rng, error) ||
         !ReadU32(command_prompt_, &offset, &pending_bits, error) ||
-        op > static_cast<std::uint32_t>(TpInstructionOp::kEnd)) {
+        op > static_cast<std::uint32_t>(TpInstructionOp::kCancelPrepare)) {
       command_prompt_.clear();
       command_prompt_.shrink_to_fit();
       SetError(error, "TP control instruction is invalid");
@@ -1158,6 +1191,12 @@ bool TpControlChannel::SendResponse(const TpControlResponse& response,
   payload.reserve(128 + members.size() * 64 + response.error.size());
   AppendU64(&payload, response.sequence);
   AppendU32(&payload, static_cast<std::uint32_t>(response.kind));
+  if (response.kind == TpControlResponseKind::kInstruction) {
+    AppendU64(&payload, response.instruction_index);
+    AppendU32(&payload, static_cast<std::uint32_t>(response.error.size()));
+    payload.insert(payload.end(), response.error.begin(), response.error.end());
+    return SendFrame(kResponse, response.sequence, payload, error);
+  }
   AppendU64(&payload, response.kind == TpControlResponseKind::kSingle
                           ? response.sequence
                           : response.cohort_id);
@@ -1205,6 +1244,29 @@ bool TpControlChannel::ReceiveResponse(TpControlResponse* response,
   std::uint64_t embedded = 0;
   std::uint32_t kind = 0;
   std::uint32_t member_count = 0;
+  if (!ReadU64(response_payload_, &offset, &embedded, error) ||
+      !ReadU32(response_payload_, &offset, &kind, error) ||
+      embedded != sequence) {
+    return false;
+  }
+  if (kind == static_cast<std::uint32_t>(TpControlResponseKind::kInstruction)) {
+    parsed.kind = TpControlResponseKind::kInstruction;
+    std::uint32_t size = 0;
+    if (!ReadU64(response_payload_, &offset, &parsed.instruction_index,
+                 error) ||
+        !ReadU32(response_payload_, &offset, &size, error) ||
+        size > kMaxErrorBytes || response_payload_.size() - offset != size) {
+      SetError(error, "TP cache acknowledgement is malformed");
+      return false;
+    }
+    parsed.error.assign(
+        reinterpret_cast<const char*>(response_payload_.data() + offset), size);
+    if (!ValidateTpControlResponse(parsed, error))
+      return false;
+    *response = std::move(parsed);
+    return true;
+  }
+  offset = 0;
   if (!ReadU64(response_payload_, &offset, &embedded, error) ||
       !ReadU32(response_payload_, &offset, &kind, error) ||
       !ReadU64(response_payload_, &offset, &parsed.cohort_id, error) ||
@@ -1378,6 +1440,29 @@ struct TpResponseBroker::Impl {
         if (stopping) {
           return;
         }
+        if (response.kind == TpControlResponseKind::kInstruction) {
+          if (!ack_expected || ack_ready || ack_sequence != response.sequence ||
+              ack_index != response.instruction_index) {
+            stopping = poisoned = true;
+            failure = "TP cache acknowledgement is unknown or duplicate";
+            condition.notify_all();
+            control->Interrupt();
+            return;
+          }
+          ack_error = std::move(response.error);
+          ack_ready = true;
+          condition.notify_all();
+          continue;
+        }
+        if (ack_expected && ack_sequence == response.sequence) {
+          stopping = poisoned = true;
+          failure =
+              "TP final response arrived before cache acknowledgement was "
+              "consumed";
+          condition.notify_all();
+          control->Interrupt();
+          return;
+        }
         const auto found = pending.find(response.sequence);
         if (found == pending.end() || found->second->ready) {
           stopping = true;
@@ -1411,6 +1496,10 @@ struct TpResponseBroker::Impl {
   std::condition_variable condition;
   std::mutex stop_mutex;
   std::unordered_map<std::uint64_t, std::shared_ptr<Pending>> pending;
+  bool ack_expected{false};
+  bool ack_ready{false};
+  std::uint64_t ack_sequence{0}, ack_index{0};
+  std::string ack_error;
   bool stopping{false};
   bool poisoned{false};
   std::string failure;
@@ -1424,6 +1513,42 @@ TpResponseBroker::TpResponseBroker(std::shared_ptr<TpControlChannel> control,
 
 TpResponseBroker::~TpResponseBroker() {
   impl_.reset();
+}
+
+bool TpResponseBroker::RegisterInstruction(std::uint64_t sequence,
+                                           std::uint64_t index,
+                                           std::string* error) {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->stopping || impl_->poisoned || impl_->ack_expected ||
+      !impl_->pending.contains(sequence)) {
+    SetError(error, "TP cache acknowledgement cannot be registered: " +
+                        impl_->failure);
+    return false;
+  }
+  impl_->ack_sequence = sequence;
+  impl_->ack_index = index;
+  impl_->ack_expected = true;
+  impl_->ack_ready = false;
+  impl_->ack_error.clear();
+  return true;
+}
+
+bool TpResponseBroker::WaitForInstruction(std::string* error) {
+  std::unique_lock<std::mutex> lock(impl_->mutex);
+  if (!impl_->ack_expected) {
+    SetError(error, "TP cache acknowledgement is not registered");
+    return false;
+  }
+  impl_->condition.wait(lock, [&] {
+    return impl_->ack_ready || impl_->stopping || impl_->poisoned;
+  });
+  impl_->ack_expected = false;
+  if (impl_->stopping || impl_->poisoned) {
+    SetError(error, impl_->failure);
+    return false;
+  }
+  SetError(error, impl_->ack_error);
+  return impl_->ack_error.empty();
 }
 
 bool TpResponseBroker::RegisterPendingResponse(std::uint64_t sequence,
