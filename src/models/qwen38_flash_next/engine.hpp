@@ -29,6 +29,7 @@ struct MtpWeights;
 class NgramTable;
 struct MtpCandidateLogits;
 namespace rocm {
+class Communicator;
 class DeviceModel;
 class Executor;
 class Session;
@@ -45,6 +46,12 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
+  /// Optional two-rank expert-parallel identity. World size one preserves the
+  /// existing single-rank path and needs no communicator.
+  std::uint32_t tp_rank = 0;
+  std::uint32_t tp_world_size = 1;
+  int hip_device = 0;
+  std::shared_ptr<rocm::Communicator> communicator;
 };
 
 class Session;
@@ -80,6 +87,13 @@ public:
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
+  [[nodiscard]] std::uint32_t TpRank() const noexcept {
+    return options_.tp_rank;
+  }
+  [[nodiscard]] std::uint32_t TpWorldSize() const noexcept {
+    return options_.tp_world_size;
+  }
+  [[nodiscard]] int HipDevice() const noexcept { return options_.hip_device; }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] const tokenization::QwenTokenizer& tokenizer() const noexcept {
@@ -212,6 +226,8 @@ public:
                                      std::string* error_msg = nullptr);
 
 private:
+  [[nodiscard]] bool RestoreSnapshotPayload(
+      std::span<const std::uint8_t> payload, std::string* error_msg);
   friend class Model;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
 

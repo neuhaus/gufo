@@ -42,6 +42,12 @@ def main():
         assert ("--voice " in text) == (modality == "tts")
         assert "--served-model-name" in text
     check(["serve", "asr", "--voice", "x=y"], 2, "Unknown option")
+    check([
+        "serve", "llm", "--model", "missing", "--tp-world-size", "2",
+        "--tp-rank", "0", "--tp-bootstrap-port", "18515",
+        "--tp-control-port", "18516", "--tp-control-token", "test",
+        "--sessions", "2",
+    ], 2, "TP2 currently requires C1")
     text = check(["transcribe", "--help"], 0, "--prompt")
     assert "--context" in text
 

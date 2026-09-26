@@ -2379,7 +2379,9 @@ __global__ void AttentionMergeKernel(const float* partials, float* out,
 template<unsigned MaxExperts>
 __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
                                  std::int32_t* ids, float* weights,
-                                 std::uint32_t n_experts, std::uint32_t k) {
+                                 std::uint32_t n_experts, std::uint32_t k,
+                                 std::uint32_t expert_begin,
+                                 std::uint32_t local_experts) {
   __shared__ float probs[1024];
   __shared__ float shared[32];
   __shared__ std::uint32_t chosen[32];
@@ -2448,8 +2450,12 @@ __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
     }
     sum = fmaxf(sum, 6.103515625e-5f);
     for (std::uint32_t slot = 0; slot < k; ++slot) {
-      ids[t * k + slot] = static_cast<std::int32_t>(chosen[slot]);
-      weights[t * k + slot] = chosen_p[slot] / sum;
+      const std::uint32_t global = chosen[slot];
+      const bool local =
+          global >= expert_begin && global - expert_begin < local_experts;
+      ids[t * k + slot] =
+          local ? static_cast<std::int32_t>(global - expert_begin) : -1;
+      weights[t * k + slot] = local ? chosen_p[slot] / sum : 0.0f;
     }
   }
 }
@@ -2466,8 +2472,10 @@ __global__ void MoeEpilogueKernel(const float* expert_out, const float* weights,
   }
   float acc = 0.0f;
   for (std::uint32_t s = 0; s < k; ++s) {
-    acc += weights[t * k + s] *
-           expert_out[(static_cast<std::size_t>(t) * k + s) * dim + i];
+    const float w = weights[t * k + s];
+    if (w != 0.0f) {
+      acc += w * expert_out[(static_cast<std::size_t>(t) * k + s) * dim + i];
+    }
   }
   const std::size_t idx = static_cast<std::size_t>(t) * dim + i;
   out[idx] = acc + SigmoidF(gate[static_cast<std::size_t>(t) * gate_stride]) *
@@ -2495,11 +2503,13 @@ __global__ void MoeEpilogueVec4Kernel(const ExpertT* expert_out,
   const ExpertT* rows = expert_out + static_cast<std::size_t>(t) * k * dim + i;
   for (std::uint32_t s = 0; s < k; ++s) {
     const float w = weights[t * k + s];
-    const float4 v = Load4(rows + static_cast<std::size_t>(s) * dim);
-    acc.x += w * v.x;
-    acc.y += w * v.y;
-    acc.z += w * v.z;
-    acc.w += w * v.w;
+    if (w != 0.0f) {
+      const float4 v = Load4(rows + static_cast<std::size_t>(s) * dim);
+      acc.x += w * v.x;
+      acc.y += w * v.y;
+      acc.z += w * v.z;
+      acc.w += w * v.w;
+    }
   }
   const std::size_t idx = static_cast<std::size_t>(t) * dim + i;
   const float g = SigmoidF(gate[static_cast<std::size_t>(t) * gate_stride]);
@@ -5797,13 +5807,16 @@ __global__ void ExpertCountsKernel(const std::int32_t* ids,
 
 void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
-                std::uint32_t k, hipStream_t stream) {
+                std::uint32_t k, std::uint32_t expert_begin,
+                std::uint32_t local_experts, hipStream_t stream) {
   if (n_experts <= 512) {
     hipLaunchKernelGGL((RouterTopKKernel<512>), dim3(n_tokens), dim3(kThreads),
-                       0, stream, logits, stride, ids, weights, n_experts, k);
+                       0, stream, logits, stride, ids, weights, n_experts, k,
+                       expert_begin, local_experts);
   } else {
     hipLaunchKernelGGL((RouterTopKKernel<1024>), dim3(n_tokens), dim3(kThreads),
-                       0, stream, logits, stride, ids, weights, n_experts, k);
+                       0, stream, logits, stride, ids, weights, n_experts, k,
+                       expert_begin, local_experts);
   }
 }
 

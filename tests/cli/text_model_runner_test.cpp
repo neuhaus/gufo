@@ -465,6 +465,17 @@ public:
   }
 };
 
+class PreserveSnapshotPrefixRunner final : public SnapshotRunner {
+public:
+  using SnapshotRunner::SnapshotRunner;
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    auto descriptor = SnapshotRunner::Descriptor();
+    descriptor.capabilities.preserve_snapshot_prefix = true;
+    return descriptor;
+  }
+};
+
 class PersistentSnapshotRunner final : public SnapshotRunner {
 public:
   std::function<void()> before_serialize;
@@ -717,6 +728,29 @@ void TestSnapshotRetentionUsesPromptBoundary() {
            "extended reuse preserves the rebuilt decode frontier");
     extension.Invalidate();
   }
+}
+
+void TestPreserveSnapshotPrefixForDistributedCache() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PreserveSnapshotPrefixRunner>(stats);
+  TextRunnerPool pool(runner, 1);
+
+  auto root = pool.Acquire({1, 2, 3, 4});
+  Expect(root.Prefill(4).decode_ready,
+         "distributed root reaches its immutable boundary");
+  root.Commit();
+  const auto captures_after_root = stats->snapshot_captures;
+
+  auto continuation =
+      pool.Acquire({1, 2, 3, 4, 5, 6}, gufo::sampling::SamplingConfig{}, {},
+                   nullptr, true, 6);
+  Expect(continuation.cache_hit() && continuation.cached_prompt_tokens() == 4,
+         "distributed continuation reuses the stable historical boundary");
+  Expect(continuation.Prefill(2).decode_ready,
+         "distributed continuation prefills only its suffix");
+  Expect(stats->snapshot_captures == captures_after_root,
+         "distributed cache hit preserves the older immutable snapshot");
+  continuation.Invalidate();
 }
 
 void TestGeneratedFrontierForksBeforeMutation() {
@@ -1163,6 +1197,7 @@ int main() {
   std::ostringstream normal_log;
   auto* previous = std::clog.rdbuf(normal_log.rdbuf());
   TestSnapshotRetentionUsesPromptBoundary();
+  TestPreserveSnapshotPrefixForDistributedCache();
   std::clog.rdbuf(previous);
   Expect(normal_log.str().empty(), "routine cache replacement stays quiet");
   TestPersistentSnapshotRestoresAcrossPools();

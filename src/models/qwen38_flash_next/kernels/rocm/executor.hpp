@@ -137,11 +137,16 @@ private:
 class Executor {
 public:
   struct Options {
+    int device_index{0};
     std::uint32_t max_batch{1};
     /// Rows of logits (and hidden states) a Forward call may return.
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{1};
+    /// GPU-visible sum reduction used by the routed-expert boundary. The
+    /// callback is required only when DeviceModel carries world_size > 1.
+    std::function<bool(float*, std::size_t, hipStream_t, std::string*)>
+        all_reduce;
   };
 
   ~Executor();
@@ -373,6 +378,7 @@ private:
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
            bool last_only = false) const;
+  bool AllReduce(float* data, std::size_t rows, std::string* error_msg) const;
   /// Runs routed experts after the router and shared expert are ready.
   bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
                   std::uint32_t n_tokens, std::string* error_msg) const;

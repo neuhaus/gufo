@@ -78,6 +78,8 @@ struct TextRunnerCapabilities {
   /// Zero means no physical-width limit.
   std::size_t batched_multi_token_decode_max_width{0};
   bool prefix_reuse{true};
+  /// Preserve an older immutable snapshot when a cache hit covers its prefix.
+  bool preserve_snapshot_prefix{false};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.

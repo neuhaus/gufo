@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -23,6 +24,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/cli/serve/tp_control.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
@@ -38,6 +40,7 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #endif
 
 namespace gufo::server {
@@ -52,6 +55,72 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
+class TpOperationLease {
+public:
+  TpOperationLease(
+      std::shared_ptr<models::qwen38_flash_next::rocm::Communicator>
+          communicator,
+      std::uint64_t scope_id)
+      : communicator_(std::move(communicator)), scope_id_(scope_id) {}
+
+  ~TpOperationLease() { (void)End(nullptr); }
+
+  TpOperationLease(const TpOperationLease&) = delete;
+  TpOperationLease& operator=(const TpOperationLease&) = delete;
+  TpOperationLease(TpOperationLease&&) = delete;
+  TpOperationLease& operator=(TpOperationLease&&) = delete;
+
+  [[nodiscard]] bool Begin(std::string* error) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (active_) {
+      SetError(error, "TP operation scope is already active");
+      return false;
+    }
+    if (!communicator_) {
+      SetError(error, "TP communicator is missing");
+      return false;
+    }
+    if (!communicator_->BeginOperation(scope_id_, error)) {
+      return false;
+    }
+    active_ = true;
+    return true;
+  }
+
+  [[nodiscard]] bool End(std::string* error) noexcept {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!active_) {
+      return true;
+    }
+    active_ = false;
+    if (!communicator_) {
+      if (error != nullptr) {
+        try {
+          *error = "TP communicator is missing";
+        } catch (...) {
+        }
+      }
+      return false;
+    }
+    try {
+      return communicator_->EndOperation(scope_id_, error);
+    } catch (...) {
+      if (error != nullptr) {
+        try {
+          *error = "TP operation scope cleanup threw an exception";
+        } catch (...) {
+        }
+      }
+      return false;
+    }
+  }
+
+private:
+  std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> communicator_;
+  const std::uint64_t scope_id_;
+  bool active_{false};
+  std::mutex mutex_;
+};
 
 struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
@@ -93,7 +162,8 @@ TextPreparedPrompt PrepareQwenPrompt(
   // the next user turn directly after tool results. Preserve a checkpoint
   // before the generation suffix even when reasoning itself is retained.
   std::size_t cache_prefix = 0;
-  if (!options.preserve_thinking || !request.tools.empty()) {
+  if (request.cache_prompt &&
+      (!options.preserve_thinking || !request.tools.empty())) {
     const auto generation = tokenizer.Encode(
         tokenization::GenerationPrompt(options.enable_thinking),
         {.add_bos = false, .add_eos = false, .parse_special_tokens = true});
@@ -2273,12 +2343,15 @@ public:
                           std::uint32_t max_context, bool use_mtp,
                           std::uint32_t max_draft_tokens,
                           std::string artifact_fingerprint = {},
-                          std::string mtp_fingerprint = {})
+                          std::string mtp_fingerprint = {},
+                          bool allow_distributed_snapshots = false)
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
-        max_draft_tokens_(max_draft_tokens) {
-    if (!artifact_fingerprint.empty()) {
+        max_draft_tokens_(max_draft_tokens),
+        distributed_(model_->TpWorldSize() > 1),
+        allow_distributed_snapshots_(allow_distributed_snapshots) {
+    if (!distributed_ && !artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
@@ -2298,14 +2371,17 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = true,
-                .fork = true,
+                .snapshot = !distributed_ || allow_distributed_snapshots_,
+                .fork = !distributed_ || allow_distributed_snapshots_,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
-                .batched_multi_token_decode = use_mtp_,
-                .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
+                .batched_multi_token_decode = !distributed_ && use_mtp_,
+                .batched_multi_token_decode_max_width =
+                    !distributed_ && use_mtp_ ? 8u : 0u,
                 .prefix_reuse = true,
+                .preserve_snapshot_prefix =
+                    distributed_ && allow_distributed_snapshots_,
             },
         .persistence = persistence_,
     };
@@ -2330,12 +2406,18 @@ public:
         // Runtime scratch is shared and already allocated at model load;
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_capacity_bytes =
+            (!distributed_ || allow_distributed_snapshots_)
+                ? HostSnapshotBudgetBytes()
+                : 0,
         .requires_device_runtime_lock = true,
     };
   }
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    if (distributed_) {
+      return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    }
     std::vector<TextExecutionPlan> plans{
         {.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
     for (std::size_t width = 2; width <= 8; ++width) {
@@ -2362,13 +2444,48 @@ public:
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
-    return PrepareQwenPrompt(request, model_->tokenizer(),
-                             model_->VisionEncoder(), max_context_);
+    if (distributed_) {
+      for (const auto& message : request.messages) {
+        if (!message.images.empty()) {
+          throw std::invalid_argument(
+              "Qwen3.8-Flash-Next TP2 does not support image input");
+        }
+      }
+    }
+    auto prepared = PrepareQwenPrompt(request, model_->tokenizer(),
+                                      model_->VisionEncoder(), max_context_);
+    if (allow_distributed_snapshots_ && request.cache_prompt &&
+        !prepared.tokens.empty()) {
+      auto stable_options = QwenChatOptions(request);
+      stable_options.add_generation_prompt = false;
+      const auto tools =
+          request.tool_choice == ChatRequest::ToolChoice::kNone
+              ? std::span<const tokenization::ChatTool>{}
+              : std::span<const tokenization::ChatTool>{request.tools};
+      const auto stable = tokenization::QwenChatTemplate::RenderAndTokenize(
+          model_->tokenizer(), request.messages, tools, stable_options);
+      if (stable) {
+        std::size_t common = 0;
+        const auto limit = std::min(stable->size(), prepared.tokens.size());
+        while (common < limit &&
+               stable->at(common) == prepared.tokens[common]) {
+          ++common;
+        }
+        if (common != 0) {
+          prepared.cache_prefix_tokens = common;
+        }
+      }
+    }
+    return prepared;
   }
 
   void SetPromptContext(
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
+    if (distributed_ && context != nullptr) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support vision prompt context");
+    }
     RequireQwenFlashNextState(state).session().ConfigureVision(
         QwenPrompt(context));
   }
@@ -2516,6 +2633,10 @@ public:
 
   void AdvanceBatch(
       std::span<const TextRunnerAdvance> advances) const override {
+    if (distributed_ && advances.size() > 1) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support batched decode");
+    }
     if (advances.size() < 2) {
       return TextModelRunner::AdvanceBatch(advances);
     }
@@ -2550,6 +2671,10 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
+    if (distributed_ && decodes.size() > 1) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support batched decode");
+    }
     if (decodes.size() < 2 || !use_mtp_) {
       return TextModelRunner::DecodeBatch(decodes);
     }
@@ -2613,6 +2738,10 @@ public:
 
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       const TextRunnerState& state) const override {
+    if (distributed_ && !allow_distributed_snapshots_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 local snapshots are disabled");
+    }
     const std::uint64_t bytes =
         RequireQwenFlashNextState(state).session().SnapshotBytes();
     if (bytes == 0 || bytes > static_cast<std::uint64_t>(
@@ -2625,6 +2754,10 @@ public:
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
+    if (distributed_ && !allow_distributed_snapshots_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 local snapshots are disabled");
+    }
     const auto& qfn = RequireQwenFlashNextState(state);
     std::string error;
     auto snapshot = qfn.session().SaveSnapshot(&error);
@@ -2637,6 +2770,10 @@ public:
 
   void RestoreOrFork(TextRunnerState& state,
                      const TextRunnerSnapshot& snapshot) const override {
+    if (distributed_ && !allow_distributed_snapshots_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 local snapshots are disabled");
+    }
     const auto* qfn_snapshot =
         dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
     if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
@@ -2656,6 +2793,10 @@ public:
 
   [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
       const TextRunnerSnapshot& snapshot) const override {
+    if (distributed_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support persistent snapshots");
+    }
     const auto* qfn_snapshot =
         dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
     if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
@@ -2670,6 +2811,10 @@ public:
   [[nodiscard]] std::size_t SerializePersistentSnapshot(
       const TextRunnerSnapshot& snapshot,
       std::span<std::uint8_t> destination) const override {
+    if (distributed_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support persistent snapshots");
+    }
     const auto* qfn_snapshot =
         dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
     if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
@@ -2692,6 +2837,10 @@ public:
   void RestorePersistentSnapshot(
       TextRunnerState& state,
       std::span<const std::uint8_t> payload) const override {
+    if (distributed_) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next TP2 does not support persistent snapshots");
+    }
     auto& restored = RequireQwenFlashNextState(state);
     std::string error;
     if (!restored.session().RestoreSnapshot(payload, &error)) {
@@ -2714,6 +2863,8 @@ private:
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
+  bool distributed_{false};
+  bool allow_distributed_snapshots_{false};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 #endif
@@ -2724,6 +2875,12 @@ struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
     std::shared_ptr<TextGenerationScheduler> scheduler;
+    std::shared_ptr<TpControlChannel> control;
+    std::shared_ptr<TpResponseBroker> response_broker;
+    std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> communicator;
+    std::uint32_t tp_rank{0};
+    std::uint32_t tp_world_size{1};
+    bool tp_allow_cache_reuse{false};
     std::string model_id;
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
@@ -2735,31 +2892,145 @@ struct InferenceBackend::Impl {
     ScheduledGenerationRequest(
         std::shared_ptr<const State> model_state,
         TextGenerationScheduler::Request scheduled_request,
-        InitialOutputState initial = InitialOutputState::kContent)
+        InitialOutputState initial = InitialOutputState::kContent,
+        std::shared_ptr<TpResponseBroker> response_broker = {},
+        std::shared_ptr<TpOperationLease> operation = {},
+        std::uint64_t sequence = 0)
         : state_(std::move(model_state)),
-          request_(std::move(scheduled_request)) {
+          request_(std::move(scheduled_request)),
+          response_broker_(std::move(response_broker)),
+          operation_(std::move(operation)),
+          sequence_(sequence) {
       if (initial == InitialOutputState::kReasoning)
         reasoning_end_ = state_->scheduler->runner().Tokenize("</think>");
     }
 
-    Result Wait(const TokenCallback& on_token) override {
-      auto result = request_.Wait(on_token);
-      if (!reasoning_end_.empty()) {
-        const auto end =
-            std::search(result.tokens.begin(), result.tokens.end(),
-                        reasoning_end_.begin(), reasoning_end_.end());
-        result.reasoning_tokens =
-            static_cast<std::size_t>(end - result.tokens.begin());
+    ~ScheduledGenerationRequest() override {
+      if (operation_ != nullptr) {
+        Cancel();
       }
-      return result;
     }
 
-    void Cancel() noexcept override { request_.Cancel(); }
+    Result Wait(const TokenCallback& on_token) override {
+      try {
+        std::exception_ptr local_error;
+        Result result;
+        try {
+          result = request_.Wait(on_token);
+        } catch (...) {
+          local_error = std::current_exception();
+        }
+        if (response_broker_ != nullptr) {
+          TpControlResponse response;
+          std::string control_error;
+          const bool received = response_broker_->WaitForResponse(
+              sequence_, &response, &control_error);
+          if (local_error != nullptr) {
+            if (!received) {
+              response_broker_->FailAll(
+                  "rank-0 request failed and TP response drain failed: " +
+                  control_error);
+              throw std::runtime_error(
+                  "rank-0 request failed and TP response drain failed: " +
+                  control_error);
+            }
+            std::rethrow_exception(local_error);
+          }
+          if (!received) {
+            throw std::runtime_error("TP worker response failed: " +
+                                     control_error);
+          }
+          if (!response.error.empty()) {
+            throw std::runtime_error("TP worker failed: " + response.error);
+          }
+          if (response.tokens.size() != result.tokens.size()) {
+            throw std::runtime_error("TP worker token count mismatch");
+          }
+          for (std::size_t i = 0; i < result.tokens.size(); ++i) {
+            if (static_cast<std::uint32_t>(response.tokens[i]) !=
+                result.tokens[i]) {
+              throw std::runtime_error("TP worker token mismatch");
+            }
+          }
+          if (response.draft_tokens != result.draft_tokens ||
+              response.draft_accepted_tokens != result.draft_accepted_tokens ||
+              response.cached_prompt_tokens != result.cached_prompt_tokens) {
+            throw std::runtime_error(
+                "TP worker cache/draft telemetry mismatch");
+          }
+        } else if (local_error != nullptr) {
+          std::rethrow_exception(local_error);
+        }
+        if (!reasoning_end_.empty()) {
+          const auto end =
+              std::search(result.tokens.begin(), result.tokens.end(),
+                          reasoning_end_.begin(), reasoning_end_.end());
+          result.reasoning_tokens =
+              static_cast<std::size_t>(end - result.tokens.begin());
+        }
+        if (!EndOperation()) {
+          throw std::runtime_error("TP operation scope cleanup failed");
+        }
+        return result;
+      } catch (...) {
+        (void)EndOperation();
+        throw;
+      }
+    }
+
+    void Cancel() noexcept override {
+      if (operation_ == nullptr) {
+        request_.Cancel();
+        return;
+      }
+      try {
+        if (response_broker_ == nullptr) {
+          request_.Cancel();
+        } else {
+          // C1 has no symmetric cancellation command. Finish the rank-0
+          // request and consume the correlated worker response before
+          // returning.
+          try {
+            (void)request_.Wait({});
+          } catch (...) {
+          }
+          TpControlResponse response;
+          std::string error;
+          if (!response_broker_->WaitForResponse(sequence_, &response,
+                                                 &error)) {
+            response_broker_->FailAll(
+                "TP response drain failed during cancel: " + error);
+          }
+        }
+      } catch (...) {
+      }
+      (void)EndOperation();
+    }
 
   private:
+    bool EndOperation() noexcept {
+      if (operation_ == nullptr) {
+        return true;
+      }
+      std::string error;
+      const bool ended = operation_->End(&error);
+      if (!ended && response_broker_ != nullptr) {
+        try {
+          response_broker_->FailAll("TP operation scope cleanup failed: " +
+                                    error);
+        } catch (...) {
+        }
+      }
+      operation_.reset();
+      return ended;
+    }
+
     std::shared_ptr<const State> state_;
     TextGenerationScheduler::Request request_;
     std::vector<tokenization::TokenId> reasoning_end_;
+    std::shared_ptr<TpResponseBroker> response_broker_;
+    std::shared_ptr<TpOperationLease> operation_;
+    std::uint64_t sequence_{0};
   };
 
   [[nodiscard]] std::shared_ptr<const State> Snapshot() const {
@@ -2789,6 +3060,142 @@ struct InferenceBackend::Impl {
       return result;
     }
 
+    if (current->control != nullptr) {
+      const bool use_cache_reuse =
+          current->tp_allow_cache_reuse && cache_prompt;
+      const std::size_t worker_cache_prefix_tokens =
+          use_cache_reuse ? cache_prefix_tokens : 0;
+      if (!sampling.can_use_unmodified_argmax() || context != nullptr ||
+          (cache_prefix_tokens != 0 && !use_cache_reuse) ||
+          !stop_sequences.empty() ||
+          max_tokens > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(
+            "TP2 requires greedy text without stop sequences and an explicitly "
+            "enabled cache-reuse path");
+      }
+      std::vector<std::int32_t> worker_prompt;
+      worker_prompt.reserve(prompt_tokens.size());
+      for (const auto token : prompt_tokens) {
+        if (token > static_cast<TextRunnerToken>(
+                        std::numeric_limits<std::int32_t>::max())) {
+          throw std::invalid_argument(
+              "TP2 prompt token exceeds the worker protocol range");
+        }
+        worker_prompt.push_back(static_cast<std::int32_t>(token));
+      }
+      const std::lock_guard<std::mutex> lock(*tp_submit_mutex);
+      const std::uint64_t sequence = tp_sequence++;
+      if (current->response_broker == nullptr ||
+          current->communicator == nullptr) {
+        throw std::logic_error(
+            "TP rank-zero response broker or communicator is missing");
+      }
+      TpOperationLease operation(current->communicator, sequence);
+      std::string control_error;
+      if (!operation.Begin(&control_error)) {
+        throw std::runtime_error("TP operation scope bind failed: " +
+                                 control_error);
+      }
+      auto request = current->scheduler->Submit(
+          std::move(prompt_tokens), max_tokens, sampling, {},
+          static_cast<bool>(on_token),
+          TextRequestMetadata{
+              .client_id = client_id,
+              .deadline = std::nullopt,
+              .request_start = request_start,
+              .prompt_context = nullptr,
+              .cache_prompt = use_cache_reuse,
+              .cache_prefix_tokens = worker_cache_prefix_tokens,
+          });
+      if (!current->response_broker->RegisterPendingResponse(sequence,
+                                                             &control_error)) {
+        try {
+          request.Cancel();
+          (void)request.Wait({});
+        } catch (...) {
+        }
+        throw std::runtime_error("TP response registration failed: " +
+                                 control_error);
+      }
+      bool send_started = false;
+      bool response_received = false;
+      try {
+        TpControlCommand command{
+            .sequence = sequence,
+            .max_tokens = static_cast<std::uint32_t>(max_tokens),
+            .cache_prompt = use_cache_reuse,
+            .cache_prefix_tokens =
+                static_cast<std::uint32_t>(worker_cache_prefix_tokens),
+            .prompt_tokens = std::move(worker_prompt),
+            .client_id = client_id,
+        };
+        send_started = true;
+        if (!current->control->SendCommand(command, &control_error)) {
+          throw std::runtime_error("TP worker command failed: " +
+                                   control_error);
+        }
+        TpControlResponse response;
+        if (!current->response_broker->WaitForResponse(sequence, &response,
+                                                       &control_error)) {
+          throw std::runtime_error("TP worker response failed: " +
+                                   control_error);
+        }
+        response_received = true;
+        if (!response.error.empty()) {
+          throw std::runtime_error("TP worker failed: " + response.error);
+        }
+        result = request.Wait(on_token);
+        if (response.tokens.size() != result.tokens.size()) {
+          throw std::runtime_error("TP worker token count mismatch");
+        }
+        for (std::size_t i = 0; i < result.tokens.size(); ++i) {
+          if (static_cast<std::uint32_t>(response.tokens[i]) !=
+              result.tokens[i]) {
+            throw std::runtime_error("TP worker token mismatch");
+          }
+        }
+        if (response.draft_tokens != result.draft_tokens ||
+            response.draft_accepted_tokens != result.draft_accepted_tokens ||
+            response.cached_prompt_tokens != result.cached_prompt_tokens ||
+            response.cache_snapshot_bytes != result.cache_snapshot_bytes) {
+          throw std::runtime_error("TP worker cache/draft telemetry mismatch");
+        }
+        if (initial == InitialOutputState::kReasoning) {
+          const auto reasoning_end =
+              current->scheduler->runner().Tokenize("</think>");
+          if (!reasoning_end.empty()) {
+            const auto end =
+                std::search(result.tokens.begin(), result.tokens.end(),
+                            reasoning_end.begin(), reasoning_end.end());
+            result.reasoning_tokens =
+                static_cast<std::size_t>(end - result.tokens.begin());
+          }
+        }
+        if (!operation.End(&control_error)) {
+          current->response_broker->FailAll(
+              "TP operation scope cleanup failed: " + control_error);
+          throw std::runtime_error("TP operation scope cleanup failed: " +
+                                   control_error);
+        }
+        return result;
+      } catch (...) {
+        try {
+          request.Cancel();
+          (void)request.Wait({});
+        } catch (...) {
+        }
+        if (!send_started) {
+          std::string cancel_error;
+          (void)current->response_broker->CancelUnsentResponse(sequence,
+                                                               &cancel_error);
+        } else if (!response_received) {
+          current->response_broker->FailAll(
+              "TP request failed before a correlated response arrived");
+        }
+        throw;
+      }
+    }
+
     auto request = current->scheduler->Submit(
         std::move(prompt_tokens), max_tokens, sampling, is_cancelled,
         static_cast<bool>(on_token),
@@ -2807,6 +3214,9 @@ struct InferenceBackend::Impl {
   }
 
   mutable std::mutex state_mutex;
+  mutable std::shared_ptr<std::mutex> tp_submit_mutex{
+      std::make_shared<std::mutex>()};
+  mutable std::uint64_t tp_sequence{0};
   std::shared_ptr<const State> state;
 #endif
 };
@@ -2822,7 +3232,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             TextSchedulerPolicy scheduler_policy,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
-                            const std::string& vision_model_path) {
+                            const std::string& vision_model_path,
+                            const TextTpConfig& tp_config) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -2832,12 +3243,16 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
+  const std::string architecture =
+      std::string(reader->GetMetadataString("general.architecture")
+                      .value_or(std::string_view{}));
+  if (tp_config.world_size > 1 && architecture != "qwen4exp") {
+    SetError(error, "HTTP TP=2 is supported only by Qwen3.8-Flash-Next");
+    return false;
+  }
   if (max_context == 0) {
-    const auto architecture =
-        reader->GetMetadataString("general.architecture").value_or("");
     const auto native =
-        reader->GetMetadataUint64(std::string(architecture) + ".context_length")
-            .value_or(0);
+        reader->GetMetadataUint64(architecture + ".context_length").value_or(0);
     if (native < 2 || native > std::numeric_limits<std::uint32_t>::max()) {
       SetError(error,
                "GGUF has no valid native context length; specify --context");
@@ -2846,7 +3261,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     max_context = static_cast<std::uint32_t>(native);
   }
 
-  if (reader->GetMetadataString("general.architecture") == "deepseek4") {
+  if (architecture == "deepseek4") {
     if (!vision_model_path.empty()) {
       SetError(error, "DeepSeek does not support --mmproj");
       return false;
@@ -2901,7 +3316,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config));
   }
-  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+  if (architecture == "qwen4exp") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kMtp) {
       SetError(error,
@@ -2944,11 +3359,25 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
+            .tp_rank = tp_config.rank,
+            .tp_world_size = tp_config.world_size,
+            .hip_device = tp_config.hip_device,
+            .communicator = tp_config.communicator,
         },
         &load_error);
     if (model == nullptr) {
       SetError(error,
                "Failed to create Qwen3.8-Flash-Next model: " + load_error);
+      return false;
+    }
+    if (model->TpWorldSize() > 1 && session_count != 1) {
+      SetError(error, "Qwen3.8-Flash-Next TP2 currently requires one session");
+      return false;
+    }
+    if (model->TpWorldSize() > 1 &&
+        DiskCacheEnabled(resolved_disk_cache_config)) {
+      SetError(error,
+               "Qwen3.8-Flash-Next TP2 does not support disk continuation");
       return false;
     }
     if (DiskCacheEnabled(resolved_disk_cache_config) &&
@@ -2969,7 +3398,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config));
+                std::move(resolved_disk_cache_config), tp_config);
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
@@ -3011,6 +3440,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)speculative_config;
   (void)disk_cache_config;
   (void)vision_model_path;
+  (void)tp_config;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -3241,7 +3671,7 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config) {
+    TextDiskCacheConfig disk_cache_config, const TextTpConfig& tp_config) {
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
@@ -3249,6 +3679,19 @@ bool InferenceBackend::load(
   if (max_context == 0)
     max_context = model->MaxContext();
 
+  if (model->TpWorldSize() > 1 &&
+      (tp_config.control == nullptr || tp_config.communicator == nullptr)) {
+    SetError(error,
+             "Qwen3.8-Flash-Next TP2 requires a worker control channel "
+             "and communicator");
+    return false;
+  }
+  if (model->TpWorldSize() > 1 &&
+      (session_count != 1 || DiskCacheEnabled(disk_cache_config))) {
+    SetError(error,
+             "Qwen3.8-Flash-Next TP2 requires one session and no disk cache");
+    return false;
+  }
   if (session_count == 0) {
     SetError(error, "HTTP session count must be at least one");
     return false;
@@ -3257,6 +3700,11 @@ bool InferenceBackend::load(
     SetError(
         error,
         "HTTP context exceeds the loaded Qwen3.8-Flash-Next model context");
+    return false;
+  }
+  if (prefill_policy.decode_active_tokens >
+      std::numeric_limits<std::uint32_t>::max()) {
+    SetError(error, "HTTP prefill chunk exceeds the TP control range");
     return false;
   }
   if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
@@ -3284,6 +3732,9 @@ bool InferenceBackend::load(
              "invalid");
     return false;
   }
+  const auto tp_world_size = model->TpWorldSize();
+  const auto tp_rank = model->TpRank();
+  const bool has_mtp = model->HasMtp();
   try {
     auto new_state = std::make_shared<Impl::State>();
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
@@ -3291,7 +3742,8 @@ bool InferenceBackend::load(
         speculative_config.backend == TextSpeculativeBackend::kMtp,
         speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+        disk_cache_config.draft_model_artifact_fingerprint,
+        tp_config.allow_cache_reuse);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
@@ -3306,6 +3758,33 @@ bool InferenceBackend::load(
         std::move(runner), session_count, std::move(runner_disk_cache));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
+    new_state->control = tp_config.control;
+    new_state->communicator = tp_config.communicator;
+    new_state->tp_rank = tp_rank;
+    new_state->tp_world_size = tp_world_size;
+    new_state->tp_allow_cache_reuse = tp_config.allow_cache_reuse;
+    if (tp_world_size > 1) {
+      const TpControlConfig control_config{
+          .rank = tp_rank,
+          .world_size = tp_world_size,
+          .max_context = max_context,
+          .max_draft_tokens = has_mtp ? speculative_config.max_draft_tokens : 0,
+          .use_mtp = has_mtp,
+          .allow_cache_reuse = tp_config.allow_cache_reuse,
+          .auth_token = tp_config.auth_token,
+          .prefill_chunk_tokens =
+              static_cast<std::uint32_t>(prefill_policy.decode_active_tokens),
+      };
+      std::string control_error;
+      if (!tp_config.control->Handshake(control_config, &control_error)) {
+        SetError(error, "TP worker handshake failed: " + control_error);
+        return false;
+      }
+      if (tp_rank == 0) {
+        new_state->response_broker =
+            std::make_shared<TpResponseBroker>(tp_config.control, 1);
+      }
+    }
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -3315,6 +3794,113 @@ bool InferenceBackend::load(
     SetError(error, exception.what());
     return false;
   }
+}
+
+bool InferenceBackend::run_worker(std::string* error) {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->control == nullptr ||
+      state->communicator == nullptr || state->tp_world_size != 2 ||
+      state->tp_rank != 1) {
+    SetError(error, "TP worker requires a loaded rank-1 Flash-Next model");
+    return false;
+  }
+  for (;;) {
+    TpControlCommand command;
+    std::string control_error;
+    if (!state->control->ReceiveCommand(&command, &control_error)) {
+      SetError(error, "TP worker command receive failed: " + control_error);
+      return false;
+    }
+    TpControlResponse response{.sequence = command.sequence};
+    auto operation = std::make_shared<TpOperationLease>(state->communicator,
+                                                        command.sequence);
+    if (!operation->Begin(&control_error)) {
+      response.error =
+          "TP worker operation scope bind failed: " + control_error;
+      if (response.error.size() > (1U << 20)) {
+        response.error.resize(1U << 20);
+      }
+      if (!state->control->SendResponse(response, &control_error)) {
+        SetError(error, "TP worker response send failed: " + control_error);
+        return false;
+      }
+      SetError(error, response.error);
+      return false;
+    }
+    try {
+      std::vector<TextRunnerToken> prompt_tokens;
+      prompt_tokens.reserve(command.prompt_tokens.size());
+      for (const auto token : command.prompt_tokens) {
+        if (token < 0 || static_cast<std::uint64_t>(token) >
+                             std::numeric_limits<TextRunnerToken>::max()) {
+          throw std::invalid_argument(
+              "TP worker received an out-of-range prompt token");
+        }
+        prompt_tokens.push_back(static_cast<TextRunnerToken>(token));
+      }
+      sampling::SamplingConfig greedy;
+      auto request = state->scheduler->Submit(
+          std::move(prompt_tokens), command.max_tokens, greedy, {}, false,
+          TextRequestMetadata{
+              .client_id = command.client_id,
+              .deadline = std::nullopt,
+              .request_start = Clock::now(),
+              .prompt_context = nullptr,
+              .cache_prompt = command.cache_prompt,
+              .cache_prefix_tokens = command.cache_prefix_tokens,
+          });
+      const auto result = request.Wait({});
+      response.tokens.reserve(result.tokens.size());
+      for (const auto token : result.tokens) {
+        if (token > static_cast<tokenization::TokenId>(
+                        std::numeric_limits<std::int32_t>::max())) {
+          throw std::invalid_argument(
+              "TP worker produced an out-of-range token");
+        }
+        response.tokens.push_back(static_cast<std::int32_t>(token));
+      }
+      response.draft_tokens = result.draft_tokens;
+      response.draft_accepted_tokens = result.draft_accepted_tokens;
+      if (result.cached_prompt_tokens >
+          std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(
+            "TP worker cached prompt count is out of range");
+      }
+      response.cached_prompt_tokens =
+          static_cast<std::uint32_t>(result.cached_prompt_tokens);
+      response.cache_snapshot_bytes = result.cache_snapshot_bytes;
+      response.error = result.cancelled ? "worker request cancelled" : "";
+    } catch (const std::exception& exception) {
+      response.error = exception.what();
+      if (response.error.size() > (1U << 20)) {
+        response.error.resize(1U << 20);
+      }
+    }
+    std::string operation_error;
+    if (!operation->End(&operation_error)) {
+      if (!response.error.empty()) {
+        response.error += "; ";
+      }
+      response.error +=
+          "TP worker operation scope cleanup failed: " + operation_error;
+      if (response.error.size() > (1U << 20)) {
+        response.error.resize(1U << 20);
+      }
+    }
+    if (!state->control->SendResponse(response, &control_error)) {
+      SetError(error, "TP worker response send failed: " + control_error);
+      return false;
+    }
+    if (!operation_error.empty()) {
+      SetError(error, response.error);
+      return false;
+    }
+  }
+#else
+  SetError(error, "TP worker requires the HIP backend");
+  return false;
+#endif
 }
 #endif
 
@@ -3507,6 +4093,99 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
 
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
+  if (state->control != nullptr) {
+    const bool use_cache_reuse =
+        state->tp_allow_cache_reuse && request.cache_prompt;
+    const std::size_t worker_cache_prefix_tokens =
+        use_cache_reuse ? prompt->cache_prefix_tokens : 0;
+    if (stream_output || !sampling_config.can_use_unmodified_argmax() ||
+        prompt->context != nullptr ||
+        (prompt->cache_prefix_tokens != 0 && !use_cache_reuse) ||
+        !request.stop_sequences.empty() ||
+        max_tokens > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::invalid_argument(
+          "TP2 start_chat requires one greedy request without stop sequences "
+          "and an explicitly enabled cache-reuse path");
+    }
+    std::vector<std::int32_t> worker_prompt;
+    worker_prompt.reserve(prompt->tokens.size());
+    for (const auto token : prompt->tokens) {
+      if (token > static_cast<TextRunnerToken>(
+                      std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument(
+            "TP2 prompt token exceeds the worker protocol range");
+      }
+      worker_prompt.push_back(static_cast<std::int32_t>(token));
+    }
+    const std::lock_guard<std::mutex> lock(*impl_->tp_submit_mutex);
+    const std::uint64_t sequence = impl_->tp_sequence++;
+    if (state->response_broker == nullptr || state->communicator == nullptr) {
+      throw std::logic_error(
+          "TP rank-zero response broker or communicator is missing");
+    }
+    auto operation =
+        std::make_shared<TpOperationLease>(state->communicator, sequence);
+    std::string control_error;
+    if (!operation->Begin(&control_error)) {
+      throw std::runtime_error("TP operation scope bind failed: " +
+                               control_error);
+    }
+    auto scheduled_request = state->scheduler->Submit(
+        std::move(prompt->tokens), max_tokens, sampling_config, {}, false,
+        TextRequestMetadata{
+            .client_id = client_id,
+            .deadline = std::nullopt,
+            .request_start = request_start,
+            .prompt_context = nullptr,
+            .cache_prompt = use_cache_reuse,
+            .cache_prefix_tokens = worker_cache_prefix_tokens,
+        });
+    if (!state->response_broker->RegisterPendingResponse(sequence,
+                                                         &control_error)) {
+      try {
+        scheduled_request.Cancel();
+        (void)scheduled_request.Wait({});
+      } catch (...) {
+      }
+      throw std::runtime_error("TP response registration failed: " +
+                               control_error);
+    }
+    bool send_started = false;
+    try {
+      TpControlCommand command{
+          .sequence = sequence,
+          .max_tokens = static_cast<std::uint32_t>(max_tokens),
+          .cache_prompt = use_cache_reuse,
+          .cache_prefix_tokens =
+              static_cast<std::uint32_t>(worker_cache_prefix_tokens),
+          .prompt_tokens = std::move(worker_prompt),
+          .client_id = client_id,
+      };
+      send_started = true;
+      if (!state->control->SendCommand(command, &control_error)) {
+        throw std::runtime_error("TP worker command failed: " + control_error);
+      }
+      return std::make_shared<Impl::ScheduledGenerationRequest>(
+          state, std::move(scheduled_request),
+          state->scheduler->runner().InitialOutputState(request),
+          state->response_broker, std::move(operation), sequence);
+    } catch (...) {
+      try {
+        scheduled_request.Cancel();
+        (void)scheduled_request.Wait({});
+      } catch (...) {
+      }
+      if (send_started) {
+        state->response_broker->FailAll(
+            "TP command send failed before request ownership transferred");
+      } else {
+        std::string cancel_error;
+        (void)state->response_broker->CancelUnsentResponse(sequence,
+                                                           &cancel_error);
+      }
+      throw;
+    }
+  }
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt->tokens), max_tokens, sampling_config, is_cancelled,
       stream_output,

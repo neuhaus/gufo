@@ -13,6 +13,8 @@
 #include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -72,6 +74,40 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     AssignError(error_msg, "decode concurrency must be between one and eight");
     return nullptr;
   }
+  if (options.hip_device < 0) {
+    AssignError(error_msg, "HIP device index must be nonnegative");
+    return nullptr;
+  }
+  if (options.tp_world_size != 1 && options.tp_world_size != 2) {
+    AssignError(error_msg,
+                "Flash-Next currently supports TP world sizes one or two");
+    return nullptr;
+  }
+  if (options.tp_world_size == 1 && options.tp_rank != 0) {
+    AssignError(error_msg, "single-rank Flash-Next requires rank zero");
+    return nullptr;
+  }
+  if (options.tp_world_size > 1 && !options.communicator) {
+    AssignError(error_msg, "TP=2 Flash-Next requires a communicator");
+    return nullptr;
+  }
+  if (options.tp_world_size > 1 &&
+      (options.communicator->world_size() != options.tp_world_size ||
+       options.communicator->rank() != options.tp_rank ||
+       options.communicator->device_index() != options.hip_device)) {
+    AssignError(error_msg,
+                "TP communicator identity does not match model rank/device");
+    return nullptr;
+  }
+  if (options.tp_world_size > 1 && !options.vision_model_path.empty()) {
+    AssignError(error_msg,
+                "vision is not supported by the initial TP=2 Flash-Next path");
+    return nullptr;
+  }
+  if (hipSetDevice(options.hip_device) != hipSuccess) {
+    AssignError(error_msg, "HIP device selection failed");
+    return nullptr;
+  }
   if (options.max_draft_tokens == 0) {
     AssignError(error_msg, "draft token limit must be positive");
     return nullptr;
@@ -93,17 +129,29 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   m->weights_ = std::make_unique<ModelWeights>(std::move(*weights));
   const Config& c = m->weights_->config;
+  std::optional<distributed::TpPartition> partition;
+  const distributed::TpPartition* partition_ptr = nullptr;
+  if (options.tp_world_size > 1) {
+    partition = distributed::TpPartition::Create(
+        c.num_experts, options.tp_rank, options.tp_world_size, error_msg);
+    if (!partition) {
+      return nullptr;
+    }
+    partition_ptr = &*partition;
+  }
   if (options.max_context == 0 || options.max_context > c.context_length) {
     AssignError(error_msg, "context exceeds the model's " +
                                std::to_string(c.context_length) + " tokens");
     return nullptr;
   }
-  try {
-    m->vision_ = qwen::vision::Encoder::Open(
-        model_path, options.vision_model_path, c.hidden_size);
-  } catch (const std::exception& e) {
-    AssignError(error_msg, e.what());
-    return nullptr;
+  if (options.tp_world_size == 1) {
+    try {
+      m->vision_ = qwen::vision::Encoder::Open(
+          model_path, options.vision_model_path, c.hidden_size);
+    } catch (const std::exception& e) {
+      AssignError(error_msg, e.what());
+      return nullptr;
+    }
   }
   m->tokenizer_ =
       tokenization::QwenTokenizer::CreateFromGguf(*m->reader_, error_msg);
@@ -131,13 +179,14 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
     m->mtp_weights_ = std::make_unique<MtpWeights>(std::move(*mtp));
   }
-  m->device_ = rocm::DeviceModel::Upload(*m->weights_, *m->reader_,
-                                         m->mtp_weights_.get(),
-                                         m->mtp_reader_.get(), error_msg);
+  m->device_ = rocm::DeviceModel::Upload(
+      *m->weights_, *m->reader_, m->mtp_weights_.get(), m->mtp_reader_.get(),
+      error_msg, partition_ptr);
   if (!m->device_) {
     return nullptr;
   }
   rocm::Executor::Options exec;
+  exec.device_index = options.hip_device;
   exec.max_batch = m->PrefillCapacity();
   exec.max_logit_rows =
       m->mtp_weights_
@@ -145,6 +194,13 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                 exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
           : 1;
   exec.max_speculative = exec.max_logit_rows;
+  if (options.communicator) {
+    const auto communicator = options.communicator;
+    exec.all_reduce = [communicator](float* data, std::size_t bytes,
+                                     hipStream_t stream, std::string* error) {
+      return communicator->AllReduceSum(data, bytes, stream, error);
+    };
+  }
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -353,11 +409,22 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
 
 bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                               std::string* error_msg) {
-  return RestoreSnapshot(snapshot.bytes(), error_msg);
+  return RestoreSnapshotPayload(snapshot.bytes(), error_msg);
 }
 
 bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
                               std::string* error_msg) {
+  if (model_->options_.tp_world_size > 1) {
+    AssignError(
+        error_msg,
+        "distributed Flash-Next serialized snapshots are not supported");
+    return false;
+  }
+  return RestoreSnapshotPayload(payload, error_msg);
+}
+
+bool Session::RestoreSnapshotPayload(std::span<const std::uint8_t> payload,
+                                     std::string* error_msg) {
   SessionSnapshotHeader header{};
   if (payload.size() < sizeof(header)) {
     AssignError(error_msg, "session snapshot is truncated");
