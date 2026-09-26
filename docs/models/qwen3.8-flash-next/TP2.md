@@ -174,14 +174,16 @@ experimental and must not be rendered into the published benchmark tables.
 
 - Expert-parallel routed MoE with replicated dense, attention, GDN, HC,
   embedding, and LM-head weights.
-- Rank 0 owns the shared expert; the routed layer output is reduced with the
-  ordered communicator.
+- The shared expert's intermediate dimension is split across ranks. Its
+  partial outputs join the routed-expert output in the existing collective.
 - Host-staged synchronous RDMA reads use identical fixed IOVA windows for
   send, receive, and result data, with a small ordered TCP control/ack
   channel; an RDMA completion channel is used when available, with bounded
   CQ polling as a provider fallback. HIP graph capture is disabled.
   The probe fails safely if a fixed staging address is already occupied.
-- The initial host sum changes reduction order, so distributed logits are
+- Each rank adds the peer partial on the GPU after the staged RDMA read; read
+  acknowledgements are consumed before the next exchange reuses the window.
+  Partitioning changes reduction order relative to TP1, so TP1/TP2 logits are
   compared with an explicit tolerance rather than claimed bit-identical.
 - A rank with no locally selected experts emits a zero routed contribution
   and still participates in the collective.
@@ -271,7 +273,8 @@ experimental and must not be rendered into the published benchmark tables.
   Still covered by hosted tests only: peer cancel mid-cohort, member failure,
   and the runner-capacity refusal. TP2 loading rejects more than one session,
   so that refusal cannot be injected on hardware without relaxing the guard.
-  No C2 command has run with a prompt longer than one prefill chunk.
+  Multi-chunk C2 probe runs are recorded in [NEXT.md](NEXT.md); they do not
+  enable concurrent serving.
 
 - The dormant C2 path HAS now run end to end on hardware, three consecutive
   times, via `qwen38_flash_next_tp_c2_probe` (rank 0 on `fuzzy`, rank 1 on
@@ -285,13 +288,14 @@ experimental and must not be rendered into the published benchmark tables.
   local greedy output. Each member issued 8 forwards and 384 collectives
   (48 layers), where 8 published tokens cost 7 decode advances because
   `final_token_advance_required` is false on the distributed runner. Still
-  unproven: batched/physical C2, any performance benefit, and failure injection
-  on hardware.
+  unproven in serving: batched/physical C2. Later probe batching and hardware
+  fault-injection evidence are recorded in [NEXT.md](NEXT.md).
 - MTP follows the same expert partition and collective path.
 - Q8_0 uses the same partition/upload contract; `gpu_probe` reports exact
   routed source bytes and the device model reports post-conversion resident
-  bytes. The larger target must pass that local-memory fit check before it is
-  promoted to a serving target.
+  bytes. Q8 memory fit and restricted AR/MTP serving passed on the combined
+  branch; independent quality and ordinary client support remain open. See
+  [INTEGRATION.md](INTEGRATION.md) for the fresh baseline.
 - Batched single-token advance was compared against serial advance on ONE host,
   Q4 UD-Q4_K_XL, greedy, 64 new tokens, two prompts of 2106 and 78 prompt
   tokens. `gufo serve -j 2` selected `plan=batched-w2 batch_width=2` with both

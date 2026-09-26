@@ -22,6 +22,13 @@ target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
   gufo_qwen38_flash_next_reference)
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
+# Host-only PLE gather fingerprint for the full-Q8 divergence investigation.
+# It opens its own n-gram table and never touches a ROCm device.
+add_executable(qwen38_flash_next_ple_gather_probe EXCLUDE_FROM_ALL
+  ple_gather_probe.cpp)
+target_link_libraries(qwen38_flash_next_ple_gather_probe PRIVATE
+  gufo_qwen38_flash_next)
+
 if (ENGINE_ENABLE_HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
