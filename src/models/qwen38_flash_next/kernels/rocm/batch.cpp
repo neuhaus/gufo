@@ -630,10 +630,10 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error)) {
     return false;
   }
-  // Rank zero owns the shared expert's contribution; peers run the same
-  // projections so their activation staging state matches, then drop the
-  // output (see Executor::Moe).
-  if (model_->tp_rank() != 0 &&
+  // A split shared expert leaves each rank a partial; a whole one belongs to
+  // rank zero, and peers run it only to keep their activation staging state
+  // in step, then drop the output (see Executor::Moe).
+  if (model_->tp_rank() != 0 && !l.shexp_split &&
       !Check(hipMemsetAsync(base.shexp_out, 0,
                             static_cast<std::size_t>(rows) * c.hidden_size *
                                 sizeof(float),

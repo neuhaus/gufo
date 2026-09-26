@@ -57,6 +57,12 @@ struct DeviceLayer {
   DeviceTensor router;
   DeviceTensor ffn_gate_exps, ffn_up_exps, ffn_down_exps, shexp_gate, shexp_up,
       shexp_down;
+  /// Under TP the shared expert is split across ranks: this rank holds its
+  /// share of the intermediate rows of gate/up and the matching columns of
+  /// down, so its output is a partial the MoE all-reduce completes. False when
+  /// the weights cannot be split on a block boundary; then every rank holds
+  /// the whole shared expert and only rank zero keeps its output.
+  bool shexp_split{false};
   DeviceTensor nextn_enorm, nextn_hnorm, nextn_fc_embedding, nextn_fc_hidden;
   DeviceMixer nextn_head;
 };

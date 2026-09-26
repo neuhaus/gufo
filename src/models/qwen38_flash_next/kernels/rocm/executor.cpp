@@ -1619,13 +1619,13 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                     error_msg)) {
     return false;
   }
-  // Rank zero owns the shared expert's contribution, and the routed sum is
-  // reduced after the epilogue, so peers must not add a second copy. Peers
-  // still run the projections above: they rewrite the activation staging
-  // caches, and skipping them would leave a peer's later projections reusing
-  // a different staged copy than rank zero's, so the replicated state would
-  // drift apart (seen with full Q8).
-  if (model_->tp_rank() != 0 &&
+  // A split shared expert leaves each rank a partial that the all-reduce
+  // completes. A whole one belongs to rank zero, so peers must not add a
+  // second copy. Peers still run the projections above: they rewrite the
+  // activation staging caches, and skipping them would leave a peer's later
+  // projections reusing a different staged copy than rank zero's, so the
+  // replicated state would drift apart (seen with full Q8).
+  if (model_->tp_rank() != 0 && !l.shexp_split &&
       !Check(hipMemsetAsync(s_.shexp_out, 0,
                             static_cast<std::size_t>(n_tokens) *
                                 c.hidden_size * sizeof(float),

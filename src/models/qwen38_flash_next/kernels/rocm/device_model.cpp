@@ -7,6 +7,7 @@
 #include <limits>
 
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -118,6 +119,93 @@ struct Uploader {
     }
     return CopyRange(t, range->byte_offset, range->byte_size,
                      range->expert_count);
+  }
+
+  /// Bytes of `elements` consecutive values of one row, or zero when the
+  /// count is not a whole number of quantization blocks.
+  static std::size_t SpanBytes(core::GgmlType type, std::size_t elements) {
+    switch (type) {
+      case core::GgmlType::kF32:
+        return elements * 4;
+      case core::GgmlType::kF16:
+      case core::GgmlType::kBF16:
+        return elements * 2;
+      default:
+        return gufo::quant::QuantizedRowBytes(type, elements);
+    }
+  }
+
+  /// Rows [begin, begin + count) of a matrix.
+  DeviceTensor CopyRows(const TensorRef& t, std::uint32_t begin,
+                        std::uint32_t count) {
+    const std::size_t row_bytes = t.RowBytes();
+    DeviceTensor d = CopyRange(t, static_cast<std::uint64_t>(begin) * row_bytes,
+                               static_cast<std::size_t>(count) * row_bytes, 1);
+    d.rows = count;
+    return d;
+  }
+
+  /// Columns [begin, begin + count) of every row, split on a quantization
+  /// block boundary without dequantizing or changing any weight.
+  DeviceTensor CopyColumns(const TensorRef& t, std::uint32_t begin,
+                           std::uint32_t count) {
+    const std::size_t row_bytes = t.RowBytes();
+    const std::size_t offset = SpanBytes(t.type, begin);
+    const std::size_t part_row = SpanBytes(t.type, count);
+    DeviceTensor full = Copy(t);
+    if (!ok || !stager.Finish(error)) {
+      Fail("column split upload failed for " + std::string(t.name));
+      return {};
+    }
+    DeviceTensor d = full;
+    d.cols = count;
+    const std::size_t part_bytes = part_row * t.rows;
+    if (hipMalloc(&d.data, part_bytes + kTailMargin) != hipSuccess) {
+      Fail("column split allocation failed for " + std::string(t.name));
+      return {};
+    }
+    allocations.push_back(d.data);
+    bytes += part_bytes + kTailMargin;
+    if (hipMemcpy2D(d.data, part_row,
+                    static_cast<const std::uint8_t*>(full.data) + offset,
+                    row_bytes, part_row, t.rows,
+                    hipMemcpyDeviceToDevice) != hipSuccess ||
+        hipMemset(static_cast<std::uint8_t*>(d.data) + part_bytes, 0,
+                  kTailMargin) != hipSuccess) {
+      Fail("column split copy failed for " + std::string(t.name));
+      return {};
+    }
+    std::erase(allocations, full.data);
+    (void)hipFree(full.data);
+    bytes -= t.SizeBytes() + kTailMargin;
+    return d;
+  }
+
+  /// Splits the shared expert's intermediate dimension across ranks when
+  /// every piece falls on a block boundary; returns false to keep it whole.
+  bool SplitSharedExpert(const LayerWeights& l, DeviceLayer& d) {
+    if (partition == nullptr || !partition->distributed() ||
+        l.shexp_gate.empty() || l.shexp_up.empty() || l.shexp_down.empty()) {
+      return false;
+    }
+    const std::uint64_t ff = l.shexp_gate.rows;
+    const std::uint32_t world = partition->world_size;
+    if (ff == 0 || ff % world != 0 || l.shexp_up.rows != ff ||
+        l.shexp_down.cols != ff) {
+      return false;
+    }
+    // A share of whole blocks puts every rank's first column on a block
+    // boundary too.
+    const auto share = static_cast<std::uint32_t>(ff / world);
+    const auto begin = share * partition->rank;
+    if (SpanBytes(l.shexp_down.type, share) == 0) {
+      return false;
+    }
+    d.shexp_gate = CopyRows(l.shexp_gate, begin, share);
+    d.shexp_up = CopyRows(l.shexp_up, begin, share);
+    d.shexp_down = CopyColumns(l.shexp_down, begin, share);
+    d.shexp_split = true;
+    return true;
   }
 
   // GGUF packs [fc_embedding | fc_hidden] across each row. Split on a
@@ -286,9 +374,11 @@ struct Uploader {
     d.ffn_gate_exps = CopyRouted(l.ffn_gate_exps);
     d.ffn_up_exps = CopyRouted(l.ffn_up_exps);
     d.ffn_down_exps = CopyRouted(l.ffn_down_exps);
-    d.shexp_gate = Copy(l.shexp_gate);
-    d.shexp_up = Copy(l.shexp_up);
-    d.shexp_down = Copy(l.shexp_down);
+    if (!SplitSharedExpert(l, d)) {
+      d.shexp_gate = Copy(l.shexp_gate);
+      d.shexp_up = Copy(l.shexp_up);
+      d.shexp_down = Copy(l.shexp_down);
+    }
     d.nextn_enorm = Copy(l.nextn_enorm);
     d.nextn_hnorm = Copy(l.nextn_hnorm);
     SplitMtpProjection(l.nextn_eh_proj, d.nextn_fc_embedding,

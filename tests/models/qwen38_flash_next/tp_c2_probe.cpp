@@ -391,6 +391,9 @@ Step-2 spike:
                           program, but each decode step advances the included
                           members one at a time. Both modes print decode_ms and
                           ms_per_step, so the pair measures what batching buys.
+                          A member that stops early leaves a serial step with
+                          one forward: compare ms_per_forward across runs whose
+                          members stop at different steps.
                           BOTH ranks must pass the same mode flag.
   --allreduce-bench N     Load no model: time N all-reduces each of 1, 2 and 8
                           decode rows and one 512-row prefill chunk, and print
@@ -1369,8 +1372,10 @@ int RunBatchedW2(const char* role, const std::shared_ptr<q::Model>& model,
       std::chrono::duration<double, std::milli>(decode_time).count();
   char timing[160];
   std::snprintf(timing, sizeof(timing),
-                "decode_ms=%.1f ms_per_step=%.2f tokens_per_s=%.1f",
+                "decode_ms=%.1f ms_per_step=%.2f ms_per_forward=%.2f "
+                "tokens_per_s=%.1f",
                 decode_ms, timed_steps == 0 ? 0.0 : decode_ms / timed_steps,
+                forwards == 0 ? 0.0 : decode_ms / forwards,
                 decode_ms <= 0.0 ? 0.0 : advanced_tokens * 1000.0 / decode_ms);
   Say(role, std::string(serial ? "serial" : "batched") +
                 " decode: steps=" + std::to_string(timed_steps) +
