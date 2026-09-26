@@ -77,6 +77,15 @@ Order:
 6. C2 and higher concurrency later, once it serves concurrent requests; dormant
    code without a caller is hard to justify in review. Park #3 until then.
 
+Transport scope: InfiniBand only until the above is in good shape. RoCEv2 and
+RDMA over Thunderbolt/USB4 come after. The communicator's exchange uses
+one-sided `IBV_WR_RDMA_READ` and `ibv_query_gid` addressing. RoCEv2 keeps that
+model and mainly needs the right GID index. [OdinLink-Five](https://github.com/Geramy/OdinLink-Five)
+(Thunderbolt RDMA) also sits under libibverbs, but its provider maps queue pairs
+to streams and sends every work request as a two-sided SEND, and it has no
+`ibv_query_gid`. It would need a two-sided exchange (post a receive, SEND the
+partial) behind the existing `Communicator` interface.
+
 ## Measured TP2 performance
 
 Q4 UD-Q4_K_XL, rank 0 `fuzzy`, rank 1 `misty`, FDR InfiniBand, 2026-09-26.
