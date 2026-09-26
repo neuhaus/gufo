@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -2849,6 +2850,8 @@ struct InferenceBackend::Impl {
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
     ReasoningOptions reasoning_defaults;
+    /// TP2: how many requests may wait while one executes (`--max-pending`).
+    std::size_t tp_max_waiting{0};
   };
 
   /// One TP2 request on rank 0, from the command that starts it on rank 1 to
@@ -3062,7 +3065,21 @@ struct InferenceBackend::Impl {
       }
       begin.prompt_tokens.push_back(static_cast<std::int32_t>(token));
     }
-    std::unique_lock<std::mutex> serial(*tp_request_mutex);
+    // Rank 1 executes one request at a time, so later requests wait here for
+    // the running one, bounded like the scheduler's queue.
+    if (tp_waiting.fetch_add(1) >= state->tp_max_waiting) {
+      tp_waiting.fetch_sub(1);
+      throw TextGenerationError(TextGenerationErrorCode::kQueueFull,
+                                "text generation pending queue is full");
+    }
+    std::unique_lock<std::mutex> serial(*tp_request_mutex, std::defer_lock);
+    try {
+      serial.lock();
+    } catch (...) {
+      tp_waiting.fetch_sub(1);
+      throw;
+    }
+    tp_waiting.fetch_sub(1);
     begin.sequence = tp_sequence++;
     auto operation =
         std::make_unique<TpOperationLease>(state->communicator, begin.sequence);
@@ -3162,6 +3179,8 @@ struct InferenceBackend::Impl {
   /// Serializes TP2 requests on rank 0 for their whole lifetime.
   mutable std::shared_ptr<std::mutex> tp_request_mutex{
       std::make_shared<std::mutex>()};
+  /// TP2 requests waiting for `tp_request_mutex`.
+  mutable std::atomic<std::size_t> tp_waiting{0};
   /// Starts at 1: a request's sequence names its operation scope, and zero
   /// means "between requests" to the instruction protocol.
   mutable std::uint64_t tp_sequence{1};
@@ -3693,6 +3712,7 @@ bool InferenceBackend::load(
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
+    new_state->tp_max_waiting = scheduler_policy.max_pending_requests;
     if (tp_world_size > 1) {
       const TpControlConfig control_config{
           .snapshot_budget_bytes = HostSnapshotBudgetBytes(),

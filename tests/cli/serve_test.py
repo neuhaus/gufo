@@ -47,7 +47,7 @@ def main():
         "--tp-rank", "0", "--tp-bootstrap-port", "18515",
         "--tp-control-port", "18516", "--tp-control-token", "test",
         "--sessions", "2",
-    ], 2, "TP2 currently requires C1")
+    ], 2, "TP2 currently requires one session")
     text = check(["transcribe", "--help"], 0, "--prompt")
     assert "--context" in text
 

@@ -1201,13 +1201,10 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
     if (tp_world_size == 2 &&
-        (session_count != 1 || max_pending_requests != 1 ||
-         max_pending_requests_per_client != 1 || request_timeout_ms != 0 ||
-         !cache_disk_directory.empty() || !vision_model_path.empty() ||
-         max_connections != 1)) {
-      std::cerr << "Error: TP2 currently requires C1: one session, one pending "
-                   "request, no timeout, no disk cache, no vision, and one "
-                   "connection\n";
+        (session_count != 1 || request_timeout_ms != 0 ||
+         !cache_disk_directory.empty() || !vision_model_path.empty())) {
+      std::cerr << "Error: TP2 currently requires one session, no timeout, no "
+                   "disk cache and no vision\n";
       return 2;
     }
 
