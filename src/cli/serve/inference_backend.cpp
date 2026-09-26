@@ -3040,6 +3040,13 @@ struct InferenceBackend::Impl {
           " tokens but the context is " + std::to_string(state->max_context) +
           "; increase --context or shorten the conversation");
     }
+    // Resolve the budget as the scheduler does, so rank 1 is told the one
+    // rank 0 uses: zero, a request without `max_tokens`, means "until the
+    // context is full".
+    const std::size_t available = state->max_context - prompt.size();
+    if (max_tokens == 0 || max_tokens > available) {
+      max_tokens = available;
+    }
     if (max_tokens > std::numeric_limits<std::uint32_t>::max()) {
       throw std::invalid_argument(
           "TP2 token budget exceeds the protocol range");
