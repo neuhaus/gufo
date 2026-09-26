@@ -301,7 +301,7 @@ int main(int argc, char** argv) {
   std::unique_ptr<OperationGuard> operation;
 #endif
   if (tp_world_size == 2) {
-    partition = q::distributed::TpPartition::Create(c.num_experts, tp_rank,
+    partition = q::distributed::TpPartition::Create(c.expert_ff, tp_rank,
                                                     tp_world_size, &error);
     if (!partition) {
       std::fprintf(stderr, "partition failed: %s\n", error.c_str());
@@ -375,8 +375,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (tp_world_size == 2) {
-    std::printf("TP2 rank=%u world=%u local_experts=%u resident_bytes=%zu\n",
-                tp_rank, tp_world_size, device->local_experts(),
+    std::printf("TP2 rank=%u world=%u expert_share=%u resident_bytes=%zu\n",
+                tp_rank, tp_world_size, partition->ff_count,
                 device->resident_bytes());
   }
   q::rocm::Executor::Options options;

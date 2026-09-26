@@ -623,8 +623,7 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   if (!DenseBatch(l.router, x, base.router, rows, error))
     return false;
   RouterTopK(base.router, c.num_experts + 1, base.ids, base.weights, rows,
-             c.num_experts, c.num_experts_used, model_->expert_begin(),
-             model_->local_experts(), stream_);
+             c.num_experts, c.num_experts_used, stream_);
   if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
                        error) ||
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error)) {
@@ -647,12 +646,12 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     // scalar Q8 activation quantization and dot-product reduction.
     if (qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),
                               l.ffn_gate_exps.data, l.ffn_up_exps.data, x,
-                              base.ids, base.gate_e, c.expert_ff, c.hidden_size,
-                              rows, l.ffn_gate_exps.experts, c.num_experts_used,
-                              stream_) != 0 ||
+                              base.ids, base.gate_e, l.ffn_gate_exps.rows,
+                              c.hidden_size, rows, l.ffn_gate_exps.experts,
+                              c.num_experts_used, stream_) != 0 ||
         qfn_mmq_moe_vec(static_cast<int>(l.ffn_down_exps.type),
                         l.ffn_down_exps.data, base.gate_e, base.ids,
-                        base.down_e, c.hidden_size, c.expert_ff,
+                        base.down_e, c.hidden_size, l.ffn_gate_exps.rows,
                         rows * c.num_experts_used, l.ffn_down_exps.experts, 1,
                         stream_) != 0)
       return Fail(error, "batched routed vector projection failed");

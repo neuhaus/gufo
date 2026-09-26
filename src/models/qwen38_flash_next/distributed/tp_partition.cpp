@@ -3,6 +3,8 @@
 #include <limits>
 #include <utility>
 
+#include "src/core/quant/ggml_dequant.hpp"
+
 namespace gufo::models::qwen38_flash_next::distributed {
 namespace {
 
@@ -12,58 +14,78 @@ void SetError(std::string* error_msg, std::string message) {
   }
 }
 
-bool CheckedAdd(std::size_t* total, std::size_t value, const char* label,
-                std::string* error_msg) {
+/// Bytes of `elements` consecutive values of one row, or zero when the count
+/// is not a whole number of quantization blocks.
+std::size_t SpanBytes(core::GgmlType type, std::size_t elements) {
+  switch (type) {
+    case core::GgmlType::kF32:
+      return elements * 4;
+    case core::GgmlType::kF16:
+    case core::GgmlType::kBF16:
+      return elements * 2;
+    default:
+      return gufo::quant::QuantizedRowBytes(type, elements);
+  }
+}
+
+bool CheckedMulAdd(std::size_t* total, std::size_t a, std::size_t b,
+                   std::size_t c, std::string* error_msg) {
+  if (a != 0 &&
+      (b > std::numeric_limits<std::size_t>::max() / a ||
+       (b != 0 && c > std::numeric_limits<std::size_t>::max() / (a * b)))) {
+    SetError(error_msg, "TP routed weight plan overflows");
+    return false;
+  }
+  const std::size_t value = a * b * c;
   if (*total > std::numeric_limits<std::size_t>::max() - value) {
-    SetError(error_msg,
-             std::string("TP routed weight plan overflows in ") + label);
+    SetError(error_msg, "TP routed weight plan overflows");
     return false;
   }
   *total += value;
   return true;
 }
 
-std::optional<std::size_t> EncodedSize(const TensorRef& tensor,
-                                       std::string* error_msg) {
-  const std::size_t row_bytes = tensor.RowBytes();
-  if (tensor.empty() || row_bytes == 0 || tensor.rows == 0 ||
-      tensor.experts == 0) {
-    SetError(error_msg, "TP routed weight plan has an invalid tensor shape");
-    return std::nullopt;
-  }
-  if (tensor.rows > std::numeric_limits<std::size_t>::max() / row_bytes) {
-    SetError(error_msg, "TP routed weight plan row bytes overflow");
-    return std::nullopt;
-  }
-  const std::size_t rows = static_cast<std::size_t>(tensor.rows);
-  const std::size_t row_total = rows * row_bytes;
-  if (tensor.experts >
-      static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() /
-                                 (row_total == 0 ? 1 : row_total))) {
-    SetError(error_msg, "TP routed weight plan expert bytes overflow");
-    return std::nullopt;
-  }
-  return row_total * static_cast<std::size_t>(tensor.experts);
-}
-
-bool AddRoutedTensor(const TensorRef& tensor, const TpPartition& partition,
-                     RoutedWeightPlan* plan, std::string* error_msg) {
-  const auto full = EncodedSize(tensor, error_msg);
-  const auto range = LocalExpertRange(tensor, partition, error_msg);
-  if (!full || !range) {
+/// A gate or up projection: `ff_count` of each expert's `expert_ff` rows.
+bool AddRowShare(const TensorRef& t, const TpPartition& partition,
+                 RoutedWeightPlan* plan, std::string* error_msg) {
+  const std::size_t row_bytes = t.RowBytes();
+  if (t.empty() || row_bytes == 0 || t.rows != partition.expert_ff) {
+    SetError(error_msg, "TP routed tensor " + std::string(t.name) +
+                            " does not match the intermediate split");
     return false;
   }
-  return CheckedAdd(&plan->full_encoded_bytes, *full, "full tensor",
-                    error_msg) &&
-         CheckedAdd(&plan->local_encoded_bytes, range->byte_size,
-                    "local tensor", error_msg);
+  return CheckedMulAdd(&plan->full_encoded_bytes, row_bytes, t.rows, t.experts,
+                       error_msg) &&
+         CheckedMulAdd(&plan->local_encoded_bytes, row_bytes,
+                       partition.ff_count, t.experts, error_msg);
+}
+
+/// A down projection: `ff_count` of each row's `expert_ff` columns.
+bool AddColumnShare(const TensorRef& t, const TpPartition& partition,
+                    RoutedWeightPlan* plan, std::string* error_msg) {
+  const std::size_t row_bytes = t.RowBytes();
+  const std::size_t share_bytes = SpanBytes(t.type, partition.ff_count);
+  if (t.empty() || row_bytes == 0 || t.cols != partition.expert_ff) {
+    SetError(error_msg, "TP routed tensor " + std::string(t.name) +
+                            " does not match the intermediate split");
+    return false;
+  }
+  if (share_bytes == 0) {
+    SetError(error_msg, "TP share of " + std::string(t.name) +
+                            " does not fall on a quantization-block boundary");
+    return false;
+  }
+  return CheckedMulAdd(&plan->full_encoded_bytes, row_bytes, t.rows, t.experts,
+                       error_msg) &&
+         CheckedMulAdd(&plan->local_encoded_bytes, share_bytes, t.rows,
+                       t.experts, error_msg);
 }
 
 bool AddLayerRouted(const LayerWeights& layer, const TpPartition& partition,
                     RoutedWeightPlan* plan, std::string* error_msg) {
-  return AddRoutedTensor(layer.ffn_gate_exps, partition, plan, error_msg) &&
-         AddRoutedTensor(layer.ffn_up_exps, partition, plan, error_msg) &&
-         AddRoutedTensor(layer.ffn_down_exps, partition, plan, error_msg);
+  return AddRowShare(layer.ffn_gate_exps, partition, plan, error_msg) &&
+         AddRowShare(layer.ffn_up_exps, partition, plan, error_msg) &&
+         AddColumnShare(layer.ffn_down_exps, partition, plan, error_msg);
 }
 
 }  // namespace
@@ -75,10 +97,9 @@ std::optional<RoutedWeightPlan> PlanRoutedBytes(const ModelWeights& weights,
   if (error_msg != nullptr) {
     error_msg->clear();
   }
-  if (!partition.Valid() ||
-      partition.num_experts != weights.config.num_experts ||
+  if (!partition.Valid() || partition.expert_ff != weights.config.expert_ff ||
       (mtp_weights != nullptr &&
-       mtp_weights->config.num_experts != partition.num_experts)) {
+       mtp_weights->config.expert_ff != partition.expert_ff)) {
     SetError(error_msg,
              "TP routed weight plan geometry does not match the model");
     return std::nullopt;
@@ -96,81 +117,27 @@ std::optional<RoutedWeightPlan> PlanRoutedBytes(const ModelWeights& weights,
   return plan;
 }
 
-std::optional<TpPartition> TpPartition::Create(std::uint32_t num_experts,
+std::optional<TpPartition> TpPartition::Create(std::uint32_t expert_ff,
                                                std::uint32_t rank,
                                                std::uint32_t world_size,
                                                std::string* error_msg) {
   if (error_msg != nullptr) {
     error_msg->clear();
   }
-  if (num_experts == 0 || world_size == 0 || rank >= world_size ||
-      num_experts % world_size != 0) {
+  if (expert_ff == 0 || world_size == 0 || rank >= world_size ||
+      expert_ff % world_size != 0) {
     SetError(error_msg,
-             "TP expert partition requires a nonzero, evenly divisible expert "
-             "count and a valid rank");
+             "TP expert split requires a nonzero, evenly divisible expert "
+             "intermediate size and a valid rank");
     return std::nullopt;
   }
   TpPartition result;
   result.rank = rank;
   result.world_size = world_size;
-  result.num_experts = num_experts;
-  result.expert_count = num_experts / world_size;
-  result.expert_begin = result.expert_count * rank;
+  result.expert_ff = expert_ff;
+  result.ff_count = expert_ff / world_size;
+  result.ff_begin = result.ff_count * rank;
   return result;
-}
-
-std::optional<TensorRange> LocalExpertRange(const TensorRef& tensor,
-                                            const TpPartition& partition,
-                                            std::string* error_msg) {
-  if (error_msg != nullptr) {
-    error_msg->clear();
-  }
-  if (!partition.Valid() || tensor.empty() ||
-      tensor.experts != partition.num_experts) {
-    SetError(error_msg,
-             "TP expert range tensor does not match the partition geometry");
-    return std::nullopt;
-  }
-  const std::size_t row_bytes = tensor.RowBytes();
-  if (row_bytes == 0) {
-    SetError(error_msg,
-             "TP expert range has an unsupported tensor format or shape");
-    return std::nullopt;
-  }
-  const std::uint64_t rows = tensor.rows;
-  if (rows != 0 && partition.expert_count >
-                       std::numeric_limits<std::uint64_t>::max() / rows) {
-    SetError(error_msg, "TP expert range row geometry overflows");
-    return std::nullopt;
-  }
-  const std::uint64_t local_rows = rows * partition.expert_count;
-  if (local_rows != 0 &&
-      static_cast<std::uint64_t>(row_bytes) >
-          std::numeric_limits<std::uint64_t>::max() / local_rows) {
-    SetError(error_msg, "TP expert range byte geometry overflows");
-    return std::nullopt;
-  }
-  if (rows != 0 && partition.expert_begin >
-                       std::numeric_limits<std::uint64_t>::max() / rows) {
-    SetError(error_msg, "TP expert range offset geometry overflows");
-    return std::nullopt;
-  }
-  const std::uint64_t offset_rows = rows * partition.expert_begin;
-  if (offset_rows != 0 &&
-      static_cast<std::uint64_t>(row_bytes) >
-          std::numeric_limits<std::uint64_t>::max() / offset_rows) {
-    SetError(error_msg, "TP expert range offset byte geometry overflows");
-    return std::nullopt;
-  }
-  const std::uint64_t byte_offset = offset_rows * row_bytes;
-  const std::uint64_t byte_size = local_rows * row_bytes;
-  if (byte_offset > std::numeric_limits<std::size_t>::max() ||
-      byte_size > std::numeric_limits<std::size_t>::max()) {
-    SetError(error_msg, "TP expert range exceeds the host addressable size");
-    return std::nullopt;
-  }
-  return TensorRange{partition.expert_begin, partition.expert_count,
-                     byte_offset, static_cast<std::size_t>(byte_size)};
 }
 
 }  // namespace gufo::models::qwen38_flash_next::distributed

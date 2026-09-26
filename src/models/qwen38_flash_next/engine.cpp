@@ -133,7 +133,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   const distributed::TpPartition* partition_ptr = nullptr;
   if (options.tp_world_size > 1) {
     partition = distributed::TpPartition::Create(
-        c.num_experts, options.tp_rank, options.tp_world_size, error_msg);
+        c.expert_ff, options.tp_rank, options.tp_world_size, error_msg);
     if (!partition) {
       return nullptr;
     }

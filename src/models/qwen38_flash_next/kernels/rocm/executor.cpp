@@ -410,16 +410,15 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
-  s.expert_counts = Alloc<std::uint32_t>(a, model.local_experts(), error_msg);
+  s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
   {
-    const std::size_t compact = RoutedCompactRows(slots, model.local_experts());
-    s.routed_bounds =
-        Alloc<std::int32_t>(a, model.local_experts() + 1, error_msg);
-    s.routed_cursors = Alloc<std::int32_t>(a, model.local_experts(), error_msg);
+    const std::size_t compact = RoutedCompactRows(slots, c.num_experts);
+    s.routed_bounds = Alloc<std::int32_t>(a, c.num_experts + 1, error_msg);
+    s.routed_cursors = Alloc<std::int32_t>(a, c.num_experts, error_msg);
     s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
     s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
     s.routed_tiles = Alloc<std::int32_t>(
-        a, 3 * RoutedTileCapacity(slots, model.local_experts()), error_msg);
+        a, 3 * RoutedTileCapacity(slots, c.num_experts), error_msg);
   }
   s.weights = f32(slots);
   s.gate_e = f32(slots * c.expert_ff);
@@ -446,17 +445,15 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
     void* counts = nullptr;
-    if (!Check(hipHostMalloc(&counts,
-                             model.local_experts() * sizeof(std::uint32_t)),
+    if (!Check(hipHostMalloc(&counts, c.num_experts * sizeof(std::uint32_t)),
                "pinned expert counts", error_msg)) {
       return nullptr;
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
     if (!Check(
-            hipHostMalloc(&tiles,
-                          3 * RoutedTileCapacity(slots, model.local_experts()) *
-                              sizeof(std::int32_t)),
+            hipHostMalloc(&tiles, 3 * RoutedTileCapacity(slots, c.num_experts) *
+                                      sizeof(std::int32_t)),
             "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -917,7 +914,6 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   // bucket. Counts are downloaded before the shared expert; wait only for
   // that download while the shared expert continues on the same stream.
   const Config& c = config();
-  const std::uint32_t local_experts = model_->local_experts();
   routed_max_rows_ = 0;
   routed_64_tiles_ = 0;
   routed_pair_tiles_ = 0;
@@ -936,8 +932,8 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   std::uint32_t max_rows = 0;
   std::uint32_t n_tiles = 0;
   routed_tile_rows_ = RoutedTileRows(
-      static_cast<std::size_t>(n_tokens) * c.num_experts_used, local_experts);
-  for (std::uint32_t e = 0; e < local_experts; ++e) {
+      static_cast<std::size_t>(n_tokens) * c.num_experts_used, c.num_experts);
+  for (std::uint32_t e = 0; e < c.num_experts; ++e) {
     const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
     max_rows = std::max(max_rows, counts_host_[e]);
     for (std::uint32_t j = 0;
@@ -951,7 +947,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   // Wide expert buckets also get a 128-token gate/up map: it amortizes
   // weight decoding, while short buckets retain the cheaper 64-token tile.
   if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
-    for (std::uint32_t e = 0; e < local_experts; ++e) {
+    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
       const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
       for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
         tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
@@ -960,14 +956,14 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
     routed_pair_offset_ = routed_n_tiles_;
     routed_pair_tiles_ = routed_64_tiles_;
     std::uint32_t tiles_128 = 0;
-    for (std::uint32_t e = 0; e < local_experts; ++e) {
+    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
       tiles_128 += (counts_host_[e] + 127u) / 128u;
     }
     if (tiles_128 * 4 <= routed_64_tiles_ * 3) {
       routed_pair_rows_ = 128;
       routed_pair_offset_ = n_tiles;
       routed_pair_tiles_ = tiles_128;
-      for (std::uint32_t e = 0; e < local_experts; ++e) {
+      for (std::uint32_t e = 0; e < c.num_experts; ++e) {
         for (std::uint32_t j = 0; j < (counts_host_[e] + 127u) / 128u; ++j) {
           tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
         }
@@ -975,7 +971,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
     }
   }
   routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
-      counts_host_, static_cast<int>(local_experts));
+      counts_host_, static_cast<int>(c.num_experts));
   return n_tiles == 0 || Check(hipMemcpyAsync(s_.routed_tiles, tiles_host_,
                                               n_tiles * sizeof(std::int32_t),
                                               hipMemcpyHostToDevice, stream_),
@@ -1586,13 +1582,12 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     return false;
   }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
-             c.num_experts, used, model_->expert_begin(),
-             model_->local_experts(), stream_);
+             c.num_experts, used, stream_);
   if (ExpertMatrixRows(n_tokens)) {
-    ExpertCounts(s_.ids, s_.expert_counts, n_tokens, model_->local_experts(),
-                 used, stream_);
+    ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
+                 stream_);
     if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
-                              model_->local_experts() * sizeof(std::uint32_t),
+                              c.num_experts * sizeof(std::uint32_t),
                               hipMemcpyDeviceToHost, stream_),
                "expert counts download", error_msg) ||
         !Check(hipEventRecord(counts_ready_, stream_), "expert counts event",
@@ -1664,6 +1659,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
   const std::uint32_t slots = n_tokens * used;
+  // One host holds each expert's full intermediate width; a TP2 rank holds its
+  // share of every expert.
+  const std::uint32_t expert_ff = l.ffn_gate_exps.rows;
   if (!RouteHints(n_tokens, error_msg)) {
     return false;
   }
@@ -1676,18 +1674,11 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                             l.ffn_up_exps.type == l.ffn_gate_exps.type &&
                             (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
                              l.ffn_down_exps.type == GgmlType::kQ8_0) &&
-                            c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
-  if (ExpertMatrixRows(n_tokens) && routed_n_tiles_ == 0) {
-    const std::size_t bytes =
-        static_cast<std::size_t>(slots) * c.hidden_size * sizeof(float);
-    if (!Check(hipMemsetAsync(s_.down_e, 0, bytes, stream_),
-               "empty local routed expert output", error_msg)) {
-      return false;
-    }
-  } else if (wmma_experts) {
+                            c.hidden_size % 256 == 0 && expert_ff % 64 == 0;
+  if (wmma_experts) {
     RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds, s_.routed_cursors,
-                  s_.rows_token, s_.rows_slot, n_tokens, used,
-                  model_->local_experts(), stream_);
+                  s_.rows_token, s_.rows_slot, n_tokens, used, c.num_experts,
+                  stream_);
     // The GEMMs read F16 token rows: the router's F16 GEMM (or the mix)
     // usually left them in s_.x_half already.
     if (!(half_src_ == x && half_rows_ == n_tokens &&
@@ -1713,17 +1704,17 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
                   s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
                   routed_pair_rows_, s_.routed_bounds, s_.rows_token,
-                  s_.rows_slot, up_half, c.expert_ff, c.hidden_size, stream_)
+                  s_.rows_slot, up_half, expert_ff, c.hidden_size, stream_)
             : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
                              s_.routed_tiles, routed_n_tiles_,
                              routed_tile_rows_, s_.routed_bounds, s_.rows_token,
                              s_.rows_slot, nullptr, s_.gate_e, nullptr,
-                             c.expert_ff, c.hidden_size, stream_) &&
+                             expert_ff, c.hidden_size, stream_) &&
                RoutedF16Gemm(l.ffn_up_exps.data, gate_type, x_half,
                              s_.routed_tiles, routed_n_tiles_,
                              routed_tile_rows_, s_.routed_bounds, s_.rows_token,
                              s_.rows_slot, s_.gate_e, nullptr, up_half,
-                             c.expert_ff, c.hidden_size, stream_));
+                             expert_ff, c.hidden_size, stream_));
     if (!gated_ok) {
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
@@ -1745,7 +1736,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                        wide_down ? 64 : routed_tile_rows_, s_.routed_bounds,
                        s_.rows_slot, s_.rows_slot, nullptr, nullptr,
                        reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
-                       c.expert_ff, stream_)) {
+                       expert_ff, stream_)) {
       AssignError(error_msg, "routed F16 down GEMM failed");
       return false;
     }

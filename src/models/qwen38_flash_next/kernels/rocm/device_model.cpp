@@ -103,22 +103,62 @@ struct Uploader {
                      static_cast<std::uint32_t>(t.experts));
   }
 
-  DeviceTensor CopyRouted(const TensorRef& t) {
-    if (t.empty() || !ok) {
-      return {};
-    }
-    if (partition == nullptr) {
+  /// A gate or up projection: this rank's rows of every expert. Each share is
+  /// a contiguous range of the file, so only it is read.
+  DeviceTensor CopyExpertRows(const TensorRef& t) {
+    if (t.empty() || !ok || partition == nullptr) {
       return Copy(t);
     }
-    const auto range = distributed::LocalExpertRange(t, *partition, error);
-    if (!range) {
-      Fail(error != nullptr && !error->empty()
-               ? *error
-               : "invalid routed tensor partition");
+    const std::size_t row_bytes = t.RowBytes();
+    if (t.rows != partition->expert_ff || row_bytes == 0 ||
+        t.experts > std::numeric_limits<std::uint32_t>::max() ||
+        t.cols > std::numeric_limits<std::uint32_t>::max()) {
+      Fail("routed tensor does not match the TP split: " + std::string(t.name));
       return {};
     }
-    return CopyRange(t, range->byte_offset, range->byte_size,
-                     range->expert_count);
+    const std::size_t share = partition->ff_count * row_bytes;
+    const std::size_t size = share * t.experts;
+    void* ptr = nullptr;
+    if (hipMalloc(&ptr, size + kTailMargin) != hipSuccess) {
+      Fail("hipMalloc failed for " + std::string(t.name) + " (" +
+           std::to_string(size) + " bytes)");
+      return {};
+    }
+    allocations.push_back(ptr);
+    bytes += size + kTailMargin;
+    for (std::uint64_t e = 0; e < t.experts; ++e) {
+      const std::uint64_t first_row = e * t.rows + partition->ff_begin;
+      if (!stager.Copy(shard_base + t.shard,
+                       t.file_offset + first_row * row_bytes, share,
+                       static_cast<std::uint8_t*>(ptr) + e * share, error)) {
+        Fail("upload failed for " + std::string(t.name) +
+             (error != nullptr ? ": " + *error : std::string()));
+        return {};
+      }
+    }
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
+                         nullptr);
+    DeviceTensor d;
+    d.data = ptr;
+    d.type = t.type;
+    d.cols = static_cast<std::uint32_t>(t.cols);
+    d.rows = partition->ff_count;
+    d.experts = static_cast<std::uint32_t>(t.experts);
+    return d;
+  }
+
+  /// A down projection: this rank's columns of every expert's rows.
+  DeviceTensor CopyExpertColumns(const TensorRef& t) {
+    if (t.empty() || !ok || partition == nullptr) {
+      return Copy(t);
+    }
+    if (t.cols != partition->expert_ff ||
+        SpanBytes(t.type, partition->ff_count) == 0) {
+      Fail("routed tensor share is not whole quantization blocks: " +
+           std::string(t.name));
+      return {};
+    }
+    return CopyColumns(t, partition->ff_begin, partition->ff_count);
   }
 
   /// Bytes of `elements` consecutive values of one row, or zero when the
@@ -145,8 +185,9 @@ struct Uploader {
     return d;
   }
 
-  /// Columns [begin, begin + count) of every row, split on a quantization
-  /// block boundary without dequantizing or changing any weight.
+  /// Columns [begin, begin + count) of every row (of every stacked expert),
+  /// split on a quantization-block boundary without dequantizing or changing
+  /// any weight.
   DeviceTensor CopyColumns(const TensorRef& t, std::uint32_t begin,
                            std::uint32_t count) {
     const std::size_t row_bytes = t.RowBytes();
@@ -159,7 +200,8 @@ struct Uploader {
     }
     DeviceTensor d = full;
     d.cols = count;
-    const std::size_t part_bytes = part_row * t.rows;
+    const std::size_t rows = t.rows * t.experts;
+    const std::size_t part_bytes = part_row * rows;
     if (hipMalloc(&d.data, part_bytes + kTailMargin) != hipSuccess) {
       Fail("column split allocation failed for " + std::string(t.name));
       return {};
@@ -168,7 +210,7 @@ struct Uploader {
     bytes += part_bytes + kTailMargin;
     if (hipMemcpy2D(d.data, part_row,
                     static_cast<const std::uint8_t*>(full.data) + offset,
-                    row_bytes, part_row, t.rows,
+                    row_bytes, part_row, rows,
                     hipMemcpyDeviceToDevice) != hipSuccess ||
         hipMemset(static_cast<std::uint8_t*>(d.data) + part_bytes, 0,
                   kTailMargin) != hipSuccess) {
@@ -371,9 +413,9 @@ struct Uploader {
     d.ple_norm_conv = Copy(l.ple_norm_conv);
     d.ple_conv1d = Copy(l.ple_conv1d);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
-    d.ffn_gate_exps = CopyRouted(l.ffn_gate_exps);
-    d.ffn_up_exps = CopyRouted(l.ffn_up_exps);
-    d.ffn_down_exps = CopyRouted(l.ffn_down_exps);
+    d.ffn_gate_exps = CopyExpertRows(l.ffn_gate_exps);
+    d.ffn_up_exps = CopyExpertRows(l.ffn_up_exps);
+    d.ffn_down_exps = CopyExpertColumns(l.ffn_down_exps);
     if (!SplitSharedExpert(l, d)) {
       d.shexp_gate = Copy(l.shexp_gate);
       d.shexp_up = Copy(l.shexp_up);
@@ -420,23 +462,16 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   std::unique_ptr<DeviceModel> m(new DeviceModel());
   m->config_ = w.config;
-  if (partition == nullptr) {
-    m->tp_rank_ = 0;
-    m->tp_world_size_ = 1;
-    m->expert_begin_ = 0;
-    m->local_experts_ = static_cast<std::uint32_t>(w.config.num_experts);
-  } else {
+  if (partition != nullptr) {
     if (!partition->Valid() || partition->world_size > 2 ||
-        partition->num_experts != w.config.num_experts) {
+        partition->expert_ff != w.config.expert_ff) {
       if (error_msg != nullptr) {
-        *error_msg = "TP partition expert count does not match the model";
+        *error_msg = "TP split does not match the model's expert size";
       }
       return nullptr;
     }
     m->tp_rank_ = partition->rank;
     m->tp_world_size_ = partition->world_size;
-    m->expert_begin_ = partition->expert_begin;
-    m->local_experts_ = partition->expert_count;
   }
   const auto regions = reader.GetMappedRegions();
   std::vector<core::GgufMappedRegion> shards(regions.begin(), regions.end());
