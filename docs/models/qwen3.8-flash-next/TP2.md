@@ -43,31 +43,42 @@ sequence; an unknown or duplicate sequence poisons the channel. After the
 handshake an idle rank waits without a timeout, and TCP keepalive reports a
 dead peer host.
 
-**Rank-0 step plan (AR).** Rank 0 samples each token and publishes it as a
-`kStep` command; rank 1 consumes it in `SelectNext` instead of sampling, so both
-ranks run the stop test on the same token. Each consume is bounded by 5 s; a
-clean timeout does not poison the channel. `TpStepArm` arms the channel in all
-three request entry points (`GenerateScheduled`, `start_chat`, the rank-1
-worker) and disarms it on every exit. Two ordering rules are not enforced by the
-compiler:
+**Rank 1 as executor.** Rank 0 runs the ordinary scheduler and runner pool
+through `TpMirroredRunner`. Just before each call that changes model state, the
+wrapper sends it to rank 1 as a `kInstruction` (state reset, prefill chunk,
+advance, or one greedy multi-token decode cycle); rank 1's `TpExecutor` makes
+the same call on the same state, and both ranks meet in the call's exchanges.
+Token selection reads only logits and stays on rank 0, so sampling, stop
+sequences, cancellation and streaming are decided by rank 0's scheduler exactly
+as on one host; rank 1 simply receives no further calls. A request starts with
+`kSingle` and ends with `kEnd`. Rank 1 builds no pool or scheduler: it creates
+as many states as rank 0's pool, so a state id names the same state on both
+ranks. Rules that the compiler does not enforce:
 
-- Rank 0's publisher must be armed before its scheduler thread can decode.
-- The prefill preview (`PreviewFirstToken`, from `PrepareFirstSnapshot`) samples
-  a token that prefill discards. It must not publish or consume on either rank,
-  so `SelectNextImpl` takes `use_step_channel = false` for it.
+- Every call that changes model state must pass through the wrapper, including
+  state resets, which the continuation cache makes directly on the state. The
+  base `TextModelRunner::DecodeStep` calls `SelectNext` and `Advance` on the
+  runner it belongs to, so the wrapper implements the token-by-token path
+  itself rather than forwarding it.
+- The wrapper never passes a request's cancellation check to the model session,
+  which can abort between layers and would strand rank 1 inside an exchange.
+  The scheduler cancels between calls, so a long prefill stops at its next
+  chunk.
+- Multi-token decoding is one instruction only for greedy requests, whose draft
+  and acceptance decisions are deterministic; the draft-length controller
+  depends only on acceptance history (`mtp_policy.hpp`). Sampled requests decode
+  token by token.
+- The wrapper does not mirror snapshots, forks or prefix reuse, so it reports
+  none of them and TP2 refuses `--tp-cache-reuse`.
 
-The MTP path (`DecodeStep`) does not use the step channel: each rank drafts and
-verifies on its own. The draft-length controller depends only on acceptance
-history, never on timing (`mtp_policy.hpp`), so identical tokens give identical
-draft lengths and identical collectives.
-
-**Agreement checks.** When a request ends, rank 0 compares rank 1's tokens and
-draft/cache telemetry with its own; any difference fails the request, since it
-means the exchanges combined partials from different states. Under the step
-plan rank 1 also compares its own greedy choice, made on a copy of its sampler,
-with each consumed token; the first disagreement fails the request after both
-ranks have finished its collective schedule. Both failures return HTTP 500 and
-leave the communicator usable.
+**Agreement checks.** Both ranks keep a digest of every call and its result
+(prefill consumption, decoded tokens and draft counts, checkpoint positions,
+failures). `kEnd` carries rank 0's digest and call count, and rank 1 fails the
+request when either differs. Under greedy decoding rank 1 also compares its own
+argmax with every token rank 0 advances, computed after each call while rank 0
+is still selecting, which catches a numerical divergence such as the full-Q8
+bug even though both ranks feed rank 0's token. A failure is reported in rank
+1's response and the request returns HTTP 500; the pair stays usable.
 
 **Failure behaviour.** A lost peer surfaces within about a second as a TCP reset
 on the retained bootstrap socket; rank 0 returns 500 and later requests fail on
@@ -121,21 +132,18 @@ build/gpu-tp2/gufo serve llm \
 ```
 
 For full Q8 use the first `Q8_0` shard; the Q8 PLE loader must be in the build.
-`--tp-cache-reuse` on both ranks enables symmetric rank-local live-prefix reuse
-and one retained snapshot boundary; no snapshot bytes cross hosts.
+`--tp-cache-reuse` is refused until snapshots are mirrored.
 
 ### Request limits
 
-The server refuses these with HTTP 400 (or at startup), because the TP2 path
-cannot yet keep both ranks in step for them:
+Sampling, streaming, stop sequences and client cancellation work as on one
+host. The server still refuses:
 
 | Refused | Why |
 | --- | --- |
-| Sampling (`temperature` > 0) | Not enabled yet. The step plan makes sampled AR possible; sampled MTP also needs rank 0's draft and acceptance decisions. |
-| Streaming | Rank 1 must learn that a request ended early; there is no end marker yet. |
-| `stop` sequences | Rank 1 never receives the rules and would decode past rank 0's stop. |
-| More than one session, pending request or connection; request timeouts | Both ranks must run one identical collective schedule. |
-| Disk cache, vision | Not implemented for two ranks. |
+| More than one session, pending request or connection; request timeouts | Rank 1 executes one request's calls at a time. |
+| `--tp-cache-reuse`, disk cache | Snapshots and prefix reuse are not mirrored. |
+| Vision input | Not implemented for two ranks. |
 
 ### Probes
 
@@ -150,7 +158,11 @@ cannot yet keep both ranks in step for them:
   `--allreduce-bench N` times the exchange without a model.
 - `qwen38_flash_next_ple_gather_probe --prompt-file F`: host-only hash of the
   PLE rows a prompt gathers; diff stdout between hosts.
-- `tp_step_latency_test` (label `perf`): loopback cost of one step message.
+- `tp_instruction_latency_test` (label `perf`): loopback cost of one
+  instruction.
+- `tp_executor_test`: the real scheduler and pool on rank 0 against an executor
+  on rank 1 over a loopback channel, with a toy model; checks that both ranks
+  make the same calls and that divergences are reported.
 
 ### Benchmark driver
 
@@ -219,27 +231,30 @@ one row in EXPERIMENTS.md (machine-readable detail in `artifacts/`).
 2. Format check on a fresh `git archive` export of that commit, not on a mounted
    checkout that may be stale.
 3. Hosted tests on each host, with no skips: `tp_control_test`,
-   `tp_cohort_plan_test`, `tp_cohort_worker_test`, `text_model_runner_test`,
-   `text_generation_scheduler_test`, `serve_cli_test`,
-   `qwen38_flash_next.ngram`, `qwen38_flash_next.tp_partition`,
-   `qwen38_flash_next.mtp_sampling`.
+   `tp_executor_test`, `tp_cohort_plan_test`, `tp_cohort_worker_test`,
+   `text_model_runner_test`, `text_generation_scheduler_test`,
+   `serve_cli_test`, `qwen38_flash_next.ngram`,
+   `qwen38_flash_next.tp_partition`, `qwen38_flash_next.mtp_sampling`.
 4. Serving on two hosts, greedy: Q4 and Q8, AR and MTP; a short prompt, its
    repeat, and a prompt longer than one prefill chunk. Outputs must repeat, and
    AR and MTP outputs must match within each quantization.
-5. Refusals: a sampled, a streaming and a `stop` request each return 400, and a
-   valid request succeeds afterwards.
+5. Request types: a seeded sampled request (repeats reproduce it), a streamed
+   request, a `stop` request that ends at its stop sequence, and a client
+   disconnect during decoding and during a long prefill. A valid request must
+   succeed after each.
 6. Failure paths: kill rank 1 mid-request (rank 0 returns 500 promptly); a
-   scope mismatch fails on the first exchange.
+   scope mismatch fails on the first exchange; an injected rank-1 disagreement
+   returns 500 and the next request succeeds.
 7. For speed, report the median of several warm requests; the first request is
    about 13% slower.
 
 ## C2 (dormant)
 
-C2 runs two requests as one cohort under a single operation lease. What exists:
-a validated two-member AR-only command envelope with execution/cache plan
-digests (protocol v6), atomic two-member scheduler admission, a translation seam
-to ordered member responses, and rank-1 dispatch that refuses a cohort when an
-MTP sidecar is loaded or its runner capacity is not one. No producer builds a
-C2 command, and TP2 loading requires one session, so the path is dormant. The
-C2 probe runs the contract and the batched-decode spike on hardware. The design
-decisions that remain are in [NEXT.md](NEXT.md).
+The control protocol still defines the two-member C2 cohort envelope, and the
+cohort contract code and its tests remain, but rank 1 no longer dispatches C2
+commands: it has no scheduler to admit a cohort into, and it stops if it
+receives one. C2 returns on batched executor instructions (`AdvanceBatch`,
+`DecodeBatch`). The C2 probe's batched-decode spike (`--batched-w2`,
+`--serial-w2`, `--width`) does not use the worker and still runs; its cohort
+contract modes relied on the retired dispatch. The open design decisions are
+in [NEXT.md](NEXT.md).

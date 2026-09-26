@@ -53,11 +53,11 @@ Why TP2 is not faster than one host on Q4:
 
 ## What does not work yet
 
-- **Ordinary clients.** Sampled, streaming and `stop` requests are refused
-  ([TP2.md](TP2.md#request-limits)). Upstream's pending
+- **Ordinary clients.** The executor accepts sampled, streaming and `stop`
+  requests but is not yet qualified on two hosts. Upstream's pending
   `feat/model-sampling-defaults` (#277) makes requests without an explicit
-  temperature sampled (1.0 / top_p 0.95 / top_k 20); once it lands, every TP2
-  request that does not send `temperature: 0` gets a 400.
+  temperature sampled (1.0 / top_p 0.95 / top_k 20), which the executor must
+  handle before that lands.
 - **Q8 quality.** The ranks agree with each other, but full Q8 has not been
   compared with a reference. It needs a CPU or reference-logit comparison,
   since Q8 does not fit one host.
@@ -75,12 +75,19 @@ when rank 0 says so. This replaces plan items 1–3 below.
 Progress (update after every step):
 
 - [x] Audit of the model calls (below).
-- [ ] Protocol: instruction frame, protocol v7, hosted tests.
-- [ ] Rank-0 runner wrapper and rank-1 executor loop; rank 1 builds no pool.
-- [ ] Request paths: lift the sampling, streaming, stop-sequence and
-      cancellation refusals.
+- [x] Protocol: instruction frame, protocol v7, hosted tests.
+- [x] Rank-0 runner wrapper and rank-1 executor loop; rank 1 builds no pool.
+- [x] Request paths: sampling, streaming, stop sequences and cancellation no
+      longer refused; both entry points share `StartTpRequest`.
+- [x] Greedy MTP through a `decode` instruction.
 - [ ] Two-host qualification (TP2.md checklist plus fault injection).
-- [ ] Greedy MTP through a `DecodeStep` instruction.
+
+Status: implemented, builds on both hosts, and passes the hosted tests there,
+including `tp_executor_test`, which runs the real scheduler and pool on rank 0
+against an executor on rank 1 over a loopback channel. It fails when the
+single-token decode path forwards to the inner runner or when resets are not
+mirrored (checked by mutation). Not yet run on two hosts; TP2.md already
+describes the executor.
 - [ ] Then sampled MTP, cache reuse, C2 on the batched calls.
 
 **Audit.** The scheduler reaches the model only through `TextRunnerPool`, which
