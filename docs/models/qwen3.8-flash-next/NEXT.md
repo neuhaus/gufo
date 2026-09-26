@@ -83,9 +83,26 @@ Started 2026-09-26, in the order of the list above.
       it; the MoE exchange sums the halves. AR +5% (Q4) and +6% (Q8) at one
       stream, batched decode unchanged; logits as close to one host as
       before. See EXPERIMENTS.md, "TP2 intra-expert split".
-- [ ] Cheaper exchange (item 3): replace the TCP header, RDMA read and TCP
-      acknowledgement with an RDMA write with immediate data into
-      double-buffered windows.
+- [ ] Prefill overlap (next). Measured during a 9K-token prefill (2048-token
+      chunks, 20 MB per exchange): per layer 36.6 ms wall, of which the
+      exchange is about 9.8 ms (RDMA read 8.8 ms at the link's 2.4 GB/s each
+      way, staging 0.3 ms, header wait 0.6 ms) while the GPU idles. Plan: run
+      each chunk as two row halves one layer apart on the one stream; half B
+      computes layer L while half A's layer-L partial is in flight, which is
+      the same computation as prefilling the halves one after the other.
+      Needs an asynchronous exchange (a comm thread, receive windows
+      double-buffered by operation parity), a second control block for half
+      B's position and indexer blocks, row offsets for PLE, and a larger
+      prefill chunk so each half keeps today's 2048 rows of expert-weight
+      reuse. Expected about +37% prefill (≈1,600 tok/s against 1,167; one
+      host 1,372). FP16 partials would only save about 14% and change
+      numerics; a second NIC needs an independent PCIe path (the ConnectX-3's
+      two ports share one Gen3 x4 link).
+- [ ] Cheaper decode exchange (item 3): one-row exchanges take about 46 µs,
+      of which the TCP header round trip is 14.5 µs, the staging copy 7.6 µs,
+      the RDMA read 11.7 µs and the TCP ack 3.2 µs. Replace header, read and
+      ack with an RDMA write with immediate data into double-buffered windows:
+      about 1.2 ms per token.
 
 ## What does not work yet
 
