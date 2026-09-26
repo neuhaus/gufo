@@ -63,40 +63,101 @@ Why TP2 is not faster than one host on Q4:
   since Q8 does not fit one host.
 - **Concurrency.** One request at a time; C2 is dormant.
 
+## Current work: rank 1 as an executor
+
+Decided 2026-09-26: replace the step plan and rank 1's mirrored scheduler with
+an executor. Rank 0's scheduler stays unchanged; a runner wrapper on rank 0
+sends each model call to rank 1 as an instruction just before running it, and
+rank 1 runs the same call on the same state. Both ranks then make identical
+model calls in identical order by construction, and a request ends on rank 1
+when rank 0 says so. This replaces plan items 1–3 below.
+
+Progress (update after every step):
+
+- [x] Audit of the model calls (below).
+- [ ] Protocol: instruction frame, protocol v7, hosted tests.
+- [ ] Rank-0 runner wrapper and rank-1 executor loop; rank 1 builds no pool.
+- [ ] Request paths: lift the sampling, streaming, stop-sequence and
+      cancellation refusals.
+- [ ] Two-host qualification (TP2.md checklist plus fault injection).
+- [ ] Greedy MTP through a `DecodeStep` instruction.
+- [ ] Then sampled MTP, cache reuse, C2 on the batched calls.
+
+**Audit.** The scheduler reaches the model only through `TextRunnerPool`, which
+calls the runner and the request states:
+
+| Call | Model work | Instruction |
+| --- | --- | --- |
+| `Prefill(state, prompt, offset, max)` | chunk forward via `Session::Sync`, exchanges | `prefill(state, offset, max, prompt_size)` |
+| `Advance(state, token)` | one forward, exchanges | `advance(state, token)` |
+| `DecodeStep(state, max, sampler)`, MTP | draft and verify, exchanges | `decode(state, max)`, greedy only at first |
+| `state.Invalidate()` (called by the cache, not the runner) | session reset | `invalidate(state)` |
+| `PreparePrefixReuse` | resets the MTP draft-length controller | later, with cache reuse |
+| `Snapshot`, `RestoreOrFork` | host copies of session state | later, with cache reuse |
+| `AdvanceBatch`, `DecodeBatch` | batched forwards | later, C2 |
+| `SelectNext`, `PreviewFirstToken`, `CheckpointPosition`, `Decode` | logits and bookkeeping only | none |
+
+Traps the audit found:
+
+- `Session::Sync` keeps the longest common prefix with the session's contents,
+  so a missed reset on rank 1 changes how much it prefills. Every state reset
+  must travel, including the ones the continuation cache makes directly.
+- The base `TextModelRunner::DecodeStep` (used for one-token budgets and
+  without MTP) calls `SelectNext` and `Advance` on the inner runner, so a
+  forwarded `DecodeStep` would bypass the wrapper. The wrapper implements that
+  path itself: select locally, then a mirrored `advance`.
+- The session's cancellation check can abort between layers, mid-forward, which
+  would strand rank 1 inside an exchange. The wrapper never forwards it;
+  cancellation acts only between calls (the scheduler already checks there),
+  so a long prefill is cancelled at the next chunk.
+- Rank 1 must not build a pool: it would allocate a second session. It creates
+  the same number of states (one) and executes on those.
+
+**Design.**
+
+- A request starts with the existing `kSingle` command, which now also carries
+  whether sampling is greedy. Rank 1 binds the operation lease and runs
+  instructions until `end`.
+- Instruction frame: request sequence, a channel-wide monotonic index, the
+  operation, the state id and its arguments. A state reset is valid between
+  requests; a forward-bearing instruction outside a request is a protocol error.
+- Rank 0 sends each instruction before running the call, so rank 1 starts in
+  parallel, then records the call's result in a running digest. Rank 1 does the
+  same. `end` carries rank 0's digest and instruction count; any difference
+  fails the request with rank 1's error in the response.
+- Under greedy decoding rank 1 also compares its own argmax with each `advance`
+  token, which keeps the check that caught the full-Q8 bug.
+- A call that fails deterministically fails identically on both ranks and is
+  recorded in both digests. A rank-0 failure inside a forward leaves rank 1 in
+  an exchange until the collective timeout, and the communicator then fails
+  closed.
+- Sampled requests with MTP loaded decode token by token (local selection plus
+  `advance`) until sampled MTP is mirrored.
+- `--tp-cache-reuse` is refused in executor mode until snapshots are mirrored.
+- The dormant C2 worker path needs rank 1's scheduler, so it is retired; C2
+  returns later on batched instructions.
+- Cost: one small message per model call, as with the step plan.
+
 ## Plan
 
-1. **Request-end protocol.** Rank 0 already decides stops, cancellations and
-   client disconnects, and rank 1 always waits for the next step, so rank 0
-   sends an end marker in place of the next token. One mechanism covers stop
-   sequences, cancellation, disconnects and streaming, and nothing depends on
-   both ranks evaluating stop rules identically. Shipping the rules instead is
-   not enough: with the guard removed on two hosts, a `stop` request was
-   silently ignored. Design rules:
-   - Every exit path on rank 0 emits a terminal step: EOS, length, stop,
-     cancellation and failure.
-   - `final_token_advance_required` is false, so the last published token does
-     not cause another forward; the end marker must not either.
-   - Cancel only at an agreed step boundary, never by abandoning one rank's
-     collective; cancellation during prefill needs a boundary of its own.
-   - Chat Completions and Responses share one coordinator.
-2. **Sampled AR.** Lift the sampling refusal for AR: rank 0 samples, rank 1
-   consumes. Rank 1's own-choice check applies to greedy only.
-3. **Step plan for MTP.** `Session::PrepareDecode` chooses the anchor, draft
-   length and proposal chain, and `Session::FinishDecode` selects the accepted
-   prefix, correction and rollback. These decisions shape the collectives
-   before final tokens exist, so rank 0 must send them; its final tokens alone
-   are not enough. This is also what sampled MTP and C2 with MTP need.
-4. **Q8 quality** against a reference, and the `slow`/`external-model` suites.
-5. **Upstream.** Open an issue asking whether two-host InfiniBand TP is wanted:
+1. **Executor** (current work, above). It covers what the earlier plan split
+   into an end marker, sampled AR and a step plan for MTP: rank 0's scheduler
+   decides stops, cancellations and disconnects, and rank 1 simply receives no
+   further model calls. MTP decisions stay inside `Session::DecodeStep`, so
+   greedy MTP runs the same call on both ranks and compares results; sampled
+   MTP needs rank 1's sampler to match rank 0's (RNG state, pending draw and
+   accepted history).
+2. **Q8 quality** against a reference, and the `slow`/`external-model` suites.
+3. **Upstream.** Open an issue asking whether two-host InfiniBand TP is wanted:
    it adds a libibverbs dependency and hardware upstream likely cannot test,
    and the build gate must stay off by default. Then move the working-branch
    changes into #2, condense it into a short series, and submit TP2 C1 and the
    Q8 PLE loader as separate PRs with a shared qualification.
-6. **Speed.** Split the dense projections (the only change that can make TP2
+4. **Speed.** Split the dense projections (the only change that can make TP2
    decode clearly faster than one host; it adds collectives), overlap prefill
    exchanges with compute, and reduce the rank wait at higher width by
    overlapping or by balancing expert placement from measured routing.
-7. **C2 and concurrency**, once the above works. Park #3 until C2 has a caller.
+5. **C2 and concurrency**, once the above works. Park #3 until C2 has a caller.
 
 Transport: InfiniBand only until this plan is done. RoCEv2 keeps the one-sided
 RDMA-read design and mainly needs the right GID index.
