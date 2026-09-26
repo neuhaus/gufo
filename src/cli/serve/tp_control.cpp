@@ -54,8 +54,10 @@ std::string SystemError(const char* operation) {
   return std::string(operation) + ": " + std::strerror(errno);
 }
 
-/// Bounds blocking sends and pre-handshake receives, and turns on TCP
-/// keepalive so a peer whose host died is reported even on an idle channel.
+/// Bounds blocking sends and pre-handshake receives, turns on TCP keepalive so
+/// a peer whose host died is reported even on an idle channel, and disables
+/// Nagle's algorithm: a cache instruction is a round trip, and a small frame
+/// held back for a delayed ACK stalls it by tens of milliseconds.
 void SetStartupSocketOptions(int fd, std::chrono::milliseconds io_timeout) {
   const auto milliseconds = std::max<std::int64_t>(io_timeout.count(), 1);
   timeval timeout{};
@@ -65,6 +67,7 @@ void SetStartupSocketOptions(int fd, std::chrono::milliseconds io_timeout) {
   (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
   const int enabled = 1;
   (void)::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
+  (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
 #if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
   // Probe after one idle minute, then every ten seconds: a dead host is
   // reported about two minutes after it stops answering.
@@ -745,17 +748,19 @@ bool TpControlChannel::SendFrame(std::uint16_t type, std::uint64_t sequence,
     SetError(error, "TP control frame is invalid or too large");
     return false;
   }
-  std::vector<std::uint8_t> header;
-  header.reserve(20);
-  AppendU32(&header, kMagic);
-  header.push_back(static_cast<std::uint8_t>(kVersion));
-  header.push_back(static_cast<std::uint8_t>(kVersion >> 8));
-  header.push_back(static_cast<std::uint8_t>(type));
-  header.push_back(static_cast<std::uint8_t>(type >> 8));
-  AppendU32(&header, static_cast<std::uint32_t>(payload.size()));
-  AppendU64(&header, sequence);
-  return SendAll(header.data(), header.size(), error) &&
-         (payload.empty() || SendAll(payload.data(), payload.size(), error));
+  // One write per frame: with Nagle disabled, a separate header write would
+  // leave as its own segment.
+  std::vector<std::uint8_t> frame;
+  frame.reserve(20 + payload.size());
+  AppendU32(&frame, kMagic);
+  frame.push_back(static_cast<std::uint8_t>(kVersion));
+  frame.push_back(static_cast<std::uint8_t>(kVersion >> 8));
+  frame.push_back(static_cast<std::uint8_t>(type));
+  frame.push_back(static_cast<std::uint8_t>(type >> 8));
+  AppendU32(&frame, static_cast<std::uint32_t>(payload.size()));
+  AppendU64(&frame, sequence);
+  frame.insert(frame.end(), payload.begin(), payload.end());
+  return SendAll(frame.data(), frame.size(), error);
 }
 
 bool TpControlChannel::ReceiveFrame(std::uint16_t type, std::uint64_t* sequence,
