@@ -28,7 +28,7 @@ C2 probe, measurements and documentation.
 
 Two-host serving (`fuzzy` rank 0, `misty` rank 1, FDR InfiniBand) of one
 request at a time, Q4 and full Q8, AR and MTP, with sampling, streaming, stop
-sequences, client cancellation and, with `--tp-cache-reuse`, history reuse.
+sequences, client cancellation and history reuse as on one host.
 Both hosts stay bit-identical; lost peers, scope mismatches and rank
 disagreement fail the request with HTTP 500. Full Q8 needs both hosts; it does
 not fit one.
@@ -80,8 +80,6 @@ What would help, in order of payoff for effort:
   `feat/model-sampling-defaults` (#277) makes requests without an explicit
   temperature sampled (1.0 / top_p 0.95 / top_k 20); TP2 now handles those
   with MTP.
-- **Cache reuse by default.** It works behind `--tp-cache-reuse`; one host
-  caches without a flag.
 - **Q8 quality.** The ranks agree with each other, but full Q8 has not been
   compared with a reference. It needs a CPU or reference-logit comparison,
   since Q8 does not fit one host.
@@ -114,7 +112,7 @@ Progress (update after every step):
 
 Status: qualified on two hosts for Q4 and full Q8, AR and MTP. Sampling,
 streaming, stop sequences and client cancellation work, and sampled requests
-use MTP, and `--tp-cache-reuse` reuses history as on one host. Next in this
+use MTP, and history is reused as on one host. Next in this
 line: C2.
 
 **Audit.** The scheduler reaches the model only through `TextRunnerPool`, which
@@ -173,9 +171,9 @@ Traps the audit found:
 
 ## Cache reuse on the executor
 
-Done 2026-09-26 (protocol v9, behind `--tp-cache-reuse`); design in
-[TP2.md](TP2.md#cache-reuse), evidence in EXPERIMENTS.md ("TP2 cache reuse on
-the executor").
+Done 2026-09-26 and the default (protocol v10; `--tp-cache-reuse` is gone);
+design in [TP2.md](TP2.md#cache-reuse), evidence in EXPERIMENTS.md ("TP2 cache
+reuse on the executor").
 
 How it differs from the outline: rank 1 acknowledges every cache operation
 before either rank continues, so an asymmetric failure is known at once
@@ -194,8 +192,6 @@ unchanged; functional and kill checks pass; rank 1's memory stays flat.
 
 Open:
 
-- **Default.** One host caches by default; TP2 still needs the flag. Making it
-  the default is the remaining decision.
 - **The qualification criterion was wrong.** "Cached output equals uncached"
   does not hold on one host either: prefilling a short suffix on a cached
   prefix runs different kernel shapes than prefilling the whole prompt, and a
@@ -213,8 +209,7 @@ Open:
 
 ## Plan
 
-1. **Executor**: done, with sampled MTP and cache reuse (above). Remaining
-   decision: make `--tp-cache-reuse` the default.
+1. **Executor**: done, with sampled MTP and cache reuse (above).
 2. **Q8 quality** against a reference, and the `slow`/`external-model` suites.
 3. **Upstream.** Open an issue asking whether two-host InfiniBand TP is wanted:
    it adds a libibverbs dependency and hardware upstream likely cannot test,

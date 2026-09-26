@@ -136,8 +136,8 @@ build/gpu-tp2/gufo serve llm \
 ```
 
 For full Q8 use the first `Q8_0` shard; the Q8 PLE loader must be in the build.
-Add `--tp-cache-reuse` on both ranks to reuse conversation history as one host
-does; see [Cache reuse](#cache-reuse).
+TP2 reuses conversation history as one host does; see
+[Cache reuse](#cache-reuse).
 
 ### Request limits
 
@@ -152,8 +152,7 @@ host. The server still refuses:
 
 ### Cache reuse
 
-With `--tp-cache-reuse` rank 0's continuation cache works exactly as on one
-host (live frontiers, prompt snapshots, restores, eviction), and every cache
+Rank 0's continuation cache works exactly as on one host (live frontiers, prompt snapshots, restores, eviction), and every cache
 operation that touches model state is mirrored:
 
 | Rank-0 call | Instruction | Rank 1 |
@@ -224,7 +223,6 @@ not be rendered into the published tables.
       "bootstrap_port": 18515,
       "control_port": 18516,
       "control_token": "EXPERIMENT_ONLY_TOKEN",
-      "cache_reuse": false,
       "container_image": "gufo-tp2-dev:7.2.3",
       "workspace": "/path/to/gufo",
       "container_workspace": "/workspace/gufo",
@@ -242,8 +240,8 @@ python3 tools/bench/model-bench.py --model qwen3.8-flash-next \
 ```
 
 The driver uses non-streaming JSON requests, records both rank fingerprints,
-redacts the token and bootstrap address, and refuses loading, memory, image,
-C>1 and (unless `cache_reuse` is set) nonzero-depth tables. `multi-*` tables
+redacts the token and bootstrap address, and refuses loading, memory, image
+and C>1 tables. `multi-*` tables
 run only at concurrency 1 with uncached requests.
 
 ## Full Q8 checkpoint
@@ -290,7 +288,7 @@ one row in EXPERIMENTS.md (machine-readable detail in `artifacts/`).
 6. Failure paths: kill rank 1 mid-request (rank 0 returns 500 promptly); a
    scope mismatch fails on the first exchange; an injected rank-1 disagreement
    returns 500 and the next request succeeds.
-7. With `--tp-cache-reuse`: a multi-turn greedy AR chat, its identical replay
+7. Cache reuse: a multi-turn greedy AR chat, its identical replay
    (restores the whole prompt) and a follow-up on about 6K tokens of history;
    outputs and cached token counts must match one host with its cache.
 8. For speed, report the median of several warm requests; the first request is
