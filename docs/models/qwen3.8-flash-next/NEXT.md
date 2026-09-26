@@ -8,29 +8,74 @@ Companion documents: [TP2.md](TP2.md) for the C>1 boundary, `Q8.md` (added by
 
 ## Where things stand
 
-The dormant serial C2 contract is implemented and verified on hardware, and is
-split across three reviewable PRs:
+All branches are rebased onto upstream `main` at `d9a84f1` (2026-09-26), whose
+nine new commits add stop sequences, native context defaults, streamed
+Responses and cache fixes. The fork's `main` tracks upstream (remote
+`upstream` = `gufo-org/gufo`).
 
-| PR | Branch | Content |
+| Branch | PR | Content |
 |---|---|---|
-| [#1](https://github.com/neuhaus/gufo/pull/1) | `pr/q8-ple` | Q8 PLE loader support (independent) |
-| [#2](https://github.com/neuhaus/gufo/pull/2) | `pr/tp2-c1` | TP2 RDMA execution and C1 serving |
-| [#3](https://github.com/neuhaus/gufo/pull/3) | `pr/c2-dormant` | dormant C2 cohort contract (stacked on #2) |
+| `pr/q8-ple` | [#1](https://github.com/neuhaus/gufo/pull/1) | Q8 PLE loader support (independent) |
+| `pr/tp2-c1` | [#2](https://github.com/neuhaus/gufo/pull/2) | TP2 RDMA execution and C1 serving |
+| `pr/c2-dormant` | [#3](https://github.com/neuhaus/gufo/pull/3) | dormant C2 cohort contract (on #2) |
+| `pr/c2-plan-check` | none | worker runner-capacity refusal, this document (on #3) |
+| `claude/c2-spike-serial` | none | C2 probe modes and measurements, plus production fixes (on the above) |
+
+`claude/c2-spike-serial` carries production fixes that belong in #2: the
+GPU-side add and deferred exchange ack, the idle control-channel keepalive,
+cache-prefixed chats run uncached instead of rejected, the Q8 cross-rank fix
+and the shared-expert split. Without them #2 on its own ships TP2 with the Q8
+divergence and the slower collective. Move them down into #2 and leave only
+probe, spike and documentation on top.
+
+Branches to delete: `claude/q8-diag` (a merge made only to diagnose Q8; the fix
+is on the tip) and `feature/qwen38-flash-next-tp2-rdma` (the original branch,
+replaced by the verified stack). `pr/c2-plan-check` can fold into #3.
+
+Behaviour changed by the rebase: upstream's stop sequences never reach the
+rank-1 worker, so TP2 rejects requests with `stop` instead of letting the ranks
+stop at different tokens. Upstream's reasoning-token count and context-bounded
+token limit are carried into the TP2 request path and the C2 cohort path.
 
 C2 evidence on hardware: short prompts (3/3 runs), long prompts with chunked
 collectives (3000t and 2500t, byte-exact), admission refusal, operation-scope
 mismatch on a poisoned communicator, and MTP refusal. Per-member cross-rank
 token agreement in every passing run.
 
-The original `feature/qwen38-flash-next-tp2-rdma` branch is retained as a
-fallback and is not proposed for merge.
+## Usability and upstream plan
 
-Another branch, `pr/c2-plan-check`, is stacked on #3. It adds the worker's
-runner-capacity refusal for C2 (step 1 below) and carries this document. It
-builds on both hosts, passes the format gate and its hosted TP tests, and has
-not been opened as a PR. `claude/c2-spike-serial`, stacked on it, adds the
-spike's serial baseline, timing and an all-reduce microbenchmark, and records
-the measurements below.
+Neither TP2 target is usable in practice yet.
+
+- **Q4 on TP2** works but offers nothing over one host: 26.9 against 25.9 tok/s
+  AR, one host with MTP reaches 32–59 tok/s (TP2 has no MTP), and from width 4
+  up TP2 is slower (table below).
+- **Q8 on TP2** is correct (ranks agree bit for bit; a 2,117-token prompt
+  decoded at 23 tok/s over HTTP) and is the reason for TP2, since Q8 does not
+  fit one host. Ordinary clients cannot use it yet: requests must be greedy
+  (most clients send a nonzero temperature and get a 400), non-streaming, and
+  without stop sequences, with no cancellation and one request at a time. Its
+  quality has not been checked against a reference.
+
+Most of the request restrictions share one cause: each rank samples its own
+tokens and rank 0 compares them at the end. Replacing that with a rank-0 step
+plan, where rank 0 samples and sends each step's tokens and stop decisions to
+rank 1, enables sampling, stop sequences, cancellation and streaming, removes
+the requirement for bit-identical logits that the Q8 bug showed is fragile, and
+is the per-step agreement that concurrency needs (section 1, step 3).
+
+Order:
+1. Open an upstream issue asking whether two-host InfiniBand TP is wanted: it
+   adds a libibverbs dependency and hardware upstream likely cannot test, so the
+   build gate (`GUFO_ENABLE_TP2_RDMA`) must stay off by default.
+2. Move the production fixes from `claude/c2-spike-serial` into #2 and condense
+   #2 into a short, reviewable series.
+3. Rank-0 step plan, then sampled decoding, streaming, stop sequences and
+   cancellation on TP2.
+4. Q8 quality against a reference, and the `slow`/`external-model` suites.
+5. Send TP2 C1 upstream together with the Q8 PLE loader (#1), which is not
+   useful upstream on its own because Q8 needs two hosts.
+6. C2 and higher concurrency later, once it serves concurrent requests; dormant
+   code without a caller is hard to justify in review. Park #3 until then.
 
 ## Measured TP2 performance
 
@@ -67,6 +112,12 @@ width 2), although a 4–8 row exchange is only 40–80 KiB; most of it is waiti
 for the rank whose experts received more rows. Rank balance, not the fabric,
 limits TP2 at higher concurrency.
 
+The upstream headline figures (59.41 tok/s single user, 157.22 tok/s at eight
+users) are MTP on the repetitive prompt. On mixed text one-host MTP reaches
+106.47 tok/s at eight users, about AR's 108.67, so AR against AR is the matched
+comparison above. TP2 has no MTP, so on repetitive text one host with MTP leads
+TP2 by a wide margin.
+
 For Q4, TP2 is a capacity path, not yet a speed path. Profiles and
 microbenchmarks show why:
 
@@ -75,9 +126,9 @@ microbenchmarks show why:
   are split. Halving them can save about 7% at best.
 - **What TP2 adds to a decode token is now about 3 ms:** the exchange itself
   (p50 41 µs inside decode, 48 per token, including waiting for the slower
-  rank) and the stream synchronization before each staging copy. Rank 1 waits
-  about 0.9 ms per token longer, because only rank 0 computes the shared
-  expert. The ~4 ms of 2–3 µs gaps between the ~1,780 kernels per token occur on
+  rank) and the stream synchronization before each staging copy. Both ranks
+  now compute half the shared expert, so the rank-1 wait for rank 0's shared
+  expert is gone. The ~4 ms of 2–3 µs gaps between the ~1,780 kernels per token occur on
   one host too.
 - **Graphs are not the missing piece.** A temporary single-host build with
   graphs disabled decoded at 26.39±0.55 against 26.73±0.12 tok/s. The TP2 loss
@@ -130,6 +181,9 @@ does not perturb greedy tokens at this scale. Batched decode ran at 45.4 ms per
 two-token step against 75.6 ms serial, 1.67× the aggregate throughput. The
 numbers are in `EXPERIMENTS.md`; what they mean for priorities is in the
 performance section above.
+
+Widths 4 and 8 (`--width N`) also stayed in step on Q4 and full Q8, and Q8
+batched matched serial (performance section).
 
 Still open: `DecodeBatch` (as opposed to the advance), sampled decoding, and a
 two-stream run at depth. The synthetic 32K prompts stopped the second member
@@ -244,15 +298,19 @@ both communicators and fails closed. A mismatch that keeps byte counts equal,
 such as two members swapped, would sum different members' partials with no
 header error.
 
-Recommended: run a cohort as a fixed step program derived from the command,
-executed by the same small cohort executor on both ranks instead of the general
-scheduler. That means prefill in fixed chunks in member order, lockstep decode
-at width 2, then width 1 once a member stops. The only runtime input is the stop
-decision, which depends on tokens, so it relies on both ranks computing the same
-tokens. The communicator's host sum does not break that, since two operands add
-the same in either order. The full-Q8 divergence (section 3) shows it can still
-fail; the full-Q8 divergence is now fixed and Q8 batching agrees across ranks
-at widths 2, 4 and 8.
+Earlier recommendation: run a cohort as a fixed step program derived from the
+command, identical on both ranks. That only covers members that arrive
+together; real traffic arrives staggered, and members join and finish
+mid-generation.
+
+Recommended now: rank 0's scheduler owns the schedule and sends a small
+per-step plan to rank 1: which members the step includes and in what order,
+their tokens, and which members stop. Rank 1 executes the plan and never
+samples. This covers any width up to eight and members joining mid-way, and
+removes the dependence on both ranks computing the same tokens (the full-Q8
+divergence, section 3, showed that dependence is fragile). A digest of the
+step's member set in each collective header closes the equal-byte-count hole
+above.
 
 ### 4. Scheduler admits a cohort as a batch
 
@@ -310,11 +368,14 @@ in later projections. Every rank now runs the shared expert and peers drop its
 output (see `EXPERIMENTS.md`). The Q8 PLE gather was excluded first (#1).
 
 Q8 ranks now agree bit for bit on the retained long prompt, and Q8 TP2 serving
-answered a 2,117-token prompt at 23.0 tok/s decode. Still open before Q8 is a
-supported target: a quality check against a reference (Q8 does not fit one
-host, so it needs a CPU or reference-logit comparison), the `slow` and
-`external-model` suites. The shared-expert split recovered the ~3% the fix cost.
-`Q8.md` in #1 should record the closure.
+answered a 2,117-token prompt at 23.0 tok/s decode. The shared-expert split
+recovered the ~3% the fix cost. Batched Q8 decode stays in step at widths 2, 4
+and 8 and reaches 76.2 tok/s aggregate at width 8.
+
+Still open before Q8 is a supported target: a quality check against a reference
+(Q8 does not fit one host, so it needs a CPU or reference-logit comparison),
+the `slow` and `external-model` suites, and the request restrictions listed
+under "Usability and upstream plan". `Q8.md` in #1 should record the closure.
 
 ## 4. Verification debt
 
@@ -329,11 +390,18 @@ host, so it needs a CPU or reference-logit comparison), the `slow` and
   function's documented `global - expert_begin` rule, and that correction is
   safe *only* because nothing consumes `LocalExpert`. If it is ever wired into
   the executor, the reasoning that justified the change no longer holds.
-- **`pr/c2-plan-check`** now builds on both hosts, and its format check and
-  hosted TP tests (`tp_cohort_worker_test`, `tp_cohort_plan_test`,
-  `tp_control_test`) pass. The capacity refusal itself stays hosted-test only.
-- **Decide the fate of `feature/qwen38-flash-next-tp2-rdma`** (58 commits): keep
-  as a fallback or delete once the stack merges.
+- **Format checks before 2026-09-26 afternoon were invalid.** The `nixbox`
+  container on `fuzzy` still mounted the repository directory from before it
+  was re-cloned, so it checked stale code and passed. After the rebase every PR
+  head was checked on a fresh `git archive` export and passes; the fixes are one
+  folded resolution line and two `style(tp2)` commits. Check on an export, or
+  restart `nixbox`, until its mount is current.
+- **After the rebase** every PR head builds on its own (misty), the tip builds
+  on both hosts, the serving, scheduler and TP tests pass, and Q4 TP2 serving
+  answered correctly on both hosts, rejected a `stop` request with 400 and kept
+  serving. `inference_backend_gpu_test` skipped for lack of a model, which is
+  not a pass.
+- **`pr/c2-plan-check`**: the capacity refusal stays hosted-test only.
 
 ## Not claimed anywhere in this work
 
@@ -346,4 +414,6 @@ host, so it needs a CPU or reference-logit comparison), the `slow` and
   Between the two ranks the sum has two operands, so both ranks get the same
   result and it does not by itself make them disagree.
 - Full Q8 is not yet a supported serving target: the ranks now agree, but its
-  quality has not been checked against a reference.
+  quality has not been checked against a reference, and TP2 serving accepts
+  only greedy, non-streaming requests without stop sequences.
+- Neither TP2 target is claimed to be usable with ordinary clients yet.
