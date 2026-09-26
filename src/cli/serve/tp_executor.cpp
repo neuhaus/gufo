@@ -566,7 +566,9 @@ void TpMirroredRunner::CacheCall(const TpInstruction& instruction,
   try {
     sink_->Synchronize(sequence_, instruction, local);
   } catch (...) {
-    DigestTpFailure(digest_);
+    // A failed capture is a skipped snapshot on both ranks, not a failed call.
+    if (instruction.op != TpInstructionOp::kSnapshot)
+      DigestTpFailure(digest_);
     throw;
   }
 }
@@ -904,10 +906,14 @@ bool TpExecutor::RunRequest(const TpControlCommand& begin,
           throw std::logic_error("TP instruction has no model call");
       }
     } catch (const std::exception& exception) {
-      DigestTpFailure(digest);
       call_error = "rank 1 " + std::string(OpName(instruction.op)) +
                    " failed: " + exception.what();
-      note(call_error);
+      // A failed capture only means no snapshot: the acknowledgement makes
+      // rank 0 skip it too and drop the ID, and neither state changed.
+      if (instruction.op != TpInstructionOp::kSnapshot) {
+        DigestTpFailure(digest);
+        note(call_error);
+      }
     }
     if (TpCacheAcknowledged(instruction.op)) {
       const TpControlResponse response{

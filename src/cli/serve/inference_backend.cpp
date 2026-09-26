@@ -2381,8 +2381,6 @@ public:
                 .batched_multi_token_decode_max_width =
                     !distributed_ && use_mtp_ ? 8u : 0u,
                 .prefix_reuse = !distributed_ || allow_distributed_snapshots_,
-                .preserve_snapshot_prefix =
-                    distributed_ && allow_distributed_snapshots_,
             },
         .persistence = persistence_,
     };
@@ -2455,28 +2453,6 @@ public:
     }
     auto prepared = PrepareQwenPrompt(request, model_->tokenizer(),
                                       model_->VisionEncoder(), max_context_);
-    if (allow_distributed_snapshots_ && request.cache_prompt &&
-        !prepared.tokens.empty()) {
-      auto stable_options = QwenChatOptions(request);
-      stable_options.add_generation_prompt = false;
-      const auto tools =
-          request.tool_choice == ChatRequest::ToolChoice::kNone
-              ? std::span<const tokenization::ChatTool>{}
-              : std::span<const tokenization::ChatTool>{request.tools};
-      const auto stable = tokenization::QwenChatTemplate::RenderAndTokenize(
-          model_->tokenizer(), request.messages, tools, stable_options);
-      if (stable) {
-        std::size_t common = 0;
-        const auto limit = std::min(stable->size(), prepared.tokens.size());
-        while (common < limit &&
-               stable->at(common) == prepared.tokens[common]) {
-          ++common;
-        }
-        if (common != 0) {
-          prepared.cache_prefix_tokens = common;
-        }
-      }
-    }
     return prepared;
   }
 
@@ -2942,13 +2918,22 @@ struct InferenceBackend::Impl {
             note("TP worker failed: " + response.error);
           }
         }
-        if (!problem.empty() && state_->tp_pool) {
-          state_->tp_pool->ClearCache();
-        }
         if (!operation_->End(&error)) {
           note("TP operation scope cleanup failed: " + error);
           state_->response_broker->FailAll(
               "TP operation scope cleanup failed: " + error);
+        }
+        if (!problem.empty() && state_->tp_pool) {
+          // After a failed request rank 1's states and snapshots may no longer
+          // match rank 0's cache. Forget them all; if that is impossible, stop
+          // serving rather than reuse a state the ranks disagree about.
+          try {
+            state_->tp_pool->ClearCache();
+          } catch (const std::exception& exception) {
+            state_->response_broker->FailAll(
+                std::string("TP cache reset after a failed request failed: ") +
+                exception.what());
+          }
         }
       } catch (...) {
         try {

@@ -153,7 +153,6 @@ public:
                 .incremental_text_is_exact = true,
                 .multi_token_decode = options_.mtp,
                 .prefix_reuse = options_.cache,
-                .preserve_snapshot_prefix = options_.cache,
             }};
   }
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
@@ -578,7 +577,8 @@ int main() {
             "cached restore: " + again.worker_error);
     Require(first.result.tokens == again.result.tokens,
             "restore preserves outputs");
-    Require(again.result.cached_prompt_tokens > 0, "immutable prompt hit");
+    Require(again.result.cached_prompt_tokens == prompt.size(),
+            "identical replay restores the whole prompt, as on one host");
     pair.RequireSameCalls("snapshot reuse");
     auto branch = prompt;
     branch.push_back(11);
@@ -598,14 +598,30 @@ int main() {
             "live frontier reused");
     pair.RequireSameCalls("live reuse");
   }
-  for (const bool restore : {false, true}) {
-    Pair pair({.cache = true}, {.cache = true,
-                                .fail_capture_once = !restore,
-                                .fail_restore_once = restore});
+  // A capture that fails on either rank only skips the snapshot, as on one
+  // host: the request succeeds, and no rank keeps a copy the other lacks.
+  for (const bool rank0_fails : {false, true}) {
+    Pair pair({.cache = true, .fail_capture_once = rank0_fails},
+              {.cache = true, .fail_capture_once = !rank0_fails});
     const auto first = pair.Run(prompt, 6, {}, {}, {}, true);
-    const auto failed = restore ? pair.Run(prompt, 6, {}, {}, {}, true) : first;
+    Require(first.worker_error.empty(),
+            "failed capture is not a failed request: " + first.worker_error);
+    Require(pair.snapshots() == 0, "failed capture leaves no worker copy");
+    const auto next = pair.Run(prompt, 6, {}, {}, {}, true);
+    Require(next.worker_error.empty(),
+            "request after failed capture: " + next.worker_error);
+    Require(next.result.cached_prompt_tokens == 0,
+            "a skipped snapshot is a miss");
+    Require(next.result.tokens == first.result.tokens,
+            "a skipped snapshot keeps outputs");
+    Require(pair.snapshots() == 1, "next capture succeeds on both ranks");
+  }
+  {
+    Pair pair({.cache = true}, {.cache = true, .fail_restore_once = true});
+    (void)pair.Run(prompt, 6, {}, {}, {}, true);
+    const auto failed = pair.Run(prompt, 6, {}, {}, {}, true);
     Require(!failed.worker_error.empty(),
-            "worker cache failure reaches request verdict");
+            "worker restore failure reaches request verdict");
     const auto recovered = pair.Run(prompt, 6, {}, {}, {}, true);
     Require(recovered.worker_error.empty(),
             "next request recovers: " + recovered.worker_error);
