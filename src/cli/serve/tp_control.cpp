@@ -31,7 +31,8 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 5;          // ordered C1/C2 cohort envelopes
+constexpr std::uint16_t kVersion = 6;          // ordered C1/C2 cohort envelopes
+                                        // plus the kStep per-token message
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
@@ -318,6 +319,24 @@ bool ValidateTpControlCommand(const TpControlCommand& command,
       return false;
     }
     return ValidateMemberRequest(members.front(), error);
+  }
+  if (command.kind == TpControlCommandKind::kStep) {
+    // A step is a bare instruction against a request that a previous kSingle
+    // already described. Anything else here would mean the two messages
+    // disagree about what is being decoded, so every other field must be
+    // empty: no members, no prompt, no cache request, no plan digest, and no
+    // cohort scope of its own.
+    const TpPlanDigest zero_digest{};
+    if (command.sequence == 0 || !command.members.empty() ||
+        command.max_tokens != 0 || command.cache_prompt ||
+        command.cache_prefix_tokens != 0 || !command.prompt_tokens.empty() ||
+        !command.client_id.empty() || command.cohort_id != 0 ||
+        command.execution_plan_digest != zero_digest ||
+        command.cache_plan_digest != zero_digest) {
+      SetError(error, "TP step command carries fields a step must not have");
+      return false;
+    }
+    return true;
   }
   if (command.kind != TpControlCommandKind::kCohort2Ar) {
     SetError(error, "TP control command kind is invalid");
@@ -781,6 +800,14 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     payload.insert(payload.end(), member.client_id.begin(),
                    member.client_id.end());
   }
+  // kStep appends its three fields after the (empty) member block. The layout
+  // is a function of the kind byte, which is already on the wire, so both sides
+  // derive the same framing without a separate encoder.
+  if (command.kind == TpControlCommandKind::kStep) {
+    AppendU32(&payload, static_cast<std::uint32_t>(command.step_token));
+    AppendU64(&payload, command.step_index);
+    AppendU32(&payload, command.step_final ? 1U : 0U);
+  }
   return SendFrame(kCommand, command.sequence, payload, error);
 }
 
@@ -809,7 +836,12 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
                  error) ||
       !ReadBytes(command_prompt_, &offset, parsed.cache_plan_digest, error) ||
       !ReadU32(command_prompt_, &offset, &member_count, error) ||
-      embedded != sequence || member_count == 0 ||
+      // A step belongs to a request rather than to a member, so it is the one
+      // kind that legitimately carries none. The exact per-kind count is
+      // enforced once the kind is known, below.
+      embedded != sequence ||
+      (member_count == 0 &&
+       kind != static_cast<std::uint32_t>(TpControlCommandKind::kStep)) ||
       member_count > kMaxCohortMembers) {
     command_prompt_.clear();
     command_prompt_.shrink_to_fit();
@@ -821,14 +853,20 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
   } else if (kind ==
              static_cast<std::uint32_t>(TpControlCommandKind::kCohort2Ar)) {
     parsed.kind = TpControlCommandKind::kCohort2Ar;
+  } else if (kind == static_cast<std::uint32_t>(TpControlCommandKind::kStep)) {
+    parsed.kind = TpControlCommandKind::kStep;
   } else {
     command_prompt_.clear();
     command_prompt_.shrink_to_fit();
     SetError(error, "TP control command kind is invalid");
     return false;
   }
+  // A step belongs to a request, not to a member, so it carries none. kSingle
+  // always has exactly one and kCohort2Ar exactly two.
   const std::size_t expected_members =
-      parsed.kind == TpControlCommandKind::kSingle ? 1 : kMaxCohortMembers;
+      parsed.kind == TpControlCommandKind::kSingle      ? 1
+      : parsed.kind == TpControlCommandKind::kCohort2Ar ? kMaxCohortMembers
+                                                         : 0;
   if (member_count != expected_members) {
     command_prompt_.clear();
     command_prompt_.shrink_to_fit();
@@ -869,6 +907,21 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         reinterpret_cast<const char*>(command_prompt_.data() + offset),
         client_size);
     offset += client_size;
+  }
+  if (parsed.kind == TpControlCommandKind::kStep) {
+    std::uint32_t token_bits = 0;
+    std::uint32_t final_flag = 0;
+    if (!ReadU32(command_prompt_, &offset, &token_bits, error) ||
+        !ReadU64(command_prompt_, &offset, &parsed.step_index, error) ||
+        !ReadU32(command_prompt_, &offset, &final_flag, error) ||
+        final_flag > 1) {
+      command_prompt_.clear();
+      command_prompt_.shrink_to_fit();
+      SetError(error, "TP control step command is invalid");
+      return false;
+    }
+    parsed.step_token = static_cast<std::int32_t>(token_bits);
+    parsed.step_final = final_flag != 0;
   }
   if (offset != command_prompt_.size()) {
     command_prompt_.clear();

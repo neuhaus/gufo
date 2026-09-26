@@ -28,6 +28,12 @@ enum class TpControlCommandKind : std::uint8_t {
   kSingle = 1,
   /// Control-plane contract only; no scheduler execution path consumes C2 yet.
   kCohort2Ar = 2,
+  /// One decode step of an in-flight `kSingle` request. Rank 0 samples and
+  /// sends the token; rank 1 feeds it instead of sampling its own. This is
+  /// what makes bit-identical logits unnecessary rather than merely likely:
+  /// once rank 0's token is authoritative, a rank that computed a slightly
+  /// different logit no longer fails the request.
+  kStep = 3,
 };
 
 enum class TpControlResponseKind : std::uint8_t {
@@ -71,6 +77,16 @@ struct TpControlCommand {
   TpPlanDigest execution_plan_digest{};
   TpPlanDigest cache_plan_digest{};
   std::vector<TpControlMemberRequest> members;
+  // kStep only. A step belongs to the `kSingle` request named by `sequence`
+  // and carries no prompt, no members and no plan digest: that request's
+  // command already agreed the plan, and re-digesting it on a per-token path
+  // would be redundant work at the highest-frequency point in the protocol.
+  std::int32_t step_token{0};
+  std::uint64_t step_index{0};
+  /// Rank 0 has published the last token it will sample, so rank 1 must not
+  /// ask for another. Without this a rank-0 failure between steps would leave
+  /// rank 1 waiting on a token that is never coming.
+  bool step_final{false};
 };
 
 struct TpControlResponse {
@@ -99,6 +115,9 @@ struct TpResponseExpectation {
 
 /// Computes the canonical C1/C2 execution-plan identity. C2 includes member
 /// order, token budgets and prompt tokens; rank identity is excluded.
+/// A `kStep` carries no plan and no digest: the request it belongs to already
+/// agreed one, and validation requires both of a step's digest fields to be
+/// zero, so a digest computed over a step is meaningless and never compared.
 ///
 /// This is a command-integrity digest, not a plan-agreement check: both ranks
 /// derive it from the same command bytes, so a match proves the command was not

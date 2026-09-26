@@ -25,6 +25,7 @@ using gufo::server::TpControlCommandKind;
 using gufo::server::TpControlConfig;
 using gufo::server::TpControlResponse;
 using gufo::server::TpControlResponseKind;
+using gufo::server::TpPlanDigest;
 using gufo::server::TpResponseBroker;
 using gufo::server::TpResponseExpectation;
 using gufo::server::ValidateTpControlCommand;
@@ -208,6 +209,108 @@ int main() {
               received.prompt_tokens == command.prompt_tokens &&
               received.client_id == command.client_id,
           "TP control command round trip");
+
+  // kStep is the per-token message that makes rank 0 authoritative: it carries
+  // the token rank 0 sampled so rank 1 feeds that instead of sampling its own.
+  // It belongs to the request named by `sequence` and to no plan of its own, so
+  // the round trip must preserve the three step fields and invent no members.
+  const TpControlCommand step{.sequence = command.sequence,
+                              .kind = TpControlCommandKind::kStep,
+                              .step_token = 4242,
+                              .step_index = 9,
+                              .step_final = true};
+  std::string step_error;
+  Require(ValidateTpControlCommand(step, &step_error), step_error);
+  Require(server->SendCommand(step, &server_error), server_error);
+  TpControlCommand received_step;
+  Require(client->ReceiveCommand(&received_step, &client_error), client_error);
+  Require(received_step.sequence == step.sequence &&
+              received_step.kind == TpControlCommandKind::kStep &&
+              received_step.members.empty() &&
+              received_step.step_token == step.step_token &&
+              received_step.step_index == step.step_index &&
+              received_step.step_final == step.step_final,
+          "TP step command round trip");
+
+  // A non-final step must not be mistaken for a final one, and a negative
+  // token must survive the u32 round trip by bit pattern rather than clamping.
+  const TpControlCommand mid_step{.sequence = command.sequence,
+                                  .kind = TpControlCommandKind::kStep,
+                                  .step_token = -7,
+                                  .step_index = 0,
+                                  .step_final = false};
+  Require(server->SendCommand(mid_step, &server_error), server_error);
+  TpControlCommand received_mid;
+  Require(client->ReceiveCommand(&received_mid, &client_error), client_error);
+  Require(received_mid.step_token == -7 && received_mid.step_index == 0 &&
+              !received_mid.step_final,
+          "TP step command preserves a negative token and a non-final flag");
+
+  // Every field below belongs to the request a step belongs to, not to the step
+  // itself. A step carrying one is a disagreement between the two messages, so
+  // it must be refused rather than reconciled -- and refused on the wire, not
+  // only by the validator, because that is the path a peer exercises.
+  TpPlanDigest nonzero_digest{};
+  nonzero_digest[0] = 1;
+  const auto refuses_step = [&](const std::string& what,
+                                const TpControlCommand& bad) {
+    std::string why;
+    Require(!ValidateTpControlCommand(bad, &why) && !why.empty(),
+            "TP step validation must refuse " + what + ", but said: " + why);
+    std::string send_why;
+    Require(!server->SendCommand(bad, &send_why) && !send_why.empty(),
+            "TP step send must refuse " + what + ", but said: " + send_why);
+  };
+  {
+    TpControlCommand bad = step;
+    bad.sequence = 0;
+    refuses_step("a zero sequence", bad);
+  }
+  {
+    TpControlCommand bad = step;
+    bad.members = {{.member_id = command.sequence, .max_tokens = 4}};
+    refuses_step("a member", bad);
+  }
+  {
+    TpControlCommand bad = step;
+    bad.prompt_tokens = {10, 11, 12};
+    refuses_step("a prompt", bad);
+  }
+  {
+    TpControlCommand bad = step;
+    bad.max_tokens = 4;
+    refuses_step("a token budget", bad);
+  }
+  {
+    TpControlCommand bad = step;
+    bad.cache_prompt = true;
+    refuses_step("a cache request", bad);
+  }
+  {
+    TpControlCommand bad = step;
+    bad.cache_prefix_tokens = 2;
+    refuses_step("a cache prefix", bad);
+  }
+  {
+    TpControlCommand bad = step;
+    bad.client_id = "probe";
+    refuses_step("a client id", bad);
+  }
+  {
+    TpControlCommand bad = step;
+    bad.cohort_id = 3;
+    refuses_step("a cohort scope", bad);
+  }
+  {
+    TpControlCommand bad = step;
+    bad.execution_plan_digest = nonzero_digest;
+    refuses_step("an execution-plan digest", bad);
+  }
+  {
+    TpControlCommand bad = step;
+    bad.cache_plan_digest = nonzero_digest;
+    refuses_step("a cache-plan digest", bad);
+  }
 
   TpControlResponse response{.sequence = received.sequence,
                              .tokens = {20, 21},
