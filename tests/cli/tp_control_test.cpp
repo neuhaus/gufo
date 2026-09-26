@@ -20,6 +20,8 @@ namespace {
 using gufo::server::ComputeTpCachePlanDigest;
 using gufo::server::ComputeTpExecutionPlanDigest;
 using gufo::server::TpControlChannel;
+using gufo::server::TpControlStepConsumer;
+using gufo::server::TpControlStepPublisher;
 using gufo::server::TpControlCommand;
 using gufo::server::TpControlCommandKind;
 using gufo::server::TpControlConfig;
@@ -814,7 +816,93 @@ int main() {
                 poison_error);
   }
 
+  // The step bridge needs its own channel pair: the bounded-receive test above
+  // deliberately poisoned the first client, and a poisoned channel refuses
+  // every later receive by design.
+  {
+    const auto bridge_port = FreePort();
+    std::string bridge_client_error;
+    std::shared_ptr<TpControlChannel> bridge_client;
+    std::thread bridge_connector([&] {
+      bridge_client =
+          TpControlChannel::Connect("127.0.0.1", bridge_port, &bridge_client_error);
+    });
+    std::string bridge_server_error;
+    auto bridge_server =
+        TpControlChannel::Listen(bridge_port, &bridge_server_error);
+    bridge_connector.join();
+    Require(bridge_server != nullptr && bridge_client != nullptr,
+            "TP step bridge pair connects");
+    bool bridge_server_handshake = false;
+    bool bridge_client_handshake = false;
+    std::thread bridge_server_thread([&] {
+      bridge_server_handshake = bridge_server->Handshake(rank0, &bridge_server_error);
+    });
+    std::thread bridge_client_thread([&] {
+      bridge_client_handshake = bridge_client->Handshake(rank1, &bridge_client_error);
+    });
+    bridge_server_thread.join();
+    bridge_client_thread.join();
+    Require(bridge_server_handshake && bridge_client_handshake,
+            "TP step bridge pair handshakes: " + bridge_server_error);
+
+    TpControlStepPublisher publisher(bridge_server);
+    TpControlStepConsumer consumer(bridge_client);
+    const std::uint64_t exchange = 42;
+
+    // A token published by rank 0 is the token rank 1 decodes, in order.
+    for (const std::int32_t token : {11, 22, 33}) {
+      std::string publish_error;
+      std::thread publish_thread(
+          [&] { (void)publisher.Publish(exchange, token, false, &publish_error); });
+      std::int32_t consumed = 0;
+      bool final = true;
+      std::string consume_error;
+      Require(consumer.Consume(exchange, &consumed, &final,
+                               std::chrono::seconds(10), &consume_error),
+              "TP step bridge delivers a published token: " + consume_error);
+      publish_thread.join();
+      Require(consumed == token && !final,
+              "TP step bridge returns rank 0's token, not its own");
+    }
+
+    // A step naming another request must be refused: the protocol proves it is
+    // well formed, but only the in-flight sequence proves it belongs here.
+    {
+      std::string publish_error;
+      std::thread publish_thread([&] {
+        (void)publisher.Publish(exchange + 1, 44, false, &publish_error);
+      });
+      std::int32_t consumed = 0;
+      bool final = false;
+      std::string consume_error;
+      Require(!consumer.Consume(exchange, &consumed, &final,
+                                std::chrono::seconds(10), &consume_error) &&
+                  !consume_error.empty(),
+              "TP step bridge must refuse a step for another request");
+      publish_thread.join();
+    }
+
+    // Rank 0 ending the exchange is a failure for the consumer, not an empty
+    // token: it has nothing to hand the scheduler and must not pretend
+    // otherwise.
+    {
+      std::string publish_error;
+      std::thread publish_thread([&] {
+        (void)publisher.Publish(exchange, 0, true, &publish_error);
+      });
+      std::int32_t consumed = 0;
+      bool final = false;
+      std::string consume_error;
+      Require(!consumer.Consume(exchange, &consumed, &final,
+                                std::chrono::seconds(10), &consume_error) &&
+                  !consume_error.empty(),
+              "TP step bridge must fail when rank 0 ends the exchange");
+      publish_thread.join();
+    }
+  }
+
   std::puts("PASS: TP control handshake, C1/C2 envelopes, step messages, "
-            "bounded receive, and broker routing");
+            "bounded receive, step bridge, and broker routing");
   return 0;
 }

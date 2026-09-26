@@ -1157,6 +1157,62 @@ bool TpControlChannel::ReceiveResponse(TpControlResponse* response,
   return true;
 }
 
+bool TpControlStepPublisher::Publish(std::uint64_t sequence,
+                                    std::int32_t token, bool final,
+                                    std::string* error) {
+  const TpControlCommand command{.sequence = sequence,
+                                 .kind = TpControlCommandKind::kStep,
+                                 .step_token = token,
+                                 .step_index = next_index_,
+                                 .step_final = final};
+  // The index advances only once the frame is on the wire. A send that fails
+  // must not consume an index, or the consumer's next expectation would skip
+  // one and refuse a perfectly good step.
+  if (!channel_->SendCommand(command, error)) {
+    return false;
+  }
+  ++next_index_;
+  return true;
+}
+
+bool TpControlStepConsumer::Consume(std::uint64_t sequence, std::int32_t* token,
+                                   bool* final,
+                                   std::chrono::milliseconds timeout,
+                                   std::string* error) {
+  if (token == nullptr || final == nullptr) {
+    SetError(error, "TP step consumer requires token and final outputs");
+    return false;
+  }
+  TpControlCommand step;
+  if (!channel_->ReceiveCommandWithin(&step, timeout, error)) {
+    return false;
+  }
+  if (step.kind != TpControlCommandKind::kStep) {
+    SetError(error, "TP step consumer expected a step command");
+    return false;
+  }
+  if (step.sequence != sequence) {
+    SetError(error, "TP step names sequence " + std::to_string(step.sequence) +
+                        " but request " + std::to_string(sequence) +
+                        " is decoding");
+    return false;
+  }
+  if (step.step_index != expected_index_) {
+    SetError(error, "TP step index " + std::to_string(step.step_index) +
+                        " arrived out of order, expected " +
+                        std::to_string(expected_index_));
+    return false;
+  }
+  ++expected_index_;
+  *token = step.step_token;
+  *final = step.step_final;
+  if (step.step_final) {
+    SetError(error, "TP step exchange ended by rank 0 with no token to decode");
+    return false;
+  }
+  return true;
+}
+
 struct TpResponseBroker::Impl {
   struct Pending {
     TpControlResponse response;

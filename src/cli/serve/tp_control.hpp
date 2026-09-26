@@ -228,6 +228,78 @@ private:
   std::vector<std::uint8_t> response_payload_;
 };
 
+/// Per-token bridge for the rank-0 step plan.
+///
+/// Rank 0 samples every token and publishes it; rank 1 consumes that token
+/// rather than sampling its own. Once a token originates on rank 0 the two
+/// ranks no longer need bit-identical logits: a rank whose logit differs
+/// slightly still feeds the token rank 0 chose, so the request cannot diverge.
+/// That is what removes the request restrictions, because nothing downstream
+/// still has to agree on its own.
+///
+/// Publisher and consumer are distinct types rather than one type with a role
+/// flag, so a rank can only ever hold the half it is entitled to drive.
+class TpStepPublisher {
+public:
+  virtual ~TpStepPublisher() = default;
+  /// Publish one sampled token. `final` ends the exchange: rank 1 must not ask
+  /// for another. Normal completion never sets it, because both ranks stop on
+  /// the shared token; it exists so a rank-0 failure unblocks rank 1 instead of
+  /// leaving it waiting on a token that is never coming.
+  [[nodiscard]] virtual bool Publish(std::uint64_t sequence,
+                                     std::int32_t token, bool final,
+                                     std::string* error) = 0;
+};
+
+class TpStepConsumer {
+public:
+  virtual ~TpStepConsumer() = default;
+  /// Block for rank 0's next token, bounded so a stalled peer fails this
+  /// request instead of stalling every later step. Sets `*final` when rank 0
+  /// has ended the exchange, and fails when it has: a consumer has no token to
+  /// offer the scheduler once the publisher is gone.
+  ///
+  /// A step naming any other sequence is refused. The wire protocol proves a
+  /// step is well formed, but only the in-flight sequence proves it belongs to
+  /// this decode, and a stale step fed to the wrong session is worse than a
+  /// failure.
+  [[nodiscard]] virtual bool Consume(std::uint64_t sequence,
+                                     std::int32_t* token, bool* final,
+                                     std::chrono::milliseconds timeout,
+                                     std::string* error) = 0;
+};
+
+/// Rank-zero half: publishes each sampled token as a `kStep` command.
+class TpControlStepPublisher final : public TpStepPublisher {
+public:
+  explicit TpControlStepPublisher(std::shared_ptr<TpControlChannel> channel)
+      : channel_(std::move(channel)) {}
+
+  [[nodiscard]] bool Publish(std::uint64_t sequence, std::int32_t token,
+                             bool final, std::string* error) override;
+
+private:
+  std::shared_ptr<TpControlChannel> channel_;
+  /// Monotonic per exchange, so a consumer can reject a replayed or reordered
+  /// step rather than silently decoding a token for the wrong position.
+  std::uint64_t next_index_{0};
+};
+
+/// Rank-one half: receives rank 0's tokens within a bound.
+class TpControlStepConsumer final : public TpStepConsumer {
+public:
+  explicit TpControlStepConsumer(std::shared_ptr<TpControlChannel> channel)
+      : channel_(std::move(channel)) {}
+
+  [[nodiscard]] bool Consume(std::uint64_t sequence, std::int32_t* token,
+                             bool* final, std::chrono::milliseconds timeout,
+                             std::string* error) override;
+
+private:
+  std::shared_ptr<TpControlChannel> channel_;
+  std::uint64_t expected_index_{0};
+};
+
 /// Rank-zero response owner. The dedicated reader routes final responses by
 /// control sequence; production construction uses capacity one. This is a
 /// safety foundation for ordered C2 cohorts, not an enablement of C2 itself.
