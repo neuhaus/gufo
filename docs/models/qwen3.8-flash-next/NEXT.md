@@ -9,15 +9,13 @@ and [QUALITY.md](QUALITY.md#full-q8).
 
 | Branch | PR | Content |
 |---|---|---|
-| `feat/tp2-rdma` | [gufo-org/gufo#296](https://github.com/gufo-org/gufo/pull/296) | TP2 over InfiniBand RDMA |
+| `feat/tp2-rdma` | [gufo-org/gufo#296](https://github.com/gufo-org/gufo/pull/296) | TP2 over InfiniBand RDMA, with batched MTP and the disk cache |
 | `feat/qwen38-q8` | [gufo-org/gufo#297](https://github.com/gufo-org/gufo/pull/297) | full Q8 loader |
-| `feat/tp2-disk` | not yet | disk cache under TP2, on `feat/tp2-rdma` |
-| `feat/tp2-batched-mtp` | not yet | batched MTP under TP2, on `feat/tp2-disk` |
 | `claude/tp2-next` | none | all of them merged, plus this file; work continues here |
 
 Explainer and benchmarks: [gufo-org/gufo#258](https://github.com/gufo-org/gufo/issues/258#issuecomment-5855543814).
 Review changes go to the PR branches first, then merge into `claude/tp2-next`.
-`feat/tp2-disk-cache` on the fork is an older, superseded attempt.
+`feat/tp2-disk`, `feat/tp2-batched-mtp` and `feat/tp2-disk-cache` on the fork are superseded by #296.
 
 ## Open
 
@@ -38,11 +36,6 @@ In order of payoff for effort:
 7. **Transports**: RoCEv2 mainly needs the right GID index; Thunderbolt RDMA
    (OdinLink) sends only two-sided work requests and needs a two-sided
    exchange behind `Communicator`.
-8. **Two captures of one prefix** (upstream behavior, a candidate issue): a
-   `cache_prompt: false` request captures a prompt the cache already holds;
-   memory keeps the new capture and the disk the first. Their states differ
-   slightly, so after a restart a seeded sampled MTP turn can differ: one case
-   of `check-continuation.py --restore` on TP2, none on one host by chance.
 
 ## Not verified
 
