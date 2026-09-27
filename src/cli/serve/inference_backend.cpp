@@ -122,8 +122,7 @@ TextPreparedPrompt PrepareQwenPrompt(
   // the next user turn directly after tool results. Preserve a checkpoint
   // before the generation suffix even when reasoning itself is retained.
   std::size_t cache_prefix = 0;
-  if (request.cache_prompt &&
-      (!options.preserve_thinking || !request.tools.empty())) {
+  if (!options.preserve_thinking || !request.tools.empty()) {
     const auto generation = tokenizer.Encode(
         tokenization::GenerationPrompt(options.enable_thinking),
         {.add_bos = false, .add_eos = false, .parse_special_tokens = true});
@@ -2418,7 +2417,7 @@ public:
         use_mtp_(use_mtp),
         max_draft_tokens_(max_draft_tokens),
         distributed_(model_->TpWorldSize() > 1) {
-    if (!distributed_ && !artifact_fingerprint.empty()) {
+    if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
@@ -2427,6 +2426,14 @@ public:
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
+      if (distributed_) {
+        // A TP rank's snapshot holds only its half of the split state.
+        const std::string rank =
+            "tp_rank=" + std::to_string(model_->TpRank()) +
+            "\ntp_world_size=" + std::to_string(model_->TpWorldSize()) + "\n";
+        auto& identity = persistence_->compatibility_identity;
+        identity.insert(identity.end(), rank.begin(), rank.end());
+      }
     }
   }
 
@@ -2443,9 +2450,8 @@ public:
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
-                .batched_multi_token_decode = !distributed_ && use_mtp_,
-                .batched_multi_token_decode_max_width =
-                    !distributed_ && use_mtp_ ? 8u : 0u,
+                .batched_multi_token_decode = use_mtp_,
+                .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
                 .prefix_reuse = true,
             },
         .persistence = persistence_,
@@ -2707,11 +2713,36 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
-    if (distributed_ && decodes.size() > 1) {
-      throw std::invalid_argument(
-          "Qwen3.8-Flash-Next TP2 does not support batched multi-token "
-          "decoding");
+    return RunDecodeBatch(decodes, nullptr);
+  }
+
+  [[nodiscard]] std::optional<std::uint32_t> PlanDecodeBatch(
+      std::span<const TextRunnerDecode> decodes) const override {
+    if (decodes.size() < 2 || !use_mtp_) {
+      return std::nullopt;
     }
+    std::vector<QwenFlashNextSession::DecodeRequest> requests;
+    requests.reserve(decodes.size());
+    for (const auto& decode : decodes) {
+      requests.push_back(
+          {&RequireQwenFlashNextState(decode.state.get()).session(),
+           std::min<std::size_t>(decode.max_tokens,
+                                 std::uint64_t{max_draft_tokens_} + 1),
+           &decode.sampler.get(), nullptr});
+    }
+    return QwenFlashNextSession::PlanBatch(requests);
+  }
+
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatchPlanned(
+      std::span<const TextRunnerDecode> decodes,
+      std::optional<std::uint32_t> plan) const override {
+    return RunDecodeBatch(decodes, &plan);
+  }
+
+  /// `plan`, when given, fixes the batch's draft count (a TP2 peer's choice).
+  [[nodiscard]] std::vector<TextDecodeStep> RunDecodeBatch(
+      std::span<const TextRunnerDecode> decodes,
+      const std::optional<std::uint32_t>* plan) const {
     if (decodes.size() < 2 || !use_mtp_) {
       return TextModelRunner::DecodeBatch(decodes);
     }
@@ -2736,7 +2767,7 @@ public:
            &sampler, &results[i], true, &outcomes[i]});
     }
     std::string error;
-    (void)QwenFlashNextSession::DecodeBatch(requests, &error);
+    (void)QwenFlashNextSession::DecodeBatch(requests, &error, plan);
     const auto active_count = static_cast<std::size_t>(std::count_if(
         results.begin(), results.end(),
         [](const auto& result) { return !result.tokens.empty(); }));
@@ -2818,10 +2849,6 @@ public:
 
   [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
       const TextRunnerSnapshot& snapshot) const override {
-    if (distributed_) {
-      throw std::invalid_argument(
-          "Qwen3.8-Flash-Next TP2 does not support persistent snapshots");
-    }
     const auto* qfn_snapshot =
         dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
     if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
@@ -2836,10 +2863,6 @@ public:
   [[nodiscard]] std::size_t SerializePersistentSnapshot(
       const TextRunnerSnapshot& snapshot,
       std::span<std::uint8_t> destination) const override {
-    if (distributed_) {
-      throw std::invalid_argument(
-          "Qwen3.8-Flash-Next TP2 does not support persistent snapshots");
-    }
     const auto* qfn_snapshot =
         dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
     if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
@@ -2862,10 +2885,7 @@ public:
   void RestorePersistentSnapshot(
       TextRunnerState& state,
       std::span<const std::uint8_t> payload) const override {
-    if (distributed_) {
-      throw std::invalid_argument(
-          "Qwen3.8-Flash-Next TP2 does not support persistent snapshots");
-    }
+    // Under TP2 a payload is this rank's half, which the identity names.
     auto& restored = RequireQwenFlashNextState(state);
     std::string error;
     if (!restored.session().RestoreSnapshot(payload, &error)) {
@@ -2935,8 +2955,8 @@ struct InferenceBackend::Impl {
     [[nodiscard]] bool finished() const noexcept { return finished_; }
 
     /// Ends the request on rank 1 (`kEnd` with rank 0's instruction count and
-    /// digest) and collects rank 1's verdict, which also decides whether other
-    /// requests may reuse what this one computed. Call once rank 0 makes no
+    /// digest) and collects rank 1's verdict, and the verdicts on any state
+    /// the request reused before they arrived. Call once rank 0 makes no
     /// further model calls for the request. Returns the first problem, or an
     /// empty string when both ranks agree.
     [[nodiscard]] std::string Finish() noexcept {
@@ -2945,6 +2965,7 @@ struct InferenceBackend::Impl {
       }
       finished_ = true;
       std::string problem;
+      bool settled = false;
       try {
         const auto note = [&](std::string message) {
           if (problem.empty()) {
@@ -2964,15 +2985,26 @@ struct InferenceBackend::Impl {
             note("TP worker failed: " + response.error);
           }
         }
-        // A request the ranks disagree about leaves states and snapshots that
-        // may differ between them; they are never reused, and the cache
-        // replaces them in time. Other requests keep theirs.
+        if (!state_->tp_runner->AwaitDependencies(sequence_)) {
+          note("TP request reused a state rank 1 rejected");
+        }
+        // A request the ranks disagree about leaves a state that may differ
+        // between them; it is never reused, and the cache replaces it in
+        // time. Other requests keep theirs.
         state_->tp_runner->Settle(sequence_, problem.empty());
+        settled = true;
       } catch (...) {
         try {
           if (problem.empty()) {
             problem = "TP request end failed";
           }
+        } catch (...) {
+        }
+      }
+      if (!settled) {
+        // Requests that reused this one's state wait for its verdict.
+        try {
+          state_->tp_runner->Settle(sequence_, false);
         } catch (...) {
         }
       }
@@ -3375,12 +3407,6 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                "Failed to create Qwen3.8-Flash-Next model: " + load_error);
       return false;
     }
-    if (model->TpWorldSize() > 1 &&
-        DiskCacheEnabled(resolved_disk_cache_config)) {
-      SetError(error,
-               "Qwen3.8-Flash-Next TP2 does not support disk continuation");
-      return false;
-    }
     if (DiskCacheEnabled(resolved_disk_cache_config) &&
         resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
         !FingerprintArtifact(
@@ -3687,10 +3713,6 @@ bool InferenceBackend::load(
              "and communicator");
     return false;
   }
-  if (model->TpWorldSize() > 1 && DiskCacheEnabled(disk_cache_config)) {
-    SetError(error, "Qwen3.8-Flash-Next TP2 does not support a disk cache");
-    return false;
-  }
   if (session_count == 0) {
     SetError(error, "HTTP session count must be at least one");
     return false;
@@ -3760,6 +3782,7 @@ bool InferenceBackend::load(
               static_cast<std::uint32_t>(prefill_policy.decode_active_tokens),
           .sessions = static_cast<std::uint32_t>(session_count),
           .vision = has_vision,
+          .disk_cache = DiskCacheEnabled(disk_cache_config),
       };
       std::string control_error;
       if (!tp_config.control->Handshake(control_config, &control_error)) {
@@ -3774,10 +3797,33 @@ bool InferenceBackend::load(
     if (tp_world_size > 1 && tp_rank != 0) {
       // Rank 1 serves nothing itself: it executes rank 0's model calls on as
       // many states as rank 0's pool creates, and builds no pool of its own.
+      // Its disk cache holds its half of what rank 0's cache saves.
+      std::shared_ptr<TpDiskStore> disk;
+      if (DiskCacheEnabled(disk_cache_config)) {
+        const auto persistence = runner->Descriptor().persistence;
+        if (!persistence.has_value()) {
+          SetError(error, "TP worker disk cache needs model fingerprints");
+          return false;
+        }
+        const std::size_t staging =
+            disk_cache_config.staging_capacity_bytes != 0
+                ? disk_cache_config.staging_capacity_bytes
+                : std::min(
+                      disk_cache_config.capacity_bytes,
+                      TextRunnerDiskCacheOptions::kAutomaticStagingMaxBytes);
+        disk = std::make_shared<TpDiskStore>(
+            TpDiskStore::Options{
+                .directory = disk_cache_config.directory,
+                .capacity_bytes = disk_cache_config.capacity_bytes,
+                .staging_capacity_bytes = staging,
+            },
+            persistence->compatibility_identity, persistence->payload_version);
+      }
       new_state->tp_executor = std::make_shared<TpExecutor>(
           std::move(runner), session_count,
           tp_config.control->snapshot_budget_bytes(),
-          std::make_shared<CommunicatorCallScope>(tp_config.communicator));
+          std::make_shared<CommunicatorCallScope>(tp_config.communicator),
+          std::move(disk));
     } else {
       std::shared_ptr<TextModelRunner> pool_runner = runner;
       if (tp_world_size > 1) {

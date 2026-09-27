@@ -4,7 +4,7 @@
 // correct when both ranks record the same calls with the same results, for
 // greedy, sampled, stopped, cancelled, multi-token, concurrent and batched
 // requests, when rank 1 reports the divergences it is meant to catch, and when
-// no request reuses what another computed before rank 1 agreed with it.
+// a request that reused what rank 1 then rejected fails too.
 
 #include "src/cli/serve/tp_executor.hpp"
 
@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <limits>
@@ -27,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "src/cli/serve/text_generation_scheduler.hpp"
@@ -94,6 +96,8 @@ using CallLog = std::vector<std::string>;
 struct ToyOptions {
   bool mtp{false};
   bool cache{false};
+  /// Offer persistent snapshots, for the disk cache.
+  bool persist{false};
   bool fail_capture_once{false};
   bool fail_restore_once{false};
   std::size_t cache_budget{4096};
@@ -101,8 +105,12 @@ struct ToyOptions {
   /// Runs before every prefill chunk.
   std::function<void()> prefill_hook;
   std::size_t prefill_chunk{3};
-  /// Widest batched plan offered; one offers only serial steps.
+  /// Widest batched plan offered; one offers only serial steps. With `mtp`,
+  /// multi-token steps are batched too.
   std::size_t width{1};
+  /// The draft count a greedy multi-token batch chooses on this rank, like
+  /// Flash-Next's timing-based choice: the ranks may choose differently.
+  std::optional<std::uint32_t> batch_plan;
   /// Rank-1 faults: shift the greedy choice once, at this sequence length.
   std::optional<std::size_t> diverge_at;
   /// Rank-1 fault: report one extra draft in the next multi-token step.
@@ -167,18 +175,58 @@ public:
   void CountCancellationCheck() const { ++cancellation_checks_; }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
-    return {.model_id = "toy",
-            .state_abi = "toy-v1",
-            .max_context = 256,
-            .capabilities = TextRunnerCapabilities{
+    return {
+        .model_id = "toy",
+        .state_abi = "toy-v1",
+        .max_context = 256,
+        .capabilities =
+            TextRunnerCapabilities{
                 .incremental_prefill = true,
                 .snapshot = options_.cache,
                 .fork = options_.cache,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = options_.mtp,
+                .batched_multi_token_decode =
+                    options_.mtp && options_.width > 1,
+                .batched_multi_token_decode_max_width =
+                    options_.mtp ? options_.width : 0,
                 .prefix_reuse = options_.cache,
-            }};
+            },
+        .persistence =
+            options_.persist
+                ? std::optional<gufo::server::TextRunnerPersistenceDescriptor>(
+                      {.compatibility_identity = {'t', 'o', 'y'},
+                       .payload_version = 1})
+                : std::nullopt};
+  }
+  std::size_t PersistentSnapshotPayloadBytes(
+      const gufo::server::TextRunnerSnapshot& snapshot) const override {
+    return dynamic_cast<const ToySnapshot&>(snapshot).tokens.size() * 4;
+  }
+  std::size_t SerializePersistentSnapshot(
+      const gufo::server::TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto& tokens = dynamic_cast<const ToySnapshot&>(snapshot).tokens;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      for (int byte = 0; byte < 4; ++byte) {
+        destination[i * 4 + byte] =
+            static_cast<std::uint8_t>(tokens[i] >> (8 * byte));
+      }
+    }
+    return tokens.size() * 4;
+  }
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    auto& toy = Toy(state);
+    toy.tokens.assign(payload.size() / 4, 0);
+    for (std::size_t i = 0; i < toy.tokens.size(); ++i) {
+      for (int byte = 0; byte < 4; ++byte) {
+        toy.tokens[i] |= TextRunnerToken{payload[i * 4 + byte]} << (8 * byte);
+      }
+    }
+    Record("disk restore " + std::to_string(toy.tokens.size()));
   }
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
     return {.resident_weights_bytes = 0,
@@ -336,13 +384,57 @@ public:
     if (!options_.mtp || max_tokens < 2) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
+    return Cycle(state, max_tokens, sampler, 3);
+  }
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
+      std::span<const gufo::server::TextRunnerDecode> decodes) const override {
+    return DecodeBatchPlanned(decodes, PlanDecodeBatch(decodes));
+  }
+  [[nodiscard]] std::optional<std::uint32_t> PlanDecodeBatch(
+      std::span<const gufo::server::TextRunnerDecode> decodes) const override {
+    if (decodes.size() < 2 || !options_.mtp ||
+        std::ranges::any_of(decodes, [](const auto& decode) {
+          return decode.sampler.get().config().uses_random_sampling();
+        })) {
+      return std::nullopt;
+    }
+    return options_.batch_plan;
+  }
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatchPlanned(
+      std::span<const gufo::server::TextRunnerDecode> decodes,
+      std::optional<std::uint32_t> plan) const override {
+    if (decodes.size() < 2 || !options_.mtp) {
+      return TextModelRunner::DecodeBatch(decodes);
+    }
+    Record("decode batch " + std::to_string(decodes.size()) + " plan " +
+           (plan.has_value() ? std::to_string(*plan) : std::string("own")));
+    std::vector<TextDecodeStep> steps;
+    for (const auto& decode : decodes) {
+      auto step = Cycle(decode.state.get(), decode.max_tokens,
+                        decode.sampler.get(), plan.has_value() ? *plan + 1 : 3);
+      step.execution_plan = {.kind = TextExecutionPlanKind::kBatched,
+                             .physical_width = decodes.size()};
+      steps.push_back(std::move(step));
+    }
+    return steps;
+  }
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return dynamic_cast<const ToyState&>(state).tokens.size();
+  }
+
+private:
+  /// One multi-token cycle of at most `limit` tokens.
+  TextDecodeStep Cycle(TextRunnerState& state, std::size_t max_tokens,
+                       gufo::sampling::SamplerState& sampler,
+                       std::size_t limit) const {
     auto& toy = Toy(state);
     TextDecodeStep step;
     std::string produced;
     // Like Flash-Next: draw on a working copy, leave a deferred draw for the
     // next call when sampling at random, and publish the draw state back.
     gufo::sampling::SamplerState working = sampler;
-    for (std::size_t i = 0; i < std::min<std::size_t>(max_tokens, 3); ++i) {
+    for (std::size_t i = 0; i < std::min(max_tokens, limit); ++i) {
       const auto token = static_cast<TextRunnerToken>(
           working.Sample(Logits(toy.tokens, toy.shade)));
       if (token == kEos) {
@@ -358,7 +450,7 @@ public:
       produced += " deferred";
     }
     sampler.CopyDrawStateFrom(working);
-    step.draft_tokens = 3;
+    step.draft_tokens = limit;
     step.draft_accepted_tokens =
         step.selections.empty() ? 0 : step.selections.size() - 1;
     if (options_.extra_draft_once) {
@@ -369,12 +461,6 @@ public:
            std::to_string(max_tokens) + produced);
     return step;
   }
-  [[nodiscard]] std::size_t CheckpointPosition(
-      const TextRunnerState& state) const override {
-    return dynamic_cast<const ToyState&>(state).tokens.size();
-  }
-
-private:
   static ToyState& Toy(TextRunnerState& state) {
     return dynamic_cast<ToyState&>(state);
   }
@@ -424,8 +510,10 @@ void ToyState::SetCancellationCheck(const CancellationCheck&) {
 /// between them. Both ranks hold `sessions` states.
 class Pair {
 public:
+  /// With `disk0` and `disk1`, each rank keeps a disk cache there.
   Pair(ToyOptions rank0_options, ToyOptions rank1_options,
-       std::size_t sessions = 1)
+       std::size_t sessions = 1, std::filesystem::path disk0 = {},
+       std::filesystem::path disk1 = {})
       : inner0_(std::make_shared<ToyRunner>(rank0_options)),
         runner1_(std::make_shared<ToyRunner>(rank1_options)) {
     const auto port = FreePort();
@@ -443,9 +531,11 @@ public:
         .world_size = 2,
         .max_context = 256,
         .auth_token = "executor-test",
-        .sessions = static_cast<std::uint32_t>(sessions)};
+        .sessions = static_cast<std::uint32_t>(sessions),
+        .disk_cache = !disk0.empty()};
     TpControlConfig rank1 = rank0;
     rank1.rank = 1;
+    rank1.disk_cache = !disk1.empty();
     bool server_ok = false;
     bool client_ok = false;
     std::thread handshake(
@@ -459,9 +549,26 @@ public:
         std::make_shared<gufo::server::TpResponseBroker>(server_, sessions + 8);
     sink_ = std::make_shared<TpControlInstructionSink>(server_, broker_);
     mirrored_ = std::make_shared<TpMirroredRunner>(inner0_, sink_);
-    pool_ = std::make_shared<TextRunnerPool>(mirrored_, sessions);
+    std::optional<gufo::server::TextRunnerDiskCacheOptions> disk_options;
+    if (!disk0.empty()) {
+      disk_options = gufo::server::TextRunnerDiskCacheOptions{
+          .directory = disk0, .capacity_bytes = 1U << 20};
+    }
+    pool_ = std::make_shared<TextRunnerPool>(mirrored_, sessions,
+                                             std::move(disk_options));
     scheduler_ = std::make_shared<TextGenerationScheduler>(pool_);
-    executor_ = std::make_unique<TpExecutor>(runner1_, sessions);
+    if (!disk1.empty()) {
+      const auto persistence = runner1_->Descriptor().persistence;
+      disk1_ = std::make_shared<gufo::server::TpDiskStore>(
+          gufo::server::TpDiskStore::Options{
+              .directory = disk1,
+              .capacity_bytes = 1U << 20,
+              .staging_capacity_bytes = 1U << 20},
+          persistence->compatibility_identity, persistence->payload_version);
+    }
+    executor_ = std::make_unique<TpExecutor>(
+        runner1_, sessions, std::numeric_limits<std::size_t>::max(),
+        std::shared_ptr<TpCallScope>{}, disk1_);
     worker_ = std::thread([this] { Work(); });
   }
 
@@ -479,9 +586,30 @@ public:
     std::string worker_error;
   };
 
+  /// A request that finished on rank 0 but has not ended on rank 1 yet.
+  struct Open {
+    std::uint64_t sequence{0};
+    Outcome outcome;
+  };
+
   /// Runs one request as serving does. `submitted` runs once the scheduler
   /// has the request.
   Outcome Run(
+      std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
+      gufo::sampling::SamplingConfig sampling = {},
+      std::vector<std::string> stop_sequences = {},
+      TextGenerationScheduler::CancellationCheck is_cancelled = {},
+      bool reuse = false, std::size_t prefix = 0,
+      const std::function<void()>& submitted = {},
+      std::shared_ptr<const gufo::server::TextPromptContext> images = {}) {
+    return Close(RunOpen(std::move(prompt), max_tokens, std::move(sampling),
+                         std::move(stop_sequences), std::move(is_cancelled),
+                         reuse, prefix, submitted, std::move(images)));
+  }
+
+  /// Runs a request on rank 0 without ending it, as when the next request
+  /// arrives before rank 1's verdict on this one.
+  Open RunOpen(
       std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
       gufo::sampling::SamplingConfig sampling = {},
       std::vector<std::string> stop_sequences = {},
@@ -516,21 +644,32 @@ public:
     if (submitted) {
       submitted();
     }
-    Outcome outcome;
-    std::string local_error;
+    Open open{.sequence = sequence};
     try {
-      outcome.result = request.Wait();
+      open.outcome.result = request.Wait();
     } catch (const std::exception& exception) {
-      local_error = exception.what();
+      open.outcome.worker_error = exception.what();
     }
+    return open;
+  }
+
+  /// Ends a request on rank 1 and settles it as serving does.
+  Outcome Close(Open open) {
+    const auto sequence = open.sequence;
+    Outcome outcome = std::move(open.outcome);
+    const std::string local_error = std::move(outcome.worker_error);
+    std::string error;
     Require(mirrored_->EndRequest(sequence, &error), "end: " + error);
     TpControlResponse response;
     Require(broker_->WaitForResponse(sequence, &response, &error),
             "response: " + error);
     Require(response.sequence == sequence, "response sequence");
-    mirrored_->Settle(sequence, response.error.empty());
-    outcome.worker_error =
-        response.error.empty() ? local_error : response.error;
+    const bool dependencies = mirrored_->AwaitDependencies(sequence);
+    mirrored_->Settle(sequence, response.error.empty() && dependencies);
+    outcome.worker_error = !response.error.empty() ? response.error
+                           : !dependencies
+                               ? std::string("reused a rejected state")
+                               : local_error;
     return outcome;
   }
 
@@ -560,6 +699,17 @@ public:
   }
 
   std::size_t snapshots() const { return worker_snapshots_.load(); }
+  /// Waits until rank 1 has written `entries` disk-cache files.
+  void WaitForRank1Disk(std::size_t entries) const {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (disk1_->entry_count() < entries &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    disk1_->Flush();
+    Require(disk1_->entry_count() >= entries, "rank 1 persists its half");
+  }
   std::size_t open_requests() const { return worker_open_.load(); }
   void ClearCache() {
     pool_->ClearCache();
@@ -615,6 +765,7 @@ private:
   std::shared_ptr<TpControlInstructionSink> sink_;
   std::shared_ptr<TpMirroredRunner> mirrored_;
   std::shared_ptr<TextGenerationScheduler> scheduler_;
+  std::shared_ptr<gufo::server::TpDiskStore> disk1_;
   std::unique_ptr<TpExecutor> executor_;
   std::thread worker_;
   std::string worker_failure_;
@@ -846,9 +997,15 @@ int main() {
         {.op = TpInstructionOp::kRestore, .snapshot_id = 1},
         {.op = TpInstructionOp::kDrop, .snapshot_id = 1}};
     gufo::server::TpExecutionDigest digest;
-    for (const auto& call : calls) {
+    for (std::size_t index = 0; index < calls.size(); ++index) {
+      auto& call = calls[index];
       const std::vector<TextRunnerToken> prefix{5, 9};
       gufo::server::DigestTpCall(digest, call, prefix);
+      if (call.op == TpInstructionOp::kSnapshot) {
+        // As rank 0 sends it: the request's calls so far.
+        call.count = static_cast<std::uint32_t>(index + 1);
+        call.digest = digest.value();
+      }
       if (call.op == TpInstructionOp::kPrefill)
         gufo::server::DigestTpPrefill(
             digest, {.consumed_tokens = 2, .decode_ready = true}, 2);
@@ -924,8 +1081,8 @@ int main() {
 
   // The mirrored runner alone: every call belongs to the request its state is
   // leased to, forwards bind their instruction's collective scope, a batch is
-  // one instruction, and what a request computed is reused only once rank 1
-  // agreed with it.
+  // one instruction, and a request that reuses what another computed depends
+  // on rank 1's verdict on it.
   {
     auto toy = std::make_shared<ToyRunner>(ToyOptions{.cache = true});
     auto sink = std::make_shared<CaptureSink>();
@@ -959,11 +1116,13 @@ int main() {
             sink->sent[1].sequence == 8 && sink->sent[2].sequence == 7 &&
             sink->sent[3].sequence == 8,
         "each call names the request its state is leased to");
-    Require(!runner->CanReuse(*first),
-            "a running request's state is not reusable");
     const auto snapshot = runner->Snapshot(*first);
-    Require(!runner->CanReuse(*snapshot),
-            "a running request's snapshot is not reusable");
+    Require(runner->CanReuse(*snapshot),
+            "a snapshot is reusable as soon as it is captured");
+    Require(sink->sent.back().instruction.op == TpInstructionOp::kSnapshot &&
+                sink->sent.back().instruction.count == 3 &&
+                sink->sent.back().instruction.digest != 0,
+            "a capture carries the request's call count and digest");
 
     std::exception_ptr failures[2];
     const gufo::server::TextRunnerAdvance advances[] = {
@@ -993,20 +1152,32 @@ int main() {
     Require(scope->began == forwards,
             "every forward binds its instruction's collective scope");
 
+    const auto second_snapshot = runner->Snapshot(*second);
     std::string error;
     Require(runner->EndRequest(7, &error) && runner->EndRequest(8, &error),
             error);
     Require(!runner->EndRequest(7, &error), "a request ends once");
-    Require(!runner->CanReuse(*first) && !runner->CanReuse(*snapshot),
-            "an ended request is reusable only after its verdict");
+    Require(runner->CanReuse(*first) && runner->CanReuse(*second),
+            "an ended request's state is reusable before its verdict");
+    // Requests that reuse those states depend on the verdicts.
+    runner->BeginRequest(9);
+    runner->BeginRequest(10);
+    runner->SetPromptContext(*first, std::make_shared<TpRequestContext>(9));
+    runner->SetPromptContext(*second, std::make_shared<TpRequestContext>(10));
     runner->Settle(7, true);
     runner->Settle(8, false);
+    Require(runner->AwaitDependencies(9),
+            "a request that reused an agreed state stands");
+    Require(!runner->AwaitDependencies(10),
+            "a request that reused a rejected state fails too");
     Require(runner->CanReuse(*first) && runner->CanReuse(*snapshot),
             "an agreed request's state and snapshot are reusable");
-    Require(!runner->CanReuse(*second),
-            "a rejected request's state is never reusable");
+    Require(!runner->CanReuse(*second) && !runner->CanReuse(*second_snapshot),
+            "a rejected request's state and snapshot are not reused");
     second->Invalidate();
     Require(runner->CanReuse(*second), "a reset state is clean");
+    Require(runner->EndRequest(9, &error) && runner->EndRequest(10, &error),
+            error);
     bool unleased = false;
     try {
       runner->Advance(*first, 5);
@@ -1014,6 +1185,59 @@ int main() {
       unleased = true;
     }
     Require(unleased, "an ended request releases its state");
+  }
+
+  // A batched multi-token decode is one instruction carrying each member's
+  // budget and draw state and rank 0's draft plan.
+  {
+    auto toy = std::make_shared<ToyRunner>(
+        ToyOptions{.mtp = true, .width = 2, .batch_plan = 1});
+    auto sink = std::make_shared<CaptureSink>();
+    auto scope = std::make_shared<RecordingScope>();
+    auto runner = std::make_shared<TpMirroredRunner>(
+        toy, sink, std::numeric_limits<std::size_t>::max(), scope);
+    Require(runner->Descriptor().capabilities.batched_multi_token_decode,
+            "TP2 offers batched multi-token decoding");
+    auto first = runner->CreateState();
+    auto second = runner->CreateState();
+    const std::vector<TextRunnerToken> short_prompt{4, 5, 6};
+    runner->BeginRequest(7);
+    runner->BeginRequest(8);
+    runner->SetPromptContext(*first, std::make_shared<TpRequestContext>(7));
+    runner->SetPromptContext(*second, std::make_shared<TpRequestContext>(8));
+    (void)runner->Prefill(*first, short_prompt, 0, 3);
+    (void)runner->Prefill(*second, short_prompt, 0, 3);
+    gufo::sampling::SamplerState samplers[] = {
+        gufo::sampling::SamplerState{gufo::sampling::SamplingConfig{}},
+        gufo::sampling::SamplerState{gufo::sampling::SamplingConfig{}}};
+    const gufo::server::TextRunnerDecode decodes[] = {
+        {.state = *first, .max_tokens = 5, .sampler = samplers[0]},
+        {.state = *second, .max_tokens = 1, .sampler = samplers[1]}};
+    const auto steps = runner->DecodeBatch(decodes);
+    const auto& batch = sink->sent.back();
+    Require(batch.sequence == 0 &&
+                batch.instruction.op == TpInstructionOp::kDecodeBatch &&
+                batch.instruction.batch_drafts == 2 &&
+                batch.instruction.batch.size() == 2 &&
+                batch.instruction.batch[0].sequence == 7 &&
+                batch.instruction.batch[0].count == 5 &&
+                batch.instruction.batch[0].pending == -1 &&
+                batch.instruction.batch[1].sequence == 8 &&
+                batch.instruction.batch[1].state == 1 &&
+                batch.instruction.batch[1].count == 1,
+            "a batched decode is one instruction naming each member");
+    Require(steps.size() == 2 && steps[0].selections.size() == 2 &&
+                steps[1].selections.size() == 1 && !steps[0].failure &&
+                !steps[1].failure,
+            "each member decodes within the plan and its budget");
+    Require(Count(toy->Log(), "decode batch 2 plan 1") == 1,
+            "rank 0 runs the batch as one call with its plan");
+    Require(
+        !scope->began.empty() && scope->began.back() == batch.instruction.index,
+        "the batch binds its instruction's collective scope");
+    std::string error;
+    Require(runner->EndRequest(7, &error) && runner->EndRequest(8, &error),
+            error);
   }
 
   // AR: greedy, sampled, stopped and cancelled requests on one pair.
@@ -1160,12 +1384,40 @@ int main() {
     pair.RequireSameCalls("rejected continuation");
   }
 
-  // Concurrent requests: each call names its request, concurrent AR decoders
-  // advance in one batched instruction, MTP decoders take turns, and every
-  // request produces what it produces alone.
+  // A request reuses what the previous one left before rank 1's verdict on
+  // it arrives, as on one host, and stands or falls with that verdict.
+  for (const bool reject : {false, true}) {
+    const std::string what =
+        reject ? "reuse before a rejection" : "reuse before a verdict";
+    ToyOptions rank1{.cache = true};
+    if (reject) {
+      rank1.diverge_at = prompt.size() + 2;
+    }
+    Pair pair({.cache = true}, rank1);
+    auto first = pair.RunOpen(prompt, 6, {}, {}, {}, true);
+    auto second = pair.RunOpen(prompt, 6, {}, {}, {}, true);
+    Require(second.outcome.result.cached_prompt_tokens == prompt.size(),
+            what + ": the second request reuses the first one's prompt");
+    const auto first_end = pair.Close(std::move(first));
+    const auto second_end = pair.Close(std::move(second));
+    Require(first_end.worker_error.empty() != reject,
+            what + ": the first request's verdict: " + first_end.worker_error);
+    Require(
+        second_end.worker_error.empty() != reject,
+        what + ": the second request follows it: " + second_end.worker_error);
+  }
+
+  // Concurrent requests: each call names its request, concurrent decoders run
+  // in one batched instruction, greedy MTP ones with rank 0's draft plan
+  // (rank 1 would choose another), and every request produces what it
+  // produces alone.
   const std::vector<TextRunnerToken> other{2, 4, 6, 8, 10, 12, 14};
-  for (const bool mtp : {false, true}) {
-    const auto sampling = mtp ? Sampled() : gufo::sampling::SamplingConfig{};
+  for (const auto& [what, mtp, sampled] :
+       {std::tuple{"concurrent AR", false, false},
+        std::tuple{"concurrent sampled MTP", true, true},
+        std::tuple{"concurrent greedy MTP", true, false}}) {
+    const auto sampling =
+        sampled ? Sampled() : gufo::sampling::SamplingConfig{};
     std::vector<TextRunnerToken> alone[2];
     {
       Pair solo({.mtp = mtp}, {.mtp = mtp});
@@ -1173,9 +1425,9 @@ int main() {
       alone[1] = solo.Run(other, 12, sampling).result.tokens;
     }
     SubmissionGate gate(2);
-    const std::size_t width = mtp ? 1 : 4;
-    Pair pair({.mtp = mtp, .prefill_hook = gate.Hook(), .width = width},
-              {.mtp = mtp, .width = width}, 2);
+    Pair pair(
+        {.mtp = mtp, .prefill_hook = gate.Hook(), .width = 4, .batch_plan = 1},
+        {.mtp = mtp, .width = 4, .batch_plan = 2}, 2);
     const auto submitted = [&gate] { gate.Submitted(); };
     auto first = std::async(std::launch::async, [&] {
       return pair.Run(prompt, 12, sampling, {}, {}, false, 0, submitted);
@@ -1185,15 +1437,22 @@ int main() {
     });
     const auto a = first.get();
     const auto b = second.get();
-    const std::string what = mtp ? "concurrent MTP" : "concurrent AR";
     Require(a.worker_error.empty() && b.worker_error.empty(),
-            what + ": " + a.worker_error + b.worker_error);
+            std::string(what) + ": " + a.worker_error + b.worker_error);
     Require(a.result.tokens == alone[0] && b.result.tokens == alone[1],
-            what + " requests produce what they produce alone");
-    Require((Count(pair.rank0().Log(), "batch") > 0) == !mtp,
-            what + ": AR decoders advance in batches, MTP ones in turns");
+            std::string(what) + ": requests produce what they produce alone");
+    const auto log = pair.rank0().Log();
+    Require(Count(log, mtp ? "decode batch 2" : "batch 2") > 0,
+            std::string(what) + ": decoders run in batches");
+    Require(!mtp || Count(log, std::string("decode batch 2 plan ") +
+                                   (sampled ? "own" : "1")) ==
+                        Count(log, "decode batch"),
+            std::string(what) +
+                ": a greedy batch drafts by rank 0's plan, a sampled one by "
+                "each member's history");
     pair.RequireSameCalls(what);
-    Require(pair.open_requests() == 0, what + ": rank 1 closed both requests");
+    Require(pair.open_requests() == 0,
+            std::string(what) + ": rank 1 closed both requests");
   }
 
   // The execution digest catches a result the ranks disagree on.
@@ -1236,6 +1495,51 @@ int main() {
     pair.RequireSameCalls(what);
   }
 
+  // The disk cache: each rank persists its own half of a snapshot, a restart
+  // of both restores both halves, and a missing half is only a cache miss.
+  for (const bool mtp : {false, true}) {
+    const std::string what = mtp ? "MTP disk cache" : "AR disk cache";
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("tp2-disk-test-" + std::to_string(::getpid()) +
+                       (mtp ? "-mtp" : "-ar"));
+    std::filesystem::remove_all(root);
+    const auto disk0 = root / "rank0";
+    const auto disk1 = root / "rank1";
+    const ToyOptions persist{.mtp = mtp, .cache = true, .persist = true};
+    std::vector<TextRunnerToken> first;
+    {
+      Pair pair(persist, persist, 1, disk0, disk1);
+      const auto run = pair.Run(prompt, 6, {}, {}, {}, true);
+      Require(run.worker_error.empty(), what + ": " + run.worker_error);
+      first = run.result.tokens;
+      pair.WaitForRank1Disk(1);
+      pair.RequireSameCalls(what + " save");
+    }
+    {
+      Pair pair(persist, persist, 1, disk0, disk1);
+      const auto run = pair.Run(prompt, 6, {}, {}, {}, true);
+      Require(run.worker_error.empty(), what + ": " + run.worker_error);
+      Require(run.result.tokens == first && run.result.cache_disk_hit &&
+                  run.result.cached_prompt_tokens > 0,
+              what + ": a restart restores both halves from disk");
+      Require(Count(pair.rank0().Log(), "disk restore") == 1,
+              what + ": rank 0 restores its half once");
+      pair.RequireSameCalls(what + " restore");
+    }
+    for (const auto& file : std::filesystem::directory_iterator(disk1)) {
+      std::filesystem::remove(file.path());
+    }
+    {
+      Pair pair(persist, persist, 1, disk0, disk1);
+      const auto run = pair.Run(prompt, 6, {}, {}, {}, true);
+      Require(run.worker_error.empty(),
+              what + ": a missing half fails nothing: " + run.worker_error);
+      Require(run.result.tokens == first && !run.result.cache_disk_hit,
+              what + ": a missing half is a miss");
+    }
+    std::filesystem::remove_all(root);
+  }
+
   // A prompt context rank 1 cannot rebuild fails that request only.
   {
     Pair pair({}, {.fail_context_decode = true});
@@ -1252,6 +1556,6 @@ int main() {
   std::puts(
       "PASS: TP2 executor mirrors greedy, sampled, stopped, cancelled, "
       "multi-token, concurrent, batched and image requests, reports divergence "
-      "and reuses only agreed continuations");
+      "and fails requests that reused a rejected continuation");
   return 0;
 }

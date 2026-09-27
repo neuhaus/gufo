@@ -38,16 +38,14 @@ build/gpu-tp2/gufo serve llm --model "$MODEL" --speculative mtp --mtp-model "$MT
 ```
 
 Sampling, streaming, stop sequences, tool calls, images (`--mmproj` on both
-ranks), cancellation, `--request-timeout-ms` and history reuse work as on one
-host. Cancellations and timeouts take effect between model calls, so a long
-prefill stops at its next chunk. Up to `--sessions` requests run at once, their
+ranks), cancellation, `--request-timeout-ms`, history reuse and the disk cache
+(`--cache-disk` on both ranks, each on its own disk) work as on one host.
+Cancellations and timeouts take effect between model calls, so a long prefill
+stops at its next chunk. Up to `--sessions` requests run at once, their
 decoders batched; more wait up to `--max-pending`, the rest get HTTP 429.
 
 Limits:
 
-- The disk cache (`--cache-disk`) is refused: snapshots are rank-local.
-- Concurrent MTP requests advance in batched single-token steps; batched
-  multi-token decoding is not mirrored.
 - A lost peer or a disagreement fails the request with HTTP 500, and a lost
   peer fails every later request, but the process keeps running and `/ready`
   stays green: restart both ranks.
@@ -92,8 +90,10 @@ and both ranks meet in the call's exchanges. Token selection reads only logits
 and stays on rank 0. A request opens with `kSingle` (prompt, sampling
 configuration and prepared images) and closes with `kEnd`. Mirrored calls:
 
-- prefill chunks, single and batched advances, and one multi-token MTP cycle,
-  which carries rank 0's sampler draw state so both ranks draw alike;
+- prefill chunks, single and batched advances, and single and batched
+  multi-token MTP cycles. A cycle carries rank 0's sampler draw state so both
+  ranks draw alike; a batch also carries the draft count rank 0 chose from its
+  own cycle timings;
 - state resets, and binding a state to its request's prompt context (images
   can reset the state);
 - snapshot, restore, prefix reuse and cancellation preparation, each
@@ -106,10 +106,27 @@ pass through the wrapper; a request's cancellation check is never passed to the
 model session, which could strand rank 1 inside an exchange; TP2 must not
 change the cache's boundaries.
 
+**Disk cache.** Each rank keeps its own half of a snapshot on its own disk.
+Rank 0's continuation disk store decides what is saved, restored and evicted,
+as on one host. Its file holds rank 0's half behind a header that names a
+random file key; when it writes the file, rank 1 persists its half under that
+key in the background. Restoring a file restores both halves, rank 1's from
+its own directory, acknowledged before rank 0 continues. Rank 1 bounds its
+directory by least-recent use within its own `--cache-disk-bytes`; a missing,
+corrupt or foreign half fails the restore on rank 1, which rank 0's store
+treats as a miss (the state is reset on both ranks and prefilled). TP2 files
+carry the rank in their cache identity, so neither a one-host server nor the
+other rank restores them. Within one process, a file of a request rank 1
+rejected is a miss, and a restore before the verdict depends on it.
+
 **Agreement.** Both ranks digest every call and its result; `kEnd` carries rank
 0's digest and call count, and rank 1 fails the request on a difference. Under
 greedy decoding rank 1 also checks its own argmax against every token rank 0
-advances. What a request computed is reused only after rank 1 agreed with it.
+advances. A capture carries the request's digest so far, and rank 1 captures
+only a state both ranks reached the same way. Snapshots and released states
+are reused at once, as on one host; a request that reuses what an unjudged
+request left fails too if rank 1 later rejects that request, and a rejected
+request's states and snapshots are not reused.
 
 ## Tests and probes
 
@@ -119,7 +136,10 @@ advances. What a request computed is reused only after rank 1 agreed with it.
 - `qwen38_flash_next.tp_partition` and the attention, projection and routed
   operator tests: the split against the full kernels.
 - `qwen38_flash_next_tp_probe` (`gpu-tp2`): prompt, decode and logit
-  comparison on both ranks.
+  comparison on both ranks; `--split N` checks that a prefill does not depend
+  on its steps (every layer's MoE input and output, and the logits, bit for
+  bit), `--decode-tail K` compares decoding the last K tokens with
+  prefilling them.
 - `qwen38_flash_next_tp_batched_probe` (`gpu-tp2`): batched against serial
   decoding on both ranks without the serving stack; `--allreduce-bench N`
   times the exchange.
@@ -139,9 +159,13 @@ On both hosts, from one commit (record it and the binary hash):
    client disconnects during decode and prefill behave as on one host.
 4. A multi-turn cached chat restores its whole prompt on replay; cached token
    counts match one host (outputs may differ after a few turns).
-5. Two, four and eight concurrent requests each equal their one-at-a-time
-   output; the queue bound returns 429; a long prefill runs beside decoders.
+5. Two, four and eight concurrent requests, AR and MTP, each equal their
+   one-at-a-time output, seeded sampled ones too; the queue bound returns 429;
+   a long prefill runs beside decoders.
 6. Images: a request, its cached repeat, a follow-up and two images in one
    request match one host's answers.
-7. Killing rank 1 mid-request returns 500 promptly.
-8. For speed, report the median of several warm requests.
+7. Disk cache (`--cache-disk` on both ranks): after both ranks restart,
+   `tools/serving/check-continuation.py --restore` restores its greedy cases
+   from disk with the same outputs.
+8. Killing rank 1 mid-request returns 500 promptly.
+9. For speed, report the median of several warm requests.

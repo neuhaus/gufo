@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TP_EXECUTOR_HPP_
 #define GUFO_SERVER_TP_EXECUTOR_HPP_
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -16,6 +17,7 @@
 
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/cli/serve/tp_control.hpp"
+#include "src/cli/serve/tp_disk_store.hpp"
 
 namespace gufo::server {
 
@@ -122,7 +124,7 @@ struct TpRequestContext final : TextPromptContext {
 /// logits and stays local. The scheduler above is unchanged, so its stop,
 /// cancellation and length decisions reach rank 1 simply as the calls rank 0
 /// no longer makes. Several requests may be open: each call belongs to the
-/// request whose state it runs on, and one batched advance to all of them.
+/// request whose state it runs on, and a batched call to all of its members.
 ///
 /// Cache operations are acknowledged before the next forward. Snapshot bytes
 /// stay local; only their monotonic IDs cross the control channel. It never
@@ -130,8 +132,10 @@ struct TpRequestContext final : TextPromptContext {
 /// aborting between layers would strand rank 1 inside an exchange, so
 /// cancellation acts only between calls, where the scheduler already checks.
 ///
-/// What a request computed is reused by no other request until rank 1 agreed
-/// with it (`Settle`), so a disagreement never spreads through the cache.
+/// A request may reuse what another computed before rank 1 judged it; it then
+/// fails if rank 1 rejects that producer (`AwaitDependencies`), and nothing a
+/// rejected request left is reused (`CanReuse`), so a disagreement never
+/// spreads through the cache.
 class TpMirroredRunner final
     : public TextModelRunner,
       public std::enable_shared_from_this<TpMirroredRunner> {
@@ -149,9 +153,13 @@ public:
   /// Sends `kEnd` with the request's instruction count and digest and
   /// releases its state. Returns false when the send failed.
   [[nodiscard]] bool EndRequest(std::uint64_t sequence, std::string* error);
-  /// Records rank 1's verdict on an ended request. What the request computed
-  /// becomes reusable once rank 1 agreed, and never if it did not.
+  /// Records rank 1's verdict on an ended request, which must include
+  /// `AwaitDependencies`. A state it left is not reused once rank 1 disagreed.
   void Settle(std::uint64_t sequence, bool agreed);
+  /// Waits for the verdicts on the requests whose live state `sequence`
+  /// reused before their verdict arrived; false when rank 1 rejected one, or
+  /// a verdict did not arrive in time. The request then fails too.
+  [[nodiscard]] bool AwaitDependencies(std::uint64_t sequence) const;
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override;
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override;
@@ -203,6 +211,20 @@ public:
   [[nodiscard]] bool CanReuse(const TextRunnerState& state) const override;
   [[nodiscard]] bool CanReuse(
       const TextRunnerSnapshot& snapshot) const override;
+  /// The disk cache holds rank 0's half of each snapshot behind a header that
+  /// names rank 1's half (a file key) and the request that produced it.
+  /// Writing it tells rank 1 to persist its half under the key; restoring it
+  /// restores both halves, or neither.
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override;
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override;
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override;
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override;
 
 private:
   class State;
@@ -220,6 +242,10 @@ private:
   };
 
   void Drop(std::uint64_t id) const noexcept;
+  /// Tells rank 1 to persist its half of `snapshot` and returns the header
+  /// of rank 0's half.
+  [[nodiscard]] std::vector<std::uint8_t> BeginPersist(
+      const TextRunnerSnapshot& snapshot) const;
   /// Runs a cache call on both ranks and returns the request it belongs to.
   std::uint64_t CacheCall(std::uint32_t state, const TpInstruction& instruction,
                           const std::function<void()>& local) const;
@@ -231,7 +257,8 @@ private:
   /// call must not run then, because rank 1 would never join its exchanges.
   Sent Send(std::uint32_t state, const TpInstruction& instruction,
             std::span<const TextRunnerToken> prefill_prompt = {}) const;
-  /// Sends a batched advance, recording each member in its own request.
+  /// Sends a batched advance or decode, recording each member in its own
+  /// request.
   Sent SendBatch(TpInstruction& instruction) const;
   /// Sends a reset, which may happen between requests too. Cannot throw: the
   /// continuation cache resets states from `noexcept` paths, so a failed send
@@ -239,8 +266,6 @@ private:
   void SendInvalidate(std::uint32_t state) const noexcept;
   void Record(std::uint64_t sequence,
               const std::function<void(TpExecutionDigest&)>& add) const;
-  /// Under `mutex_`: whether what `producer` computed may be reused.
-  [[nodiscard]] bool Settled(std::uint64_t producer) const;
 
   std::shared_ptr<TextModelRunner> inner_;
   std::shared_ptr<TpInstructionSink> sink_;
@@ -259,7 +284,14 @@ private:
   /// Requests rank 1 has not judged yet, and those it disagreed with.
   mutable std::unordered_set<std::uint64_t> unsettled_;
   mutable std::unordered_set<std::uint64_t> rejected_;
+  /// Request to the unjudged requests whose live state it reused.
+  mutable std::unordered_map<std::uint64_t, std::unordered_set<std::uint64_t>>
+      dependencies_;
+  mutable std::condition_variable settled_;
   mutable std::string failure_;
+  /// Names this process in the disk-cache files it writes, so a restore in the
+  /// same process can check the producing request's verdict.
+  std::uint64_t nonce_{0};
 };
 
 /// Rank 1's side of a TP2 pair: executes rank 0's instructions on its own
@@ -270,7 +302,8 @@ public:
   TpExecutor(
       std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
       std::size_t snapshot_budget = std::numeric_limits<std::size_t>::max(),
-      std::shared_ptr<TpCallScope> scope = {});
+      std::shared_ptr<TpCallScope> scope = {},
+      std::shared_ptr<TpDiskStore> disk = {});
   ~TpExecutor();
 
   using Respond = std::function<bool(const TpControlResponse&, std::string*)>;
@@ -314,6 +347,7 @@ private:
 
   std::shared_ptr<TextModelRunner> runner_;
   std::shared_ptr<TpCallScope> scope_;
+  std::shared_ptr<TpDiskStore> disk_;
   std::vector<std::unique_ptr<TextRunnerState>> states_;
   std::unordered_map<std::uint64_t, std::unique_ptr<Request>> requests_;
   std::uint64_t next_index_{0};
@@ -321,7 +355,8 @@ private:
   const std::size_t snapshot_budget_;
   std::size_t snapshot_bytes_{0};
   void DropSnapshot(std::uint64_t id);
-  std::unordered_map<std::uint64_t, std::unique_ptr<TextRunnerSnapshot>>
+  /// Shared with the disk store while it persists one.
+  std::unordered_map<std::uint64_t, std::shared_ptr<TextRunnerSnapshot>>
       snapshots_;
 };
 

@@ -284,6 +284,31 @@ int main() {
               {.sequence = command.sequence + 1, .state = 0, .token = 11},
               {.sequence = command.sequence + 2, .state = 7, .token = 0}}}};
   round_trip(batch);
+  // A batched multi-token decode names each member's request, state, budget
+  // and draw state, and carries rank 0's draft plan plus one.
+  const TpControlCommand decode_batch{
+      .sequence = 0,
+      .kind = TpControlCommandKind::kInstruction,
+      .instruction = {
+          .op = TpInstructionOp::kDecodeBatch,
+          .index = 18,
+          .batch = {{.sequence = command.sequence,
+                     .state = 2,
+                     .count = 8,
+                     .rng = 0x0123456789abcdefULL,
+                     .pending = 248068},
+                    {.sequence = command.sequence + 1, .state = 0, .count = 1}},
+          .batch_drafts = 4}};
+  round_trip(decode_batch);
+  // A capture carries the request's call count and digest so far.
+  round_trip({.sequence = command.sequence,
+              .kind = TpControlCommandKind::kInstruction,
+              .instruction = {.op = TpInstructionOp::kSnapshot,
+                              .index = 18,
+                              .state = 1,
+                              .count = 41,
+                              .digest = 0x1234,
+                              .snapshot_id = 7}});
   // Binding a state to its request's prompt context belongs to the request;
   // releasing it can happen between requests.
   round_trip(
@@ -296,6 +321,20 @@ int main() {
        .kind = TpControlCommandKind::kInstruction,
        .instruction = {
            .op = TpInstructionOp::kPromptContext, .index = 20, .state = 3}});
+  // The disk cache: persisting a snapshot happens between requests, a disk
+  // restore within one; both name rank 1's file by its key.
+  round_trip({.sequence = 0,
+              .kind = TpControlCommandKind::kInstruction,
+              .instruction = {.op = TpInstructionOp::kPersist,
+                              .index = 21,
+                              .snapshot_id = 19,
+                              .file_key = 0xfedcba9876543210ULL}});
+  round_trip({.sequence = command.sequence,
+              .kind = TpControlCommandKind::kInstruction,
+              .instruction = {.op = TpInstructionOp::kRestoreDisk,
+                              .index = 22,
+                              .state = 2,
+                              .file_key = 0xfedcba9876543210ULL}});
   const TpControlResponse ack{.instruction_index = 17,
                               .sequence = command.sequence,
                               .error = "capture failed",
@@ -335,6 +374,21 @@ int main() {
   refuses("a client id", with([](auto& bad) { bad.client_id = "probe"; }));
   refuses("a prompt context",
           with([](auto& bad) { bad.prompt_context = {1, 2, 3}; }));
+  refuses("a file key outside the disk cache",
+          with([](auto& bad) { bad.instruction.file_key = 5; }));
+  refuses("a persist without a file key", with([](auto& bad) {
+            bad.sequence = 0;
+            bad.instruction = {.op = TpInstructionOp::kPersist,
+                               .snapshot_id = 4};
+          }));
+  refuses("a disk restore without a file key", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kRestoreDisk};
+          }));
+  refuses("a disk restore outside a request", with([](auto& bad) {
+            bad.sequence = 0;
+            bad.instruction = {.op = TpInstructionOp::kRestoreDisk,
+                               .file_key = 9};
+          }));
   refuses("a prompt-context binding with a token", with([](auto& bad) {
             bad.instruction = {.op = TpInstructionOp::kPromptContext,
                                .token = 4};
@@ -396,6 +450,31 @@ int main() {
           with_batch([&](auto& bad) { bad.sequence = command.sequence; }));
   refuses("a batch carrying a token",
           with_batch([](auto& bad) { bad.instruction.token = 3; }));
+  const auto with_decode_batch = [&](auto change) {
+    TpControlCommand bad = decode_batch;
+    change(bad);
+    return bad;
+  };
+  refuses("a decode batch serving one request twice",
+          with_decode_batch([](auto& bad) {
+            bad.instruction.batch[1].sequence =
+                bad.instruction.batch[0].sequence;
+          }));
+  refuses(
+      "a decode batch member without a budget",
+      with_decode_batch([](auto& bad) { bad.instruction.batch[1].count = 0; }));
+  refuses(
+      "a decode batch member with a token",
+      with_decode_batch([](auto& bad) { bad.instruction.batch[0].token = 5; }));
+  refuses("a decode batch member with an invalid pending draw",
+          with_decode_batch(
+              [](auto& bad) { bad.instruction.batch[0].pending = -2; }));
+  refuses("a batched advance member with a draw state",
+          with_batch([](auto& bad) { bad.instruction.batch[0].rng = 9; }));
+  refuses("a batched advance member with a budget",
+          with_batch([](auto& bad) { bad.instruction.batch[0].count = 2; }));
+  refuses("a draft plan outside a decode batch",
+          with_batch([](auto& bad) { bad.instruction.batch_drafts = 2; }));
   refuses("members on a single advance", with([&](auto& bad) {
             bad.instruction = {.op = TpInstructionOp::kAdvance,
                                .token = 1,
@@ -535,6 +614,8 @@ int main() {
                    [](TpControlConfig& config) { config.sessions = 4; });
   refuses_mismatch("vision",
                    [](TpControlConfig& config) { config.vision = true; });
+  refuses_mismatch("disk cache",
+                   [](TpControlConfig& config) { config.disk_cache = true; });
   refuses_mismatch("context",
                    [](TpControlConfig& config) { config.max_context = 8192; });
 

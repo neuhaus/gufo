@@ -27,7 +27,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 13;         // requests and rank-1 executor
+constexpr std::uint16_t kVersion = 15;         // requests and rank-1 executor
                                                // instructions for concurrent
                                                // requests
 constexpr std::uint16_t kHello = 1;
@@ -198,19 +198,31 @@ bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
   }
   const bool snapshot_op = instruction.op == TpInstructionOp::kSnapshot ||
                            instruction.op == TpInstructionOp::kRestore ||
-                           instruction.op == TpInstructionOp::kDrop;
+                           instruction.op == TpInstructionOp::kDrop ||
+                           instruction.op == TpInstructionOp::kPersist;
   if (snapshot_op != (instruction.snapshot_id != 0)) {
     SetError(error, "TP instruction snapshot ID is invalid");
     return false;
   }
-  if ((instruction.op == TpInstructionOp::kAdvanceBatch) !=
-      !instruction.batch.empty()) {
+  const bool disk_op = instruction.op == TpInstructionOp::kPersist ||
+                       instruction.op == TpInstructionOp::kRestoreDisk;
+  if (disk_op != (instruction.file_key != 0)) {
+    SetError(error, "TP instruction file key is invalid");
+    return false;
+  }
+  const bool batch_op = instruction.op == TpInstructionOp::kAdvanceBatch ||
+                        instruction.op == TpInstructionOp::kDecodeBatch;
+  if (batch_op != !instruction.batch.empty() ||
+      (instruction.op != TpInstructionOp::kDecodeBatch &&
+       instruction.batch_drafts != 0)) {
     SetError(error, "TP instruction batch does not match its operation");
     return false;
   }
   bool valid = false;
   switch (instruction.op) {
     case TpInstructionOp::kAdvanceBatch:
+    case TpInstructionOp::kDecodeBatch: {
+      const bool decode = instruction.op == TpInstructionOp::kDecodeBatch;
       valid = instruction.state == 0 &&
               only(false, false, false, false, false) &&
               instruction.batch.size() >= 2 &&
@@ -218,13 +230,22 @@ bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
       for (std::size_t index = 0; valid && index < instruction.batch.size();
            ++index) {
         const auto& member = instruction.batch[index];
-        valid = member.sequence != 0 && member.token >= 0;
+        valid = member.sequence != 0 &&
+                (decode ? member.token == 0 && member.count != 0 &&
+                              member.pending >= -1
+                        : member.token >= 0 && member.count == 0 &&
+                              member.rng == 0 && member.pending == -1);
+        // A decode batch draws with each member's own sampler.
         for (std::size_t previous = 0; valid && previous < index; ++previous) {
-          valid = instruction.batch[previous].state != member.state;
+          valid = instruction.batch[previous].state != member.state &&
+                  (!decode ||
+                   instruction.batch[previous].sequence != member.sequence);
         }
       }
       break;
+    }
     case TpInstructionOp::kDrop:
+    case TpInstructionOp::kPersist:
       valid = instruction.state == 0 && only(false, false, false, false, false);
       break;
     case TpInstructionOp::kReuse:
@@ -232,10 +253,14 @@ bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
               instruction.prompt_size <= kMaxPromptTokens;
       break;
     case TpInstructionOp::kSnapshot:
+      // The request's call count and digest so far.
+      valid = only(false, false, true, false, true);
+      break;
     case TpInstructionOp::kRestore:
     case TpInstructionOp::kCancelPrepare:
     case TpInstructionOp::kInvalidate:
     case TpInstructionOp::kPromptContext:
+    case TpInstructionOp::kRestoreDisk:
       valid = only(false, false, false, false, false);
       break;
     case TpInstructionOp::kPrefill:
@@ -260,17 +285,19 @@ bool ReadBytes(std::span<const std::uint8_t> data, std::size_t* offset,
     SetError(error, "TP instruction has invalid arguments for its operation");
     return false;
   }
-  // Only a reset, a snapshot drop or clearing a prompt context can happen
-  // between requests: the continuation cache makes them on its own schedule.
+  // Only a reset, a snapshot drop or persist, or clearing a prompt context can
+  // happen between requests: the caches make them on their own schedule.
   // A batch names its members' requests. Every other call belongs to a
   // request.
   if (sequence == 0 && instruction.op != TpInstructionOp::kInvalidate &&
       instruction.op != TpInstructionOp::kDrop &&
+      instruction.op != TpInstructionOp::kPersist &&
       instruction.op != TpInstructionOp::kPromptContext &&
-      instruction.op != TpInstructionOp::kAdvanceBatch) {
+      instruction.op != TpInstructionOp::kAdvanceBatch &&
+      instruction.op != TpInstructionOp::kDecodeBatch) {
     SetError(error,
              "TP instruction outside a request must be a reset, a snapshot "
-             "drop or a prompt-context release");
+             "drop or persist, or a prompt-context release");
     return false;
   }
   return true;
@@ -624,6 +651,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   AppendU32(&payload, config.use_mtp ? 1U : 0U);
   AppendU32(&payload, config.sessions);
   AppendU32(&payload, config.vision ? 1U : 0U);
+  AppendU32(&payload, config.disk_cache ? 1U : 0U);
   AppendU64(&payload, config.snapshot_budget_bytes);
   AppendU32(&payload, static_cast<std::uint32_t>(config.auth_token.size()));
   payload.insert(payload.end(), config.auth_token.begin(),
@@ -652,6 +680,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   std::uint32_t mtp = 0;
   std::uint32_t sessions = 0;
   std::uint32_t vision = 0;
+  std::uint32_t disk_cache = 0;
   std::uint64_t snapshot_budget = 0;
   std::uint32_t auth_size = 0;
   std::string peer_token;
@@ -663,6 +692,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
       !ReadU32(peer, &offset, &mtp, error) ||
       !ReadU32(peer, &offset, &sessions, error) ||
       !ReadU32(peer, &offset, &vision, error) ||
+      !ReadU32(peer, &offset, &disk_cache, error) ||
       !ReadU64(peer, &offset, &snapshot_budget, error) ||
       !ReadU32(peer, &offset, &auth_size, error) ||
       auth_size > kMaxAuthTokenBytes || peer.size() - offset != auth_size) {
@@ -695,6 +725,8 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   differs(sessions != config.sessions, "sessions", config.sessions, sessions);
   differs(vision != (config.vision ? 1U : 0U), "vision (--mmproj)",
           config.vision ? 1U : 0U, vision);
+  differs(disk_cache != (config.disk_cache ? 1U : 0U),
+          "disk cache (--cache-disk)", config.disk_cache ? 1U : 0U, disk_cache);
   if (peer_token != auth_token_) {
     mismatch += std::string(mismatch.empty() ? "" : ", ") + "control token";
   }
@@ -771,11 +803,16 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU64(&payload, instruction.digest);
     AppendU64(&payload, instruction.rng);
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.pending));
+    AppendU64(&payload, instruction.file_key);
+    AppendU32(&payload, instruction.batch_drafts);
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.batch.size()));
     for (const auto& member : instruction.batch) {
       AppendU64(&payload, member.sequence);
       AppendU32(&payload, member.state);
       AppendU32(&payload, static_cast<std::uint32_t>(member.token));
+      AppendU32(&payload, member.count);
+      AppendU64(&payload, member.rng);
+      AppendU32(&payload, static_cast<std::uint32_t>(member.pending));
     }
   }
   return SendFrame(kCommand, command.sequence, payload, error);
@@ -898,8 +935,10 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU64(command_prompt_, &offset, &instruction.digest, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.rng, error) ||
         !ReadU32(command_prompt_, &offset, &pending_bits, error) ||
+        !ReadU64(command_prompt_, &offset, &instruction.file_key, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.batch_drafts, error) ||
         !ReadU32(command_prompt_, &offset, &batch_size, error) ||
-        op > static_cast<std::uint32_t>(TpInstructionOp::kPromptContext) ||
+        op > static_cast<std::uint32_t>(TpInstructionOp::kDecodeBatch) ||
         batch_size > kMaxBatchMembers) {
       return reject("TP control instruction is invalid");
     }
@@ -909,12 +948,17 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
     instruction.batch.resize(batch_size);
     for (auto& member : instruction.batch) {
       std::uint32_t member_token = 0;
+      std::uint32_t member_pending = 0;
       if (!ReadU64(command_prompt_, &offset, &member.sequence, error) ||
           !ReadU32(command_prompt_, &offset, &member.state, error) ||
-          !ReadU32(command_prompt_, &offset, &member_token, error)) {
+          !ReadU32(command_prompt_, &offset, &member_token, error) ||
+          !ReadU32(command_prompt_, &offset, &member.count, error) ||
+          !ReadU64(command_prompt_, &offset, &member.rng, error) ||
+          !ReadU32(command_prompt_, &offset, &member_pending, error)) {
         return reject("TP control instruction batch is truncated");
       }
       member.token = static_cast<std::int32_t>(member_token);
+      member.pending = static_cast<std::int32_t>(member_pending);
     }
   } else {
     return reject("TP control command kind is invalid");
