@@ -16,8 +16,9 @@ models, session counts and disk-cache budget. Both ranks therefore always
 agree, and the worker host needs no environment files.
 
 Each rank runs `podman run --rm` (no `-d`) in the foreground; systemd owns
-the process and the restart policy, and all container output is tagged with
-the unit in the user journal.
+the process and the restart policy. The container output reaches the user
+journal once, through the unit (`--log-driver none`), tagged `gufo-rank0` or
+`gufo-rank1`.
 
 ## Units
 

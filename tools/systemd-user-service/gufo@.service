@@ -29,6 +29,7 @@ Type=exec
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=5min
+SyslogIdentifier=gufo-rank0
 EnvironmentFile=%h/.config/gufo/head.env
 EnvironmentFile=%h/.config/gufo/%i.env
 # The worker connects to this host's address on the RDMA link: GUFO_TP_ADDR,
@@ -50,7 +51,7 @@ ExecStartPre=/bin/sh -c '\
       GUFO_CACHE_DISK_BYTES=$GUFO_CACHE_DISK_BYTES && \
     systemctl --user start gufo-rank1@%i.service"'
 ExecStartPre=/usr/bin/mkdir -p %h/.cache/gufo-tp2/%i
-ExecStart=/bin/sh -c 'exec podman run --rm --log-driver journald --security-opt label=disable \
+ExecStart=/bin/sh -c 'exec podman run --rm --log-driver none --security-opt label=disable \
   --userns keep-id:uid=1000,gid=1000 \
   --device /dev/kfd --device /dev/dri \
   --device /dev/infiniband/uverbs0 --device /dev/infiniband/rdma_cm \

@@ -19,10 +19,11 @@ Type=exec
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=5min
+SyslogIdentifier=gufo-rank1
 ExecStartPre=/bin/sh -c '[ -n "$GUFO_HEAD_HOST" ] && [ -n "$GUFO_MODEL" ] || \
   { echo "no settings from the rank 0 host: start gufo@%i there" >&2; exit 1; }'
 ExecStartPre=/usr/bin/mkdir -p %h/.cache/gufo-tp2/%i
-ExecStart=/bin/sh -c 'exec podman run --rm --log-driver journald --security-opt label=disable \
+ExecStart=/bin/sh -c 'exec podman run --rm --log-driver none --security-opt label=disable \
   --userns keep-id:uid=1000,gid=1000 \
   --device /dev/kfd --device /dev/dri \
   --device /dev/infiniband/uverbs0 --device /dev/infiniband/rdma_cm \
