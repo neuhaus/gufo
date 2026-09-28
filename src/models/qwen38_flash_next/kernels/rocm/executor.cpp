@@ -259,7 +259,7 @@ void Session::Reset() {
 Executor::~Executor() {
   // Readers write pinned staging memory; drain them before freeing it,
   // including when a forward failed before reaching PLE.
-  if (ple_pending_) {
+  if (ple_pending_ || lookahead_pending_) {
     (void)ngram_->WaitRead();
   }
   (void)hipFree(batch_logits_);
@@ -270,9 +270,10 @@ Executor::~Executor() {
     (void)hipFree(p);
   }
   for (void* p :
-       {static_cast<void*>(host_emb_), static_cast<void*>(control_host_),
-        static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
-        static_cast<void*>(mtp_token_host_), static_cast<void*>(counts_host_),
+       {static_cast<void*>(host_emb_), static_cast<void*>(lookahead_emb_),
+        static_cast<void*>(control_host_), static_cast<void*>(tokens_host_),
+        static_cast<void*>(logits_host_), static_cast<void*>(mtp_token_host_),
+        static_cast<void*>(counts_host_),
         static_cast<void*>(mtp_candidates_host_),
         static_cast<void*>(tiles_host_)}) {
     if (p != nullptr) {
@@ -419,6 +420,14 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     }
     e->host_emb_ = static_cast<float*>(pinned);
     e->host_rows_.resize(chunk * c.ple_heads);
+    pinned = nullptr;
+    if (!Check(
+            hipHostMalloc(&pinned, chunk * c.PleEmbeddingDim() * sizeof(float)),
+            "pinned n-gram lookahead buffer", error_msg)) {
+      return nullptr;
+    }
+    e->lookahead_emb_ = static_cast<float*>(pinned);
+    e->lookahead_rows_.resize(chunk * c.ple_heads);
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
@@ -1240,11 +1249,36 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   return true;
 }
 
+void Executor::SetPrefillLookahead(std::span<const std::int32_t> tokens) const {
+  lookahead_tokens_.assign(tokens.begin(), tokens.end());
+}
+
+void Executor::StartLookahead() const {
+  if (!lookahead_requested_ || ple_pending_ || lookahead_pending_) {
+    return;
+  }
+  lookahead_requested_ = false;
+  const std::size_t tokens = lookahead_row_count_ / config().ple_heads;
+  lookahead_pending_ = ngram_->StartRead(
+      std::span<const std::uint32_t>(lookahead_rows_.data(),
+                                     lookahead_row_count_),
+      std::span<float>(lookahead_emb_, tokens * config().PleEmbeddingDim()));
+}
+
+void Executor::SettleLookahead() const {
+  if (lookahead_pending_) {
+    lookahead_pending_ = false;
+    lookahead_ready_ = ngram_->WaitRead();
+  }
+}
+
 bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
                         bool speculative, std::string* error_msg) const {
   if (ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
+  ple_ready_ = false;
+  SettleLookahead();
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   // Only proper prefixes need snapshots; the full batch keeps its live state.
@@ -1261,6 +1295,34 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
     HashNgramRows(c, session.ngram_, tokens,
                   std::span<std::uint32_t>(host_rows_.data(), n * c.ple_heads));
   }
+  // The rows identify the embeddings, so an equal lookahead prefix holds
+  // exactly what the read would return.
+  const std::size_t row_count = static_cast<std::size_t>(n) * c.ple_heads;
+  const bool hit =
+      lookahead_ready_ && row_count <= lookahead_row_count_ &&
+      std::equal(host_rows_.begin(), host_rows_.begin() + row_count,
+                 lookahead_rows_.begin());
+  lookahead_ready_ = false;
+  // Hash the next chunk's rows from the history after this batch; the read
+  // starts once this batch's rows are in (at once on a hit, else in WaitPle).
+  lookahead_requested_ =
+      !speculative && !lookahead_tokens_.empty() &&
+      lookahead_tokens_.size() * c.ple_heads <= lookahead_rows_.size();
+  if (lookahead_requested_) {
+    NgramHistory history = session.ngram_;
+    lookahead_row_count_ = lookahead_tokens_.size() * c.ple_heads;
+    HashNgramRows(
+        c, history, lookahead_tokens_,
+        std::span<std::uint32_t>(lookahead_rows_.data(), lookahead_row_count_));
+  }
+  lookahead_tokens_.clear();
+  if (hit) {
+    std::copy_n(lookahead_emb_,
+                static_cast<std::size_t>(n) * c.PleEmbeddingDim(), host_emb_);
+    ple_ready_ = true;
+    StartLookahead();
+    return true;
+  }
   ple_pending_ = ngram_->StartRead(
       std::span<const std::uint32_t>(host_rows_.data(), n * c.ple_heads),
       std::span<float>(host_emb_,
@@ -1272,12 +1334,18 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
 }
 
 bool Executor::WaitPle(std::string* error_msg) const {
+  if (ple_ready_) {
+    ple_ready_ = false;
+    return true;
+  }
   const bool ok = ple_pending_ && ngram_->WaitRead();
   ple_pending_ = false;
   if (!ok) {
     AssignError(error_msg, "n-gram table read failed");
+    return false;
   }
-  return ok;
+  StartLookahead();
+  return true;
 }
 
 bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
