@@ -66,7 +66,6 @@ If another local user unit claims the GPU, add a drop-in
 cp 'gufo@.service' gufo.service ~/.config/systemd/user/
 mkdir -p ~/.config/gufo
 cp head.env.example ~/.config/gufo/head.env   # then adjust
-cp quant.env.example ~/.config/gufo/q8.env    # one per quantization
 systemctl --user daemon-reload
 
 # worker host
@@ -82,13 +81,16 @@ it as the IPv4 address of its only RDMA netdev; with several, set
 
 ```sh
 systemctl --user start gufo          # start pair (q8); returns in ~1 s
+systemctl --user start gufo@q4       # or another quantization
 systemctl --user stop gufo           # stop pair
 systemctl --user status gufo@q8
 journalctl --user -u gufo@q8 -f                          # rank 0 logs
 ssh <worker-host> journalctl --user -u gufo-rank1@q8 -f  # rank 1 logs
 ```
 
-Model load takes ~25 s per rank; the server answers
+`head.env` names one model per quantization (`GUFO_MODEL_Q8`,
+`GUFO_MODEL_Q4`, ...); the instance name selects it, and the head hands it to
+the worker. Model load takes ~25 s per rank; the server answers
 `http://<head>:8000/v1/models` ~1 minute after `start`.
 
 ## Disk cache
