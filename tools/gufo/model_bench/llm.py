@@ -74,6 +74,7 @@ class Session:
         modes: list[str] | None = None,
         context: int | None = None,
         request_transport: str | None = None,
+        artifact_target: str | None = None,
     ):
         self.config = config
         self.target = target
@@ -93,6 +94,7 @@ class Session:
         if request_transport not in {None, "sse", "json"}:
             raise ValueError(f"unsupported request transport: {request_transport}")
         self.request_transport = request_transport
+        self._artifact_target = artifact_target
         self.tokenizer_calibration: dict[str | None, tuple[int, float]] = {}
         self._rank_fingerprints: dict[str, dict[str, Any]] | None = None
 
@@ -129,14 +131,17 @@ class Session:
         return self.tp2_config is not None
 
     @property
+    def artifact_target(self) -> str:
+        """Artifact name suffix: TP2 results sit beside the one-host ones."""
+        if self._artifact_target:
+            return self._artifact_target
+        if self.tp2_enabled:
+            return str(self.tp2_config.get("artifact_target", "gufo-tp2"))
+        return self.target
+
+    @property
     def stream_requests(self) -> bool:
-        if self.request_transport == "json":
-            return False
-        if self.request_transport == "sse":
-            if self.tp2_enabled:
-                raise RuntimeError("TP2 requests must use the JSON transport")
-            return True
-        return not self.tp2_enabled
+        return self.request_transport != "json"
 
     def check_tp2_scope(
         self, table: TableSpec, *, depths: list[int] | None = None,
@@ -148,11 +153,6 @@ class Session:
             raise RuntimeError(
                 f"TP2 benchmark does not support {table.kind} tables; "
                 "the two-host topology is not comparable to the published one-host method"
-            )
-        if table.kind == "multi" and users != 1:
-            raise RuntimeError(
-                "TP2 benchmark currently supports C1 only; distributed "
-                "concurrent decode is not qualified"
             )
 
     def _checked_tp2_config(self) -> dict[str, Any]:
@@ -180,20 +180,6 @@ class Session:
         return str(Path(container_workspace) / relative)
 
     @staticmethod
-    def _drop_options(args: list[str], names: set[str]) -> list[str]:
-        result: list[str] = []
-        skip_next = False
-        for arg in args:
-            if skip_next:
-                skip_next = False
-                continue
-            if arg in names:
-                skip_next = True
-                continue
-            result.append(arg)
-        return result
-
-    @staticmethod
     def _container_name(table: TableSpec, tag: str, rank: int) -> str:
         raw = f"gufo-model-bench-{table.id}-{tag}-rank{rank}"
         return "".join(char if char.isalnum() or char in "-_" else "-" for char in raw)
@@ -202,10 +188,7 @@ class Session:
         self, name: str, serve_args: list[str], *, container_workspace: str,
         workspace: Path, config: dict[str, Any],
     ) -> list[str]:
-        devices = config.get("devices", [
-            "/dev/kfd", "/dev/dri", "/dev/infiniband/uverbs0",
-            "/dev/infiniband/rdma_cm",
-        ])
+        devices = config.get("devices", ["/dev/kfd", "/dev/dri", "/dev/infiniband"])
         command = [
             "podman", "run", "--rm", "--name", name,
             "--security-opt", "label=disable",
@@ -242,12 +225,7 @@ class Session:
     ) -> list[str]:
         binary = self._tp2_binary_path(config, container_workspace, workspace)
         model = self._container_path(self.config.file("gguf", table.variant), workspace, container_workspace)
-        llm_args = self._drop_options(
-            list(self.config.data["gufo"].get("llm", [])),
-            {"--max-pending", "--max-pending-per-client", "--max-connections",
-             "--request-timeout-ms", "--cache-disk", "--cache-disk-bytes",
-             "--cache-disk-staging-bytes"},
-        )
+        llm_args = list(self.config.data["gufo"].get("llm", []))
         command = [
             str(binary), "serve", "--host", "127.0.0.1", "--port", str(port),
             "--sessions", str(sessions), *self.config.data["gufo"].get("serve", []),
@@ -271,11 +249,7 @@ class Session:
             command += speculative
         else:
             command += ["--speculative", "off"]
-        # The TP2 server currently admits only one pending request, one
-        # connection, and no request timeout or disk cache.
         command += [
-            "--max-pending", "1", "--max-pending-per-client", "1",
-            "--max-connections", "1", "--request-timeout-ms", "0",
             "--tp-world-size", "2", "--tp-rank", str(rank),
             "--tp-bootstrap-port", str(config.get("bootstrap_port", 18515)),
             "--tp-control-port", str(config.get("control_port", 18516)),
@@ -462,8 +436,7 @@ class Session:
             notes = [
                 *notes,
                 "TP2 paired topology: rank 0 owns HTTP and rank 1 is the remote worker; "
-                "requests use the qualified non-streaming C1 path; cache reuse "
-                "works as on one host; "
+                "requests, sessions and cache reuse work as on one host; "
                 "control credentials and endpoint addresses are omitted",
             ]
         artifact = new_artifact(
@@ -471,14 +444,11 @@ class Session:
             source=self.source, fingerprint=self.fingerprint, notes=notes,
         )
         if command and command[0] == "tp2":
-            limitations = ["C1 only", "greedy only", "non-streaming only"]
-            limitations.append("memory cache only; snapshots stay on each host")
-            limitations.append("no published benchmark comparison")
             artifact["topology"] = {
                 "id": "tp2",
                 "worldSize": 2,
-                "requestTransport": "openai-chat-completions-json",
-                "limitations": limitations,
+                "requestTransport": "openai-chat-completions-" + (
+                    "sse" if self.stream_requests else "json"),
                 "rankFingerprints": self.rank_fingerprints(),
             }
         return artifact
@@ -642,7 +612,7 @@ def run_loading(session: Session, table: TableSpec) -> None:
                                         "`echo 3 > /proc/sys/vm/drop_caches`"),
                                        f"readiness = HTTP 200 on {cfg.data['gufo' if session.target == 'gufo' else 'reference']['readiness']}"])
     artifact["rows"] = rows
-    session.store(artifact_path(cfg, table, session.target), artifact)
+    session.store(artifact_path(cfg, table, session.artifact_target), artifact)
 
 
 def run_single(session: Session, table: TableSpec, display_table: TableSpec | None = None) -> None:
@@ -750,7 +720,7 @@ def run_single(session: Session, table: TableSpec, display_table: TableSpec | No
     ])
     artifact["rows"] = rows
     if rows:
-        session.store(artifact_path(cfg, table, session.target), artifact)
+        session.store(artifact_path(cfg, table, session.artifact_target), artifact)
     if failures:
         raise SystemExit(f"{table.id}: {len(failures)} depth(s) failed; see the artifact notes")
 
@@ -857,9 +827,6 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
     session.check_tp2_scope(table, users=max(keys))
     matched_prompt = spec.get("prompt_tokens")
     prefill_first = bool(spec.get("prefill_first", False))
-    if session.tp2_enabled:
-        # The current TP2 path has no distributed prefix snapshot/replay.
-        prefill_first = False
     if matched_prompt:
         task = spec["workload"]
         case_ids = {f"synthetic_{task}_pp{matched_prompt}"}
@@ -877,9 +844,10 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
         modes = [m for m in modes if m in session.modes]
     for mode in modes:
         # Reference AR keeps the unsuffixed name; its speculative run is suffixed like Gufo's.
-        path = artifact_path(cfg, table, session.target, None if (session.target != "gufo" and mode == "ar") else mode)
+        path = artifact_path(cfg, table, session.artifact_target, None if (session.target != "gufo" and mode == "ar") else mode)
         reference = None
-        ar_path = artifact_path(cfg, table, "gufo", "ar")
+        ar_path = artifact_path(
+            cfg, table, session.artifact_target if session.target == "gufo" else "gufo", "ar")
         if path != ar_path and ar_path.exists():
             reference = load_reference_report(ar_path)
         if mode != "ar":
@@ -1074,7 +1042,7 @@ def run_memory(session: Session, table: TableSpec) -> None:
                                        "during the request; idle_gib is the same counter before the server started",
                                        f"server mode: {mode}"])
     artifact["rows"] = rows
-    session.store(artifact_path(cfg, table, session.target), artifact)
+    session.store(artifact_path(cfg, table, session.artifact_target), artifact)
 
 
 def _png(size: int, seed: int) -> bytes:
@@ -1136,7 +1104,7 @@ def run_image_encoder(session: Session, table: TableSpec) -> None:
         f"{warmup} warm-up then {repetitions} timed samples per size; includes the projector encode and the "
         "prefill of the image and text tokens on both servers"])
     artifact["rows"] = rows
-    session.store(artifact_path(cfg, table, session.target), artifact)
+    session.store(artifact_path(cfg, table, session.artifact_target), artifact)
 
 
 RUNNERS = {

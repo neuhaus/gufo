@@ -689,22 +689,28 @@ check(remote_tp2[remote_tp2.index("--tp-bootstrap-host") + 1] == "10.0.0.1",
 check("/workspace/gufo/models/target.gguf" in local_tp2
       and "/workspace/gufo/models/mtp.gguf" in local_tp2,
       "TP2 translates host model paths into the mounted workspace")
-check(local_tp2[local_tp2.index("--max-pending") + 1] == "1"
+check("--max-pending" not in local_tp2
       and local_tp2.count("--max-pending-per-client") == 1
-      and local_tp2[local_tp2.index("--max-pending-per-client") + 1] == "1",
-      "TP2 overrides the published C8 scheduling arguments")
+      and local_tp2[local_tp2.index("--max-pending-per-client") + 1] == "8",
+      "TP2 serves with the published scheduling arguments")
+check("/dev/infiniband" in local_tp2 and "/dev/infiniband/uverbs0" not in local_tp2,
+      "TP2 containers receive every RDMA device node")
+check(tp2_session.artifact_target == "gufo-tp2" and tp2_session.stream_requests,
+      "TP2 results stream and sit beside the one-host artifacts")
 check(public_command(local_tp2).count("<redacted>") == 1,
       "TP2 token is redacted from the combined command")
 check("--tp-cache-reuse" not in local_tp2,
       "TP2 caches by default, without a cache flag")
 tp2_session.check_tp2_scope(tp2_config.table("single-ar"), depths=[4096])
 check(True, "TP2 accepts cached depths")
+tp2_session.check_tp2_scope(tp2_config.table("multi-ar"), users=8)
+check(True, "TP2 accepts concurrent users")
 try:
-    tp2_session.check_tp2_scope(tp2_config.table("multi-ar"), users=2)
+    tp2_session.check_tp2_scope(tp2_config.table("loading"))
 except RuntimeError as failure:
-    check("C1" in str(failure), "TP2 C>1 remains explicitly unqualified")
+    check("loading" in str(failure), "TP2 excludes one-host loading tables")
 else:
-    raise AssertionError("TP2 C>1 scope must remain rejected")
+    raise AssertionError("TP2 loading scope must remain rejected")
 check(
     Tp2Server(Server([], "/ready", Path("/unused")), ["podman", "run", "a b"],
              remote_host="box2", remote_log_path=Path("/unused-rank1"))._ssh_command(

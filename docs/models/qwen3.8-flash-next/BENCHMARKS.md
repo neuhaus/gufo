@@ -6,6 +6,9 @@ Gufo single-user tg: September 27, 2026 (`f797b5b`); pp and other results:
 September 22–23. Concurrency uses the unchanged short-context attention path.
 llama.cpp uses `b11069` for AR and `6fcaa16f` for MTP.
 
+Gufo TP2 runs the same tables on two such hosts that split every layer and
+exchange partial sums over InfiniBand RDMA ([TP2](TP2.md)).
+
 Positive gain favors Gufo.
 [Quality and measurement details](QUALITY.md#benchmark-method) · [Model identities](artifacts/model-identities.json)
 
@@ -29,6 +32,21 @@ Context capacities differ between engines; see the measurement details.
 
 ![Single user, autoregressive](artifacts/charts/single-ar.svg)
 
+**Two hosts (TP2 over RDMA).** The same workload on two hosts; gain is TP2 over one host.
+
+<!-- bench:single-ar-tp2 -->
+| Flash-Next Q4 AR<br>Depth (tokens) | Gufo pp (tok/s) | Gufo TP2 pp (tok/s) | Gain | Gufo tg (tok/s) | Gufo TP2 tg (tok/s) | Gain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1628.52 | TODO | TODO | 25.87 | TODO | TODO |
+| 4,096 | 1523.39 | TODO | TODO | 25.84 | TODO | TODO |
+| 8,192 | 1499.13 | TODO | TODO | 25.84 | TODO | TODO |
+| 12,288 | 1477.98 | TODO | TODO | 25.80 | TODO | TODO |
+| 16,384 | 1457.16 | TODO | TODO | 25.79 | TODO | TODO |
+| 32,768 | 1421.93 | TODO | TODO | 25.69 | TODO | TODO |
+| 65,536 | 1304.01 | TODO | TODO | 25.41 | TODO | TODO |
+| 131,072 | 1292.02 | TODO | TODO | 22.89 | TODO | TODO |
+<!-- /bench -->
+
 ## Single user, MTP
 
 pp is the highest measured rate per engine and depth across mixed/repetitive
@@ -49,6 +67,21 @@ text, including Gufo predictor catch-up.
 
 ![Single user, MTP](artifacts/charts/single-mtp.svg)
 
+**Two hosts (TP2 over RDMA).** The same workloads on two hosts; gain is TP2 over one host.
+
+<!-- bench:single-mtp-tp2 -->
+| Flash-Next Q4 MTP<br>Depth (tokens) | Gufo pp (tok/s) | Gufo TP2 pp (tok/s) | Gain pp | Gufo tg mixed (tok/s) | Gufo TP2 tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | Gufo TP2 tg repetitive (tok/s) | Gain repetitive |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1602.82 | TODO | TODO | 32.20 | TODO | TODO | 59.30 | TODO | TODO |
+| 4,096 | 1506.32 | TODO | TODO | 32.50 | TODO | TODO | 46.74 | TODO | TODO |
+| 8,192 | 1492.95 | TODO | TODO | 36.08 | TODO | TODO | 50.26 | TODO | TODO |
+| 12,288 | 1488.03 | TODO | TODO | 34.26 | TODO | TODO | 44.81 | TODO | TODO |
+| 16,384 | 1471.81 | TODO | TODO | 35.41 | TODO | TODO | 53.53 | TODO | TODO |
+| 32,768 | 1449.56 | TODO | TODO | 31.03 | TODO | TODO | 44.96 | TODO | TODO |
+| 65,536 | 1316.70 | TODO | TODO | 32.63 | TODO | TODO | 46.12 | TODO | TODO |
+| 131,072 | 1335.91 | TODO | TODO | 34.20 | TODO | TODO | 45.01 | TODO | TODO |
+<!-- /bench -->
+
 ## Multiple users, autoregressive
 
 Same pp2048 prose prompt as single-user d0, tg128, context 4096 per user.
@@ -67,6 +100,18 @@ llama.cpp re-evaluates its four-token checkpoint tail.
 
 ![Multiple users, autoregressive](artifacts/charts/multi-ar.svg)
 
+**Two hosts (TP2 over RDMA).** The same users on two hosts; gain is TP2 over one host.
+
+<!-- bench:multi-ar-tp2 -->
+| Flash-Next Q4 AR<br>Users | Gufo AR (tok/s) | Gufo TP2 AR (tok/s) | Gain |
+| ---: | ---: | ---: | ---: |
+| 1 | 25.85 | TODO | TODO |
+| 2 | 45.70 | TODO | TODO |
+| 4 | 76.29 | TODO | TODO |
+| 6 | 95.66 | TODO | TODO |
+| 8 | 108.67 | TODO | TODO |
+<!-- /bench -->
+
 ## Multiple users, MTP
 
 Same pp2048 mixed/repetitive prompts as single-user d0, tg128, context 4096
@@ -84,6 +129,37 @@ request decode rates. C1 cross-checks the single-user table.
 <!-- /bench -->
 
 ![Multiple users, MTP](artifacts/charts/multi-mtp.svg)
+
+**Two hosts (TP2 over RDMA).** The same users on two hosts; gain is TP2 over one host.
+
+<!-- bench:multi-mtp-tp2 -->
+| Flash-Next Q4 MTP<br>Users | Gufo mixed (tok/s) | Gufo TP2 mixed (tok/s) | Gain | Gufo repetitive (tok/s) | Gufo TP2 repetitive (tok/s) | Gain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 32.09 | TODO | TODO | 59.20 | TODO | TODO |
+| 2 | 51.68 | TODO | TODO | 93.16 | TODO | TODO |
+| 4 | 75.92 | TODO | TODO | 127.91 | TODO | TODO |
+| 6 | 89.18 | TODO | TODO | 142.14 | TODO | TODO |
+| 8 | 106.47 | TODO | TODO | 157.22 | TODO | TODO |
+<!-- /bench -->
+
+## Two hosts, Q8 (TP2 over RDMA)
+
+The full Q8_0 target does not fit one host. Single user on two hosts,
+pp2048/tg128 by depth as above; prefill on the left axis, generation on the
+right.
+
+<!-- bench:tp2-q8 -->
+| Flash-Next Q8 TP2<br>Depth (tokens) | pp (tok/s) | tg AR (tok/s) | tg MTP mixed (tok/s) | tg MTP repetitive (tok/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | TODO | TODO | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO |
+| 32,768 | TODO | TODO | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO |
+<!-- /bench -->
 
 ## Loading time
 

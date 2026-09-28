@@ -43,8 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--mode", action="append", default=[], help="restrict to a mode: ar or the speculative mode")
     run.add_argument("--context", type=int, default=None,
                      help="override the single-user tables' context capacity (e.g. to fit a reference server in RAM)")
+    run.add_argument("--artifact-target", default=None,
+                     help="store results under this target name, e.g. gufo-onehost for a "
+                          "one-host run of the build a TP2 run measures")
     run.add_argument("--request-transport", choices=("sse", "json"), default=None,
-                     help="override the HTTP request transport (TP2 requires json)")
+                     help="override the HTTP request transport")
 
     render = sub.add_parser("render", help="rewrite marked tables in BENCHMARKS.md from artifacts")
     render.add_argument("--table", action="append", default=[])
@@ -113,10 +116,6 @@ def cmd_run(config: BenchConfig, args: argparse.Namespace) -> int:
     from . import llm
 
     root = config.root
-    if args.target == "gufo" and config.data.get("gufo", {}).get("tp2") and args.artifacts_dir is None:
-        raise SystemExit(
-            "TP2 experiments require --artifacts-dir; published artifacts are reserved for the single-host topology"
-        )
     gufo_binary = args.gufo if args.gufo.is_absolute() else (root / args.gufo)
     if not gufo_binary.exists():
         raise SystemExit(f"Gufo binary not found: {gufo_binary} (run `nix build`)")
@@ -133,6 +132,7 @@ def cmd_run(config: BenchConfig, args: argparse.Namespace) -> int:
         depths=[int(d) for d in args.depths.split(",")] if args.depths else None,
         modes=args.mode or None, context=args.context,
         request_transport=args.request_transport,
+        artifact_target=args.artifact_target,
     )
     session.fingerprint = session.runtime_fingerprint()
     wanted = _table_ids(args.table)

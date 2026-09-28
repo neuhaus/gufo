@@ -11,7 +11,8 @@ from .config import BenchConfig, TableSpec
 from .render import MARKER_RE, _number, layout_for, model_label, parse_table
 
 # Categorical slots from the validated default palette: Gufo, reference, Gufo speculative.
-COLORS = {"gufo": "#2a78d6", "reference": "#eb6834", "spec": "#1baf7a", "ref_spec": "#eda100"}
+COLORS = {"gufo": "#2a78d6", "reference": "#eb6834", "spec": "#1baf7a", "ref_spec": "#eda100",
+          "tp2": "#8a4fc8"}
 SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
@@ -87,10 +88,18 @@ def _bars(ax: Any, labels: list[str], series: list[tuple[str, list[float], str]]
     _finish_axes(ax, labels, series, ylabel)
 
 
-def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, str]], path: Path) -> bool:
-    """Write one SVG for a rendered table; return False when there is nothing to draw."""
+def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, str]], path: Path,
+              tp2_rows: dict[str, dict[str, str]] | None = None) -> bool:
+    """Write one SVG for a rendered table; return False when there is nothing to draw.
+
+    `tp2_rows`, the table's Gufo TP2 comparison, adds a two-host series."""
     layout = layout_for(config, table)
     labels = layout.rows
+
+    def tp2(header: str) -> list[tuple[str, list[float], str]]:
+        values = _series(tp2_rows or {}, labels, f"Gufo TP2 {header}")
+        return [("Gufo TP2", values, COLORS["tp2"])] if _has_data(values) else []
+
     ref = config.reference_name
     spec_label = config.speculative["label"]
     kind = table.kind
@@ -111,13 +120,14 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
         if not any(_has_data(g, r) for g, r in series):
             return False
         fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 3.2), squeeze=False)
-        for ax, (panel, _, unit), (g, r) in zip(axes[0], panels, series):
+        for ax, (panel, metric, unit), (g, r) in zip(axes[0], panels, series):
             _lines(ax, labels, [("Gufo", g, COLORS["spec"]),
-                               (ref if matched_mode else f"{ref} AR", r, COLORS["ref_spec"])],
+                               (ref if matched_mode else f"{ref} AR", r, COLORS["ref_spec"]),
+                               *tp2(metric)],
                    unit, _depth_ticks(labels))
             ax.set_title(panel)
             ax.set_xlabel("context depth (tokens)")
-            ax.legend(loc="lower left")
+            ax.legend(loc="best" if tp2_rows else "lower left")
             if not _has_data(g, r):
                 ax.text(0.5, 0.5, "TODO", transform=ax.transAxes, ha="center")
     elif kind == "single":
@@ -131,11 +141,13 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
         g_color, r_color = (COLORS["spec"], COLORS["ref_spec"]) if table.speculative else (COLORS["gufo"], COLORS["reference"])
         fig, (a1, a2) = plt.subplots(1, 2, figsize=(8, 3.2))
         ticks = _depth_ticks(labels)
-        _lines(a1, labels, [("Gufo", gp, g_color), (reference_name, rp, r_color)], "prefill tok/s", ticks)
-        _lines(a2, labels, [("Gufo", gt, g_color), (reference_name, rt, r_color)], "generation tok/s", ticks)
+        _lines(a1, labels, [("Gufo", gp, g_color), (reference_name, rp, r_color), *tp2("pp")],
+               "prefill tok/s", ticks)
+        _lines(a2, labels, [("Gufo", gt, g_color), (reference_name, rt, r_color), *tp2("tg")],
+               "generation tok/s", ticks)
         a1.set_xlabel("context depth (tokens)")
         a2.set_xlabel("context depth (tokens)")
-        a1.legend(loc="lower left")
+        a1.legend(loc="best" if tp2_rows else "lower left")
     elif kind == "multi" and table.workload_tables():
         workloads = table.workload_tables()
         if not any(_has_data(_series(rows, labels, f"Gufo {w.spec['label']}")) for w in workloads):
@@ -144,7 +156,7 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
         for ax, workload in zip(axes[0], workloads):
             label = workload.spec["label"]
             g, r = (_series(rows, labels, f"{engine} {label}") for engine in ("Gufo", ref))
-            _bars(ax, labels, [("Gufo", g, COLORS["spec"]), (ref, r, COLORS["ref_spec"])],
+            _bars(ax, labels, [("Gufo", g, COLORS["spec"]), (ref, r, COLORS["ref_spec"]), *tp2(label)],
                   "sum of request decode tok/s")
             ax.set_title(label.capitalize())
             ax.set_xlabel("concurrent users")
@@ -159,7 +171,8 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
                 return False
             colors = ("gufo", "reference") if modes[0] == "ar" else ("spec", "ref_spec")
             series = [(layout.columns[1].header, g, COLORS[colors[0]]),
-                      (layout.columns[2].header, r, COLORS[colors[1]])]
+                      (layout.columns[2].header, r, COLORS[colors[1]]),
+                      *(("Gufo TP2 AR", v, c) for _, v, c in tp2("AR" if modes[0] == "ar" else spec_label))]
         else:
             ga, ra, gs = (_series(rows, labels, h) for h in ("Gufo AR", f"{ref} AR", f"Gufo {spec_label}"))
             if not _has_data(ga, gs):
@@ -195,23 +208,33 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
 
 def render_charts(config: BenchConfig, document: str, only: set[str] | None = None) -> tuple[str, list[str]]:
     """Draw charts for rendered tables and place an image line after each table."""
+    from .tp2 import Q8_LABEL, chart_q8
+
     known = {t.id: t for t in config.tables()}
     written: list[str] = []
     chart_dir = config.model_dir / CHART_DIR
+    tables = {m.group("id"): parse_table(m.group("body")) for m in MARKER_RE.finditer(document)}
 
     def replace(match: re.Match[str]) -> str:
         table_id = match.group("id")
         block = match.group(0)
+        if table_id == "tp2-q8" and (not only or table_id in only):
+            path = chart_dir / f"{table_id}.svg"
+            if chart_q8(config, tables[table_id], path):
+                written.append(table_id)
+                return block + f"\n\n![{Q8_LABEL}]({CHART_DIR}/{table_id}.svg)"
+            return block
         if table_id not in known or (only and table_id not in only):
             return block
         path = chart_dir / f"{table_id}.svg"
-        if chart_for(config, known[table_id], parse_table(match.group("body")), path):
+        if chart_for(config, known[table_id], parse_table(match.group("body")), path,
+                     tables.get(f"{table_id}-tp2")):
             written.append(table_id)
             return block + f"\n\n![{known[table_id].spec.get('title', table_id)}]({CHART_DIR}/{table_id}.svg)"
         return block
 
     # Replace only selected charts; untouched table links must survive a partial render.
-    for table_id in known:
+    for table_id in [*known, "tp2-q8"]:
         if not only or table_id in only:
             document = re.sub(IMAGE_RE.format(id=re.escape(table_id)), "", document)
     return MARKER_RE.sub(replace, document), written
