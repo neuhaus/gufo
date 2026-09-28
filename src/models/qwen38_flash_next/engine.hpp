@@ -126,6 +126,10 @@ public:
   /// prefix with the current tokens, reprocesses the rest.
   [[nodiscard]] bool Sync(std::span<const std::int32_t> prompt,
                           std::string* error_msg = nullptr);
+  /// The prompt tokens that will follow the next Sync, if known. Their
+  /// per-layer embedding rows are read from disk while the last chunk of that
+  /// Sync computes; results do not depend on it.
+  void SetPrefillLookahead(std::span<const std::int32_t> tokens);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
   struct DecodeResult {
@@ -245,6 +249,7 @@ private:
   std::shared_ptr<Model> model_;
   std::unique_ptr<rocm::Session> session_;
   std::vector<std::int32_t> tokens_;
+  std::vector<std::int32_t> lookahead_;
   std::vector<float> logits_;
   std::int32_t draft_token_{0};
   std::vector<float> verify_logits_;

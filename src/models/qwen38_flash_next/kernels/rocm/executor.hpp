@@ -176,6 +176,11 @@ public:
                              std::span<const std::int32_t> tokens,
                              std::uint32_t n_logits, float* logits,
                              ForwardMode mode, std::string* error_msg) const;
+  /// The tokens the prefill Forward after the next one will take. The next
+  /// Forward reads their n-gram rows once its own are in, so the following
+  /// chunk finds them ready instead of waiting for the disk. Consumed by the
+  /// next Forward; a following chunk that differs just reads its own rows.
+  void SetPrefillLookahead(std::span<const std::int32_t> tokens) const;
 
   struct BatchItem {
     Session* session;
@@ -353,6 +358,10 @@ private:
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
                 bool speculative, std::string* error_msg) const;
   bool WaitPle(std::string* error_msg) const;
+  /// Starts the requested lookahead read once the table is free.
+  void StartLookahead() const;
+  /// Waits for an outstanding lookahead read; only one read may be in flight.
+  void SettleLookahead() const;
   bool Ple(const DeviceLayer& l, Session& s, std::uint32_t n_tokens, float* res,
            bool speculative, std::string* error_msg,
            bool embeddings_ready = false) const;
@@ -520,6 +529,16 @@ private:
   float* host_emb_{nullptr};
   mutable std::vector<std::uint32_t> host_rows_;
   mutable bool ple_pending_{false};
+  /// host_emb_ already holds the batch's rows (a lookahead hit).
+  mutable bool ple_ready_{false};
+  // The next prefill chunk's rows, read while the current chunk computes.
+  float* lookahead_emb_{nullptr};
+  mutable std::vector<std::uint32_t> lookahead_rows_;
+  mutable std::vector<std::int32_t> lookahead_tokens_;
+  mutable std::size_t lookahead_row_count_{0};
+  mutable bool lookahead_requested_{false};
+  mutable bool lookahead_pending_{false};
+  mutable bool lookahead_ready_{false};
   // Pinned host staging the launched (or captured) work reads and writes.
   Session::Control* control_host_{nullptr};
   std::int32_t* tokens_host_{nullptr};

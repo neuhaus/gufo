@@ -2535,6 +2535,10 @@ public:
         {max_input_tokens, prompt.size() - offset, model_->PrefillCapacity()});
     const std::size_t next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
+    // The next step's tokens, so their n-gram rows load during this one.
+    qfn.session().SetPrefillLookahead(QwenFlashNextEngineTokens(prompt.subspan(
+        next_position, std::min<std::size_t>(prompt.size() - next_position,
+                                             model_->PrefillCapacity()))));
     std::string error;
     if (!qfn.session().Sync(prefix, &error)) {
       qfn.set_position(0);

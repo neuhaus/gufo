@@ -754,6 +754,9 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     }
   }
   if (c.ple_layer >= 0) {
+    // A lookahead read occupies the table; its rows stay for the prefill.
+    SettleLookahead();
+    ple_ready_ = false;
     if (ngram_ == nullptr ||
         !ngram_->StartRead(std::span(host_rows_).first(rows * c.ple_heads),
                            std::span(host_emb_, static_cast<std::size_t>(rows) *

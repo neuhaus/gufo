@@ -539,6 +539,9 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
 bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    bool prefill) {
   rocm::Executor& exec = *model_->executor_;
+  // The caller's lookahead follows these tokens; it is used once.
+  const std::vector<std::int32_t> lookahead = std::move(lookahead_);
+  lookahead_.clear();
   for (std::size_t off = 0; off < tokens.size(); off += exec.max_batch()) {
     const std::size_t n =
         std::min<std::size_t>(exec.max_batch(), tokens.size() - off);
@@ -549,6 +552,14 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     }
     const auto mode = prefill ? rocm::Executor::ForwardMode::kPrefill
                               : rocm::Executor::ForwardMode::kDecode;
+    if (prefill) {
+      const std::size_t next = off + n;
+      exec.SetPrefillLookahead(
+          next < tokens.size() ? tokens.subspan(next, std::min<std::size_t>(
+                                                          exec.max_batch(),
+                                                          tokens.size() - next))
+                               : std::span<const std::int32_t>(lookahead));
+    }
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg)) {
       return false;
     }
@@ -557,6 +568,10 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
   }
   return true;
+}
+
+void Session::SetPrefillLookahead(std::span<const std::int32_t> tokens) {
+  lookahead_.assign(tokens.begin(), tokens.end());
 }
 
 bool Session::Sync(std::span<const std::int32_t> prompt,
