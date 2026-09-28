@@ -32,12 +32,13 @@ TimeoutStopSec=5min
 EnvironmentFile=%h/.config/gufo/head.env
 EnvironmentFile=%h/.config/gufo/%i.env
 # The worker connects to this host's address on the RDMA link: GUFO_TP_ADDR,
-# or the IPv4 address of GUFO_TP_NETDEV, or of the only RDMA device's netdev.
+# or the IPv4 address of GUFO_TP_NETDEV, or of the netdev of the only active
+# RDMA port 1 (the port the verbs communicator uses).
 ExecStartPre=/bin/sh -c '\
   addr=$GUFO_TP_ADDR; dev=$GUFO_TP_NETDEV; \
   if [ -z "$addr" ] && [ -z "$dev" ]; then \
-    dev=$(rdma link show 2>/dev/null | sed -n "s/.* netdev \\([^ ]*\\).*/\\1/p" | sort -u); \
-    [ -n "$dev" ] || dev=$(ls /sys/class/infiniband/*/device/net 2>/dev/null | grep -v ":" | grep . | sort -u); \
+    dev=$(rdma link show 2>/dev/null | grep "/1 " | grep "state ACTIVE" | sed -n "s/.* netdev \\([^ ]*\\).*/\\1/p" | sort -u); \
+    [ -n "$dev" ] || dev=$(for n in /sys/class/net/*; do [ -d "$n/device/infiniband" ] && [ "$(cat "$n/dev_port" 2>/dev/null)" = 0 ] && basename "$n"; done); \
     [ "$(echo "$dev" | wc -w)" -eq 1 ] || { echo "RDMA netdev is ambiguous or missing (\"$dev\"): set GUFO_TP_NETDEV or GUFO_TP_ADDR" >&2; exit 1; }; \
   fi; \
   [ -n "$addr" ] || addr=$(ip -o -4 addr show dev "$dev" | awk "{print \\$4}" | cut -d/ -f1 | head -n 1); \
