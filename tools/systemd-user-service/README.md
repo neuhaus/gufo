@@ -38,6 +38,8 @@ If another local user unit claims the GPU, add a drop-in
 - gufo checkout at `~/git/gufo` with a built `build/gpu-tp2/gufo` (the
   container mounts it read-only)
 - ROCm runtime image in podman (`GUFO_IMAGE`)
+- the RDMA device nodes under `/dev/infiniband`; the units pass the whole
+  directory, so gufo can pick any device with `--tp-rdma-device`
 - models under `/opt/models` at the same paths (mounted read-only)
 - identical control token at `~/.config/gufo.token`
 - on the head host: passwordless ssh to the worker host, and `rdma` and `ip`
