@@ -1,0 +1,18 @@
+# ROCm 7.2.3 build and runtime environment for gufo with TP2 over RDMA.
+# The units run the gufo binary built from the checkout inside this image:
+#
+#   podman build -t localhost/gufo-tp2-dev:7.2.3 tools/systemd-user-service
+#
+# ibverbs-providers supplies the user-space RDMA drivers (mlx4/mlx5 for
+# InfiniBand and RoCE, irdma for Intel E810, and others).
+FROM docker.io/rocm/dev-ubuntu-24.04:7.2.3
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config python3 python3-numpy \
+    libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev ffmpeg \
+    libibverbs-dev ibverbs-providers libnl-3-dev libdw1 \
+    hipblas-dev hipblaslt-dev rocblas-dev hipcub-dev rocprim-dev rocwmma-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV ROCM_PATH=/opt/rocm
+WORKDIR /workspace/gufo
