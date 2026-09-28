@@ -480,7 +480,9 @@ void PrintServeHelp(std::string_view program_name,
     std::uint32_t tp_rank = 0;
     std::uint32_t tp_world_size = 1;
     std::uint32_t tp_device = 0;
-    std::uint32_t tp_gid_index = 0;
+    std::string tp_rdma_device;
+    std::uint32_t tp_rdma_port = 1;
+    std::int64_t tp_gid_index = -1;
     std::uint32_t tp_bootstrap_port = 18515;
     std::uint32_t tp_control_port = 18516;
     std::string tp_bootstrap_host;
@@ -522,8 +524,15 @@ void PrintServeHelp(std::string_view program_name,
                      &tp_control_token);
     parser.AddOption("", "--tp-device", "N", "HIP device index", "TP2",
                      &tp_device);
-    parser.AddOption("", "--tp-gid-index", "N", "InfiniBand GID index", "TP2",
-                     &tp_gid_index);
+    parser.AddOption("", "--tp-rdma-device", "NAME",
+                     "RDMA device (default: the host's only one)", "TP2",
+                     &tp_rdma_device);
+    parser.AddOption("", "--tp-rdma-port", "N", "RDMA device port (default: 1)",
+                     "TP2", &tp_rdma_port);
+    parser.AddOption("", "--tp-gid-index", "N",
+                     "RDMA GID index (default: 0 on InfiniBand, the port's "
+                     "RoCE v2 GID on RoCE)",
+                     "TP2", &tp_gid_index);
 
     // Sampling Defaults
     parser.AddOption(
@@ -962,7 +971,9 @@ int RunServe(std::span<const char* const> args) {
     std::uint32_t tp_rank = 0;
     std::uint32_t tp_world_size = 1;
     std::uint32_t tp_device = 0;
-    std::uint32_t tp_gid_index = 0;
+    std::string tp_rdma_device;
+    std::uint32_t tp_rdma_port = 1;
+    std::int64_t tp_gid_index = -1;
     std::uint32_t tp_bootstrap_port = 18515;
     std::uint32_t tp_control_port = 18516;
     std::string tp_bootstrap_host;
@@ -1004,7 +1015,14 @@ int RunServe(std::span<const char* const> args) {
                          &tp_control_token);
     llm_parser.AddOption("", "--tp-device", "N", "HIP device index", "TP2",
                          &tp_device);
-    llm_parser.AddOption("", "--tp-gid-index", "N", "InfiniBand GID index",
+    llm_parser.AddOption("", "--tp-rdma-device", "NAME",
+                         "RDMA device (default: the host's only one)", "TP2",
+                         &tp_rdma_device);
+    llm_parser.AddOption("", "--tp-rdma-port", "N",
+                         "RDMA device port (default: 1)", "TP2", &tp_rdma_port);
+    llm_parser.AddOption("", "--tp-gid-index", "N",
+                         "RDMA GID index (default: 0 on InfiniBand, the "
+                         "port's RoCE v2 GID on RoCE)",
                          "TP2", &tp_gid_index);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
@@ -1204,6 +1222,9 @@ int RunServe(std::span<const char* const> args) {
         tp_bootstrap_port == tp_control_port ||
         tp_device >
             static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+        tp_rdma_port == 0 ||
+        tp_rdma_port > std::numeric_limits<std::uint8_t>::max() ||
+        tp_gid_index < -1 ||
         tp_gid_index > std::numeric_limits<std::uint8_t>::max()) {
       std::cerr << "Error: invalid TP2 network/device options\n";
       return 2;
@@ -1241,7 +1262,12 @@ int RunServe(std::span<const char* const> args) {
           .bootstrap_host = tp_bootstrap_host,
           .bootstrap_port = static_cast<std::uint16_t>(tp_bootstrap_port),
           .device_index = tp_device,
-          .gid_index = tp_gid_index,
+          .rdma_device = tp_rdma_device,
+          .rdma_port = tp_rdma_port,
+          .gid_index = tp_gid_index < 0
+                           ? std::nullopt
+                           : std::optional<std::uint32_t>(
+                                 static_cast<std::uint32_t>(tp_gid_index)),
       };
       std::string tp_error;
       tp_communicator =
@@ -1252,6 +1278,8 @@ int RunServe(std::span<const char* const> args) {
                   << '\n';
         return 1;
       }
+      server::Logger::Info("tp",
+                           "event=rdma_ready " + tp_communicator->Describe());
       tp_control =
           tp_rank == 0
               ? server::TpControlChannel::Listen(

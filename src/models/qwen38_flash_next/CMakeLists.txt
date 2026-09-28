@@ -7,6 +7,7 @@ add_library(gufo_qwen38_flash_next STATIC
   config.cpp
   ngram.cpp
   weights.cpp
+  distributed/rdma_gid.cpp
   distributed/tp_partition.cpp)
 
 target_include_directories(gufo_qwen38_flash_next PUBLIC ${PROJECT_SOURCE_DIR})

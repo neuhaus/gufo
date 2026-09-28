@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next TP=2
 
-Two-host tensor-parallel serving over InfiniBand RDMA. It serves Q4 and full
+Two-host tensor-parallel serving over RDMA, native InfiniBand or RoCE v2. It serves Q4 and full
 Q8, AR and MTP, images, concurrent requests and history reuse. It needs
 libibverbs and the build option `GUFO_ENABLE_TP2_RDMA` (off by default). Its
 measurements are in [EXPERIMENTS.md](EXPERIMENTS.md#tp2), not in the published
@@ -36,6 +36,13 @@ build/gpu-tp2/gufo serve llm --model "$MODEL" --speculative mtp --mtp-model "$MT
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
   --tp-control-token SHARED_TOKEN --sessions 4
 ```
+
+The link uses port 1 of the host's only RDMA device; `--tp-rdma-device NAME`
+and `--tp-rdma-port N` choose another. On InfiniBand it uses GID 0; on RoCE
+(an Ethernet link layer) the port's RoCE v2 GID, preferring its IPv4 address's
+GID. `--tp-gid-index` overrides that, and is needed when the port has several
+candidates. Both ranks must use the same link layer. Each rank logs its choice as
+`event=rdma_ready`. RoCE v2 has run no qualification yet.
 
 Sampling, streaming, stop sequences, tool calls, images (`--mmproj` on both
 ranks), cancellation, `--request-timeout-ms`, history reuse and the disk cache

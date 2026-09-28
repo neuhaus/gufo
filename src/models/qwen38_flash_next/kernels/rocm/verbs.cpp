@@ -27,6 +27,9 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
+
+#include "src/models/qwen38_flash_next/distributed/rdma_gid.hpp"
 
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
@@ -69,7 +72,6 @@ constexpr std::size_t kReadyOffset = 0;
 constexpr std::size_t kArrivedOffset = 64;
 constexpr std::size_t kTimedOutOffset = 128;
 constexpr std::size_t kFlagBytes = 4096;
-constexpr std::uint32_t kPort = 1;
 constexpr auto kCollectiveTimeout = std::chrono::seconds(30);
 constexpr auto kReceiveSpinWindow = std::chrono::microseconds(500);
 // An exchange waits for a layer of GPU work, or a peer that is a layer behind:
@@ -355,7 +357,7 @@ struct Wire {
   std::uint8_t mtu{0};
   std::uint8_t gid_index{0};
   std::uint8_t link_layer{0};
-  std::uint16_t port_num{kPort};
+  std::uint16_t port_num{1};
   ibv_gid sgid{};
   std::uint64_t recv_address{0};
   std::uint32_t recv_rkey{0};
@@ -381,8 +383,10 @@ public:
 
   [[nodiscard]] bool Initialize(std::string* error) {
     if (config_.world_size != 2 || config_.rank > 1 ||
-        config_.bootstrap_port == 0 ||
-        config_.gid_index > std::numeric_limits<std::uint8_t>::max() ||
+        config_.bootstrap_port == 0 || config_.rdma_port == 0 ||
+        config_.rdma_port > std::numeric_limits<std::uint8_t>::max() ||
+        config_.gid_index.value_or(0) >
+            std::numeric_limits<std::uint8_t>::max() ||
         config_.device_index >
             static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
       SetError(error,
@@ -393,19 +397,7 @@ public:
       SetError(error, "hipSetDevice for verbs communicator failed");
       return false;
     }
-    int device_count = 0;
-    ibv_device** devices = ibv_get_device_list(&device_count);
-    if (devices == nullptr || device_count <= config_.device_index) {
-      if (devices != nullptr) {
-        ibv_free_device_list(devices);
-      }
-      SetError(error, "no usable InfiniBand device");
-      return false;
-    }
-    context_ = ibv_open_device(devices[config_.device_index]);
-    ibv_free_device_list(devices);
-    if (context_ == nullptr) {
-      SetError(error, "ibv_open_device failed");
+    if (!OpenDevice(error)) {
       return false;
     }
     pd_ = ibv_alloc_pd(context_);
@@ -421,14 +413,19 @@ public:
     }
 
     ibv_port_attr port{};
-    if (ibv_query_port(context_, kPort, &port) != 0 ||
-        port.state != IBV_PORT_ACTIVE ||
-        port.link_layer != IBV_LINK_LAYER_INFINIBAND) {
-      SetError(error, "native InfiniBand port 1 is not active");
+    if (ibv_query_port(context_, Port(), &port) != 0 ||
+        port.state != IBV_PORT_ACTIVE) {
+      SetError(error, "RDMA port " + std::to_string(config_.rdma_port) +
+                          " of " + device_name_ + " is not active");
       return false;
     }
-    if (ibv_query_gid(context_, kPort, config_.gid_index, &local_sgid_) != 0) {
-      SetError(error, "ibv_query_gid failed");
+    if (port.link_layer != IBV_LINK_LAYER_INFINIBAND &&
+        port.link_layer != IBV_LINK_LAYER_ETHERNET) {
+      SetError(error, "RDMA port link layer is neither InfiniBand nor RoCE");
+      return false;
+    }
+    link_layer_ = port.link_layer;
+    if (!SelectGid(port, error)) {
       return false;
     }
 
@@ -498,7 +495,7 @@ public:
     struct ibv_qp_attr attr{};
     attr.qp_state = IBV_QPS_INIT;
     attr.pkey_index = 0;
-    attr.port_num = kPort;
+    attr.port_num = Port();
     attr.qp_access_flags = kMemoryAccessFlags;
     if (ibv_modify_qp(qp_, &attr,
                       IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
@@ -513,7 +510,8 @@ public:
     local.qp_num = qp_->qp_num;
     local.lid = port.lid;
     local.mtu = static_cast<std::uint8_t>(port.active_mtu);
-    local.gid_index = static_cast<std::uint8_t>(config_.gid_index);
+    local.gid_index = gid_index_;
+    local.port_num = Port();
     local.link_layer = static_cast<std::uint8_t>(port.link_layer);
     local.sgid = local_sgid_;
     // The peer writes each partial into this rank's receive windows.
@@ -538,8 +536,7 @@ public:
     if (remote.magic != kWireMagic || remote.version != kWireVersion ||
         remote.world_size != config_.world_size ||
         remote.rank != 1U - config_.rank || remote.qp_num == 0 ||
-        remote.port_num != kPort ||
-        remote.link_layer != IBV_LINK_LAYER_INFINIBAND ||
+        remote.port_num == 0 || remote.link_layer != local.link_layer ||
         remote.mtu < IBV_MTU_256 || remote.mtu > IBV_MTU_4096 ||
         remote.recv_address != kRecvAddress || remote.recv_rkey == 0) {
       SetError(error, "verbs bootstrap metadata is invalid");
@@ -548,6 +545,7 @@ public:
 
     const auto mtu = static_cast<ibv_mtu>(std::min(
         static_cast<unsigned>(local.mtu), static_cast<unsigned>(remote.mtu)));
+    mtu_ = mtu;
     attr = {};
     attr.qp_state = IBV_QPS_RTR;
     attr.path_mtu = mtu;
@@ -556,10 +554,12 @@ public:
     attr.max_dest_rd_atomic = 1;
     attr.min_rnr_timer = 12;
     attr.ah_attr.dlid = remote.lid;
-    attr.ah_attr.grh.hop_limit = 1;
+    // RoCE v2 is routed over UDP/IP; InfiniBand stays within the subnet.
+    attr.ah_attr.grh.hop_limit =
+        link_layer_ == IBV_LINK_LAYER_ETHERNET ? 64 : 1;
     attr.ah_attr.grh.sgid_index = local.gid_index;
     attr.ah_attr.is_global = 1;
-    attr.ah_attr.port_num = kPort;
+    attr.ah_attr.port_num = Port();
     std::memcpy(&attr.ah_attr.grh.dgid, &remote.sgid, sizeof(remote.sgid));
     if (ibv_modify_qp(qp_, &attr,
                       IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
@@ -613,6 +613,13 @@ public:
   }
   [[nodiscard]] int device_index() const noexcept override {
     return static_cast<int>(config_.device_index);
+  }
+  [[nodiscard]] std::string Describe() const override {
+    return "rdma_device=" + device_name_ +
+           " port=" + std::to_string(config_.rdma_port) + " link=" +
+           (link_layer_ == IBV_LINK_LAYER_ETHERNET ? "roce_v2" : "infiniband") +
+           " gid_index=" + std::to_string(gid_index_) +
+           " mtu=" + std::to_string(128U << static_cast<unsigned>(mtu_));
   }
 
   [[nodiscard]] bool BeginOperation(std::uint64_t scope_id,
@@ -832,6 +839,98 @@ private:
     std::size_t bytes{0};
     std::string error;
   };
+
+  [[nodiscard]] std::uint8_t Port() const noexcept {
+    return static_cast<std::uint8_t>(config_.rdma_port);
+  }
+
+  /// Opens the configured RDMA device, or the host's only one.
+  [[nodiscard]] bool OpenDevice(std::string* error) {
+    int count = 0;
+    ibv_device** devices = ibv_get_device_list(&count);
+    ibv_device* chosen = nullptr;
+    std::string names;
+    for (int i = 0; devices != nullptr && i < count; ++i) {
+      const std::string name = ibv_get_device_name(devices[i]);
+      names += (names.empty() ? "" : ", ") + name;
+      if (name == config_.rdma_device ||
+          (config_.rdma_device.empty() && count == 1)) {
+        chosen = devices[i];
+      }
+    }
+    if (chosen != nullptr) {
+      device_name_ = ibv_get_device_name(chosen);
+      context_ = ibv_open_device(chosen);
+    }
+    if (devices != nullptr) {
+      ibv_free_device_list(devices);
+    }
+    if (names.empty()) {
+      SetError(error, "no RDMA device");
+    } else if (chosen == nullptr) {
+      SetError(error, config_.rdma_device.empty()
+                          ? "several RDMA devices (" + names +
+                                "): choose one with --tp-rdma-device"
+                          : "RDMA device " + config_.rdma_device +
+                                " not found (have " + names + ")");
+    } else if (context_ == nullptr) {
+      SetError(error, "ibv_open_device failed");
+    }
+    return context_ != nullptr;
+  }
+
+  /// Reads GID table entry `index`; false for an unset one.
+  [[nodiscard]] bool GidEntry(std::uint32_t index,
+                              distributed::RdmaGidEntry* entry) const {
+    ibv_gid_entry gid{};
+    if (ibv_query_gid_ex(context_, Port(), index, &gid, 0) != 0) {
+      return false;
+    }
+    entry->index = index;
+    entry->type = gid.gid_type == IBV_GID_TYPE_ROCE_V2
+                      ? distributed::RdmaGidType::kRoceV2
+                  : gid.gid_type == IBV_GID_TYPE_ROCE_V1
+                      ? distributed::RdmaGidType::kRoceV1
+                      : distributed::RdmaGidType::kInfiniBand;
+    std::memcpy(entry->gid.data(), gid.gid.raw, entry->gid.size());
+    return true;
+  }
+
+  /// Chooses the GID: the configured one, else 0 on InfiniBand and the port's
+  /// RoCE v2 GID on RoCE. RoCE uses only RoCE v2.
+  [[nodiscard]] bool SelectGid(const ibv_port_attr& port, std::string* error) {
+    const bool roce = port.link_layer == IBV_LINK_LAYER_ETHERNET;
+    std::uint32_t index = config_.gid_index.value_or(0);
+    if (roce && !config_.gid_index.has_value()) {
+      std::vector<distributed::RdmaGidEntry> entries;
+      for (int i = 0; i < port.gid_tbl_len; ++i) {
+        distributed::RdmaGidEntry entry;
+        if (GidEntry(static_cast<std::uint32_t>(i), &entry)) {
+          entries.push_back(entry);
+        }
+      }
+      const auto chosen = distributed::SelectRoceV2Gid(entries, error);
+      if (!chosen.has_value()) {
+        return false;
+      }
+      index = *chosen;
+    } else if (roce) {
+      distributed::RdmaGidEntry entry;
+      if (!GidEntry(index, &entry) ||
+          entry.type != distributed::RdmaGidType::kRoceV2) {
+        SetError(error, "GID " + std::to_string(index) +
+                            " is not a RoCE v2 GID of the RDMA port");
+        return false;
+      }
+    }
+    if (ibv_query_gid(context_, Port(), static_cast<int>(index),
+                      &local_sgid_) != 0) {
+      SetError(error, "ibv_query_gid failed");
+      return false;
+    }
+    gid_index_ = static_cast<std::uint8_t>(index);
+    return true;
+  }
 
   /// Poisons the communicator under `mutex_`, keeping the first failure so
   /// later calls report why the sequence cannot continue.
@@ -1342,6 +1441,10 @@ private:
   bool send_registered_{false};
   bool recv_registered_{false};
   ibv_gid local_sgid_{};
+  std::string device_name_;
+  std::uint8_t link_layer_{IBV_LINK_LAYER_INFINIBAND};
+  std::uint8_t gid_index_{0};
+  ibv_mtu mtu_{IBV_MTU_256};
   std::uint64_t remote_recv_address_{0};
   std::uint32_t remote_recv_rkey_{0};
   std::unique_ptr<Socket> control_;
