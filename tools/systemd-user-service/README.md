@@ -43,7 +43,16 @@ If another local user unit claims the GPU, add a drop-in
 
 - gufo checkout at `~/git/gufo` with a built `build/gpu-tp2/gufo` (the
   container mounts it read-only)
-- ROCm runtime image in podman (`GUFO_IMAGE`)
+- ROCm runtime image in podman (`GUFO_IMAGE`); [Containerfile](Containerfile)
+  builds one, and the same image builds gufo:
+
+  ```sh
+  cd ~/git/gufo
+  podman build -t localhost/gufo-tp2-dev:7.2.3 tools/systemd-user-service
+  podman run --rm --security-opt label=disable --userns keep-id \
+    -v "$PWD:/workspace/gufo" localhost/gufo-tp2-dev:7.2.3 \
+    sh -c 'cmake --preset gpu-tp2 && cmake --build --preset gpu-tp2 --target gufo'
+  ```
 - the RDMA device nodes under `/dev/infiniband`; the units pass the whole
   directory, so gufo can pick any device with `--tp-rdma-device`
 - models under `/opt/models` at the same paths (mounted read-only)
