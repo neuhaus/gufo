@@ -3,8 +3,8 @@
 # The instance name is the quantization (q4, q8, ...). Started by the rank 0
 # host's gufo@.service, which first hands this host's user manager every
 # setting (systemctl --user set-environment GUFO_HEAD_HOST=... GUFO_MODEL=...),
-# so this host needs no environment files: only this unit and the token
-#   ~/.config/gufo.token  shared control token (both hosts)
+# and writes a new TP control token into this host's runtime directory
+# (%t/gufo.token, a tmpfs), so this host needs nothing but this unit.
 # Started any other way, it refuses to run. Without a reachable rank 0 host
 # the worker exits and restarts until one appears.
 #
@@ -20,7 +20,7 @@ Restart=on-failure
 RestartSec=5
 TimeoutStopSec=5min
 SyslogIdentifier=gufo-rank1
-ExecStartPre=/bin/sh -c '[ -n "$GUFO_HEAD_HOST" ] && [ -n "$GUFO_MODEL" ] || \
+ExecStartPre=/bin/sh -c '[ -n "$GUFO_HEAD_HOST" ] && [ -n "$GUFO_MODEL" ] && [ -s %t/gufo.token ] || \
   { echo "no settings from the rank 0 host: start gufo@%i there" >&2; exit 1; }'
 ExecStartPre=/usr/bin/mkdir -p %h/.cache/gufo-tp2/%i
 ExecStart=/bin/sh -c 'exec podman run --rm --log-driver none --security-opt label=disable \
@@ -39,4 +39,4 @@ ExecStart=/bin/sh -c 'exec podman run --rm --log-driver none --security-opt labe
   --served-model-name qwen3.8-flash-next \
   --tp-world-size 2 --tp-rank 1 --tp-bootstrap-host $GUFO_HEAD_HOST \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
-  --tp-control-token "$(cat "$HOME/.config/gufo.token")"'
+  --tp-control-token "$(cat %t/gufo.token)"'

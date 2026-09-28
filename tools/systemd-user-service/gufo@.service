@@ -8,7 +8,10 @@
 # rank 0 server in the foreground; stopping tears both down. This host holds
 # the whole configuration: before starting the worker it hands the worker's
 # user manager every shared setting (systemctl set-environment), so the peer
-# needs only its unit file and the token, and both ranks always agree.
+# needs only its unit file, and both ranks always agree. Each start also
+# creates a new TP control token in this host's runtime directory (a tmpfs,
+# %t/gufo.token) and writes it through ssh's input into the peer's, so the
+# token is never stored on disk and never appears on a command line of ssh.
 # The rank container runs via "podman run --rm" (no -d): systemd owns the
 # process and the restart policy, and the container output is tagged with
 # this unit in the journal.
@@ -17,7 +20,6 @@
 #   ~/.config/gufo/head.env     host settings and shared settings
 #   ~/.config/gufo/<quant>.env  per-quantization settings (GUFO_MODEL);
 #                               a missing file fails the start cleanly
-#   ~/.config/gufo.token        shared control token (both hosts)
 #
 # If another local user unit claims the GPU, add a drop-in
 # (gufo@.service.d/local.conf) with Conflicts=<unit>.
@@ -32,6 +34,7 @@ TimeoutStopSec=5min
 SyslogIdentifier=gufo-rank0
 EnvironmentFile=%h/.config/gufo/head.env
 EnvironmentFile=%h/.config/gufo/%i.env
+ExecStartPre=/bin/sh -c 'umask 077; od -An -tx1 -N24 /dev/urandom | tr -dc 0-9a-f > %t/gufo.token'
 # The worker connects to this host's address on the RDMA link: GUFO_TP_ADDR,
 # or the IPv4 address of GUFO_TP_NETDEV, or of the netdev of the only active
 # RDMA port 1 (the port the verbs communicator uses).
@@ -44,12 +47,13 @@ ExecStartPre=/bin/sh -c '\
   fi; \
   [ -n "$addr" ] || addr=$(ip -o -4 addr show dev "$dev" | awk "{print \\$4}" | cut -d/ -f1 | head -n 1); \
   [ -n "$addr" ] || { echo "no IPv4 address on $dev: set GUFO_TP_ADDR" >&2; exit 1; }; \
-  ssh -o ConnectTimeout=10 $GUFO_PEER "systemctl --user stop \\"gufo-rank1@*.service\\"; \
+  ssh -o ConnectTimeout=10 $GUFO_PEER "umask 077; cat > /run/user/\\$(id -u)/gufo.token || exit 1; \
+    systemctl --user stop \\"gufo-rank1@*.service\\"; \
     systemctl --user set-environment GUFO_HEAD_HOST=$addr GUFO_IMAGE=$GUFO_IMAGE \
       GUFO_MODEL=$GUFO_MODEL GUFO_MTP_MODEL=$GUFO_MTP_MODEL \
       GUFO_SESSIONS=$GUFO_SESSIONS GUFO_MAX_PENDING=$GUFO_MAX_PENDING \
       GUFO_CACHE_DISK_BYTES=$GUFO_CACHE_DISK_BYTES && \
-    systemctl --user start gufo-rank1@%i.service"'
+    systemctl --user start gufo-rank1@%i.service" < %t/gufo.token'
 ExecStartPre=/usr/bin/mkdir -p %h/.cache/gufo-tp2/%i
 ExecStart=/bin/sh -c 'exec podman run --rm --log-driver none --security-opt label=disable \
   --userns keep-id:uid=1000,gid=1000 \
@@ -68,5 +72,5 @@ ExecStart=/bin/sh -c 'exec podman run --rm --log-driver none --security-opt labe
   --tp-world-size 2 --tp-rank 0 \
   --host $GUFO_HOST --port $GUFO_PORT \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
-  --tp-control-token "$(cat "$HOME/.config/gufo.token")"'
+  --tp-control-token "$(cat %t/gufo.token)"'
 ExecStopPost=/bin/sh -c 'ssh -o ConnectTimeout=10 $GUFO_PEER systemctl --user stop gufo-rank1@%i.service || true'

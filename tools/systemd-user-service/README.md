@@ -15,6 +15,12 @@ hands the worker's user manager the shared settings
 models, session counts and disk-cache budget. Both ranks therefore always
 agree, and the worker host needs no environment files.
 
+Each start also creates a new TP control token in the head's runtime
+directory (`/run/user/<uid>/gufo.token`, a tmpfs, mode 0600) and writes it
+through ssh's input into the same place on the worker host. The token is
+never stored on disk and never appears in ssh's arguments; a worker that
+restarts on its own reuses it, and the next head start replaces it.
+
 Each rank runs `podman run --rm` (no `-d`) in the foreground; systemd owns
 the process and the restart policy. The container output reaches the user
 journal once, through the unit (`--log-driver none`), tagged `gufo-rank0` or
@@ -41,7 +47,6 @@ If another local user unit claims the GPU, add a drop-in
 - the RDMA device nodes under `/dev/infiniband`; the units pass the whole
   directory, so gufo can pick any device with `--tp-rdma-device`
 - models under `/opt/models` at the same paths (mounted read-only)
-- identical control token at `~/.config/gufo.token`
 - on the head host: passwordless ssh to the worker host, and `rdma` and `ip`
   (iproute2) to find its RDMA-link address
 
