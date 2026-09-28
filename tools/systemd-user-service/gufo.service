@@ -10,4 +10,3 @@ TimeoutStartSec=5min
 TimeoutStopSec=5min
 ExecStart=/usr/bin/systemctl --user start gufo@q8.service
 ExecStop=/usr/bin/systemctl --user stop gufo@q8.service
-ExecStopPost=/usr/bin/systemctl --user stop gufo@q8.service

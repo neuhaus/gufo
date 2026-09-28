@@ -1,22 +1,16 @@
 # User unit for the rank 1 (worker) host of a two-host gufo TP=2 server.
 #
-# The instance name is the quantization (q4, q8, ...). Normally started by
-# the rank 0 host's gufo@.service through
-#
-#   ssh <peer> "systemctl --user start gufo-rank1@q8"
-#
-# but can also be started directly on this host for debugging; without a
-# reachable rank 0 host the worker exits and restarts until one appears.
+# The instance name is the quantization (q4, q8, ...). Started by the rank 0
+# host's gufo@.service, which first hands this host's user manager every
+# setting (systemctl --user set-environment GUFO_HEAD_HOST=... GUFO_MODEL=...),
+# so this host needs no environment files: only this unit and the token
+#   ~/.config/gufo.token  shared control token (both hosts)
+# Started any other way, it refuses to run. Without a reachable rank 0 host
+# the worker exits and restarts until one appears.
 #
 # The container runs in the foreground ("podman run --rm", no -d): systemd
 # owns the process and the restart policy, and the container output is
 # tagged with this unit in the journal.
-#
-# Configuration files (see the *.example files in this directory):
-#   ~/.config/gufo/worker.env  host settings for the rank 1 host
-#   ~/.config/gufo/<quant>.env  per-quantization settings (GUFO_MODEL);
-#                               a missing file fails the start cleanly
-#   ~/.config/gufo.token  shared control token (both hosts)
 [Unit]
 Description=Gufo TP=2 two-host LLM server worker, rank 1 %i
 
@@ -25,8 +19,8 @@ Type=exec
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=5min
-EnvironmentFile=%h/.config/gufo/worker.env
-EnvironmentFile=%h/.config/gufo/%i.env
+ExecStartPre=/bin/sh -c '[ -n "$GUFO_HEAD_HOST" ] && [ -n "$GUFO_MODEL" ] || \
+  { echo "no settings from the rank 0 host: start gufo@%i there" >&2; exit 1; }'
 ExecStartPre=/usr/bin/mkdir -p %h/.cache/gufo-tp2/%i
 ExecStart=/bin/sh -c 'exec podman run --rm --log-driver journald --security-opt label=disable \
   --userns keep-id:uid=1000,gid=1000 \

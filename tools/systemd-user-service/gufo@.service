@@ -4,17 +4,20 @@
 #
 #   systemctl --user start gufo@q8
 #
-# Brings up the rank 1 worker on the peer host first (GUFO_PEER from
-# ~/.config/gufo/head.env), then the rank 0 server in the foreground;
-# stopping tears both down. The rank container runs via "podman run --rm"
-# (no -d): systemd owns the process and the restart policy, and the
-# container output is tagged with this unit in the journal.
+# Brings up the rank 1 worker on the peer host first (GUFO_PEER), then the
+# rank 0 server in the foreground; stopping tears both down. This host holds
+# the whole configuration: before starting the worker it hands the worker's
+# user manager every shared setting (systemctl set-environment), so the peer
+# needs only its unit file and the token, and both ranks always agree.
+# The rank container runs via "podman run --rm" (no -d): systemd owns the
+# process and the restart policy, and the container output is tagged with
+# this unit in the journal.
 #
 # Configuration files (see the *.example files in this directory):
-#   ~/.config/gufo/head.env   host settings for the rank 0 host
+#   ~/.config/gufo/head.env     host settings and shared settings
 #   ~/.config/gufo/<quant>.env  per-quantization settings (GUFO_MODEL);
 #                               a missing file fails the start cleanly
-#   ~/.config/gufo.token  shared control token (both hosts)
+#   ~/.config/gufo.token        shared control token (both hosts)
 #
 # If another local user unit claims the GPU, add a drop-in
 # (gufo@.service.d/local.conf) with Conflicts=<unit>.
@@ -28,8 +31,23 @@ RestartSec=5
 TimeoutStopSec=5min
 EnvironmentFile=%h/.config/gufo/head.env
 EnvironmentFile=%h/.config/gufo/%i.env
-ExecStartPre=/bin/sh -c 'ssh -o ConnectTimeout=10 $GUFO_PEER systemctl --user stop gufo-rank1@*.service || true'
-ExecStartPre=/bin/sh -c 'ssh -o ConnectTimeout=10 $GUFO_PEER systemctl --user start gufo-rank1@%i.service || true'
+# The worker connects to this host's address on the RDMA link: GUFO_TP_ADDR,
+# or the IPv4 address of GUFO_TP_NETDEV, or of the only RDMA device's netdev.
+ExecStartPre=/bin/sh -c '\
+  addr=$GUFO_TP_ADDR; dev=$GUFO_TP_NETDEV; \
+  if [ -z "$addr" ] && [ -z "$dev" ]; then \
+    dev=$(rdma link show 2>/dev/null | sed -n "s/.* netdev \\([^ ]*\\).*/\\1/p" | sort -u); \
+    [ -n "$dev" ] || dev=$(ls /sys/class/infiniband/*/device/net 2>/dev/null | grep -v ":" | grep . | sort -u); \
+    [ "$(echo "$dev" | wc -w)" -eq 1 ] || { echo "RDMA netdev is ambiguous or missing (\"$dev\"): set GUFO_TP_NETDEV or GUFO_TP_ADDR" >&2; exit 1; }; \
+  fi; \
+  [ -n "$addr" ] || addr=$(ip -o -4 addr show dev "$dev" | awk "{print \\$4}" | cut -d/ -f1 | head -n 1); \
+  [ -n "$addr" ] || { echo "no IPv4 address on $dev: set GUFO_TP_ADDR" >&2; exit 1; }; \
+  ssh -o ConnectTimeout=10 $GUFO_PEER "systemctl --user stop \\"gufo-rank1@*.service\\"; \
+    systemctl --user set-environment GUFO_HEAD_HOST=$addr GUFO_IMAGE=$GUFO_IMAGE \
+      GUFO_MODEL=$GUFO_MODEL GUFO_MTP_MODEL=$GUFO_MTP_MODEL \
+      GUFO_SESSIONS=$GUFO_SESSIONS GUFO_MAX_PENDING=$GUFO_MAX_PENDING \
+      GUFO_CACHE_DISK_BYTES=$GUFO_CACHE_DISK_BYTES && \
+    systemctl --user start gufo-rank1@%i.service"'
 ExecStartPre=/usr/bin/mkdir -p %h/.cache/gufo-tp2/%i
 ExecStart=/bin/sh -c 'exec podman run --rm --log-driver journald --security-opt label=disable \
   --userns keep-id:uid=1000,gid=1000 \
