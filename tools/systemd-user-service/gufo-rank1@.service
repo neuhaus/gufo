@@ -1,0 +1,44 @@
+# User unit for the rank 1 (worker) host of a two-host gufo TP=2 server.
+#
+# The instance name is the quantization (q4, q8, ...). Normally started by
+# the rank 0 host's gufo@.service through
+#
+#   ssh <peer> "systemctl --user start gufo-rank1@q8"
+#
+# but can also be started directly on this host for debugging; without a
+# reachable rank 0 host the worker exits and restarts until one appears.
+#
+# The container runs in the foreground ("podman run --rm", no -d): systemd
+# owns the process and the restart policy, and the container output is
+# tagged with this unit in the journal.
+#
+# Configuration files (see the *.example files in this directory):
+#   ~/.config/gufo/worker.env  host settings for the rank 1 host
+#   ~/.config/gufo/<quant>.env  per-quantization settings (GUFO_MODEL);
+#                               a missing file fails the start cleanly
+#   ~/.config/gufo.token  shared control token (both hosts)
+[Unit]
+Description=Gufo TP=2 two-host LLM server worker, rank 1 %i
+
+[Service]
+Type=exec
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5min
+EnvironmentFile=%h/.config/gufo/worker.env
+EnvironmentFile=%h/.config/gufo/%i.env
+ExecStart=/bin/sh -c 'exec podman run --rm --log-driver journald --security-opt label=disable \
+  --userns keep-id:uid=1000,gid=1000 \
+  --device /dev/kfd --device /dev/dri \
+  --device /dev/infiniband/uverbs0 --device /dev/infiniband/rdma_cm \
+  --group-add keep-groups --ulimit memlock=-1 --network host \
+  -v "$HOME/git/gufo:/workspace/gufo:ro" -v /opt/models:/opt/models:ro \
+  -w /workspace/gufo $GUFO_IMAGE build/gpu-tp2/gufo serve llm \
+  --model $GUFO_MODEL \
+  --speculative mtp --mtp-model $GUFO_MTP_MODEL \
+  --draft-tokens 7 \
+  --sessions $GUFO_SESSIONS --max-pending $GUFO_MAX_PENDING \
+  --served-model-name qwen3.8-flash-next \
+  --tp-world-size 2 --tp-rank 1 --tp-bootstrap-host $GUFO_HEAD_HOST \
+  --tp-bootstrap-port 18515 --tp-control-port 18516 \
+  --tp-control-token "$(cat "$HOME/.config/gufo.token")"'
