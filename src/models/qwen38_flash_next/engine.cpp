@@ -616,10 +616,10 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     if (prefill) {
       const std::size_t next = off + n;
       exec.SetPrefillLookahead(
-          next < tokens.size() ? tokens.subspan(next, std::min<std::size_t>(
-                                                          step,
-                                                          tokens.size() - next))
-                               : std::span<const std::int32_t>(lookahead));
+          next < tokens.size()
+              ? tokens.subspan(
+                    next, std::min<std::size_t>(step, tokens.size() - next))
+              : std::span<const std::int32_t>(lookahead));
     }
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg)) {
       return false;
