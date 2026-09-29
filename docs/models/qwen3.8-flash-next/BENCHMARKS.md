@@ -13,9 +13,8 @@ Positive gain favors Gufo.
 
 Gufo single-user tg: September 27, 2026 (`f797b5b`); pp and other results:
 September 22–23. Concurrency uses the unchanged short-context attention path.
-llama.cpp uses `b11069` for AR and `6fcaa16f` for MTP. The charts also show
-Gufo RDMA on [two hosts](#two-strix-halos-over-rdma), which continues past the
-depths one host has memory for.
+llama.cpp uses `b11069` for AR and `6fcaa16f` for MTP. Gufo's prefill matches
+the hosts' performance power mode (120 W sustained).
 
 ### Single user, autoregressive
 
@@ -124,44 +123,51 @@ Gufo RDMA runs one model on two such hosts: every layer is split between them,
 and they exchange partial sums over InfiniBand RDMA ([how it works](TP2.md)).
 The workloads are those of the one-host tables; "Gufo" is the same build on
 one host, and gain is Gufo RDMA over it. With twice the memory, single users
-also reach depths one host cannot (context capacity 262144).
+also reach depths one host cannot (context capacity 262144). Both were measured
+on September 29, 2026 (`ea76571`) in the balanced power mode (85 W sustained),
+so prefill is lower than in the one-host tables above; decode is not
+power-bound.
 
 ### Single user, autoregressive
 
 <!-- bench:single-ar-tp2 -->
 | Flash-Next Q4 AR<br>Depth (tokens) | Gufo pp (tok/s) | Gufo RDMA pp (tok/s) | Gain | Gufo tg (tok/s) | Gufo RDMA tg (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 32,768 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 258,048 | — | TODO | — | — | TODO | — |
+| 0 | 1203.95 | 1541.16 | +28.0% | 26.21 | 34.19 | +30.4% |
+| 4,096 | 1243.96 | 1480.06 | +19.0% | 25.81 | 34.54 | +33.8% |
+| 32,768 | 1134.13 | 1479.06 | +30.4% | 25.79 | 33.92 | +31.5% |
+| 65,536 | 1060.00 | 1431.50 | +35.0% | 25.37 | 33.78 | +33.1% |
+| 131,072 | 979.47 | 1320.03 | +34.8% | 25.27 | 32.83 | +29.9% |
+| 258,048 | — | 1167.63 | — | — | 31.72 | — |
 <!-- /bench -->
+
+![Single user, autoregressive, one host and RDMA](artifacts/charts/single-ar-tp2.svg)
 
 ### Single user, MTP
 
 <!-- bench:single-mtp-tp2 -->
 | Flash-Next Q4 MTP<br>Depth (tokens) | Gufo pp (tok/s) | Gufo RDMA pp (tok/s) | Gain pp | Gufo tg mixed (tok/s) | Gufo RDMA tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | Gufo RDMA tg repetitive (tok/s) | Gain repetitive |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| 32,768 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| 258,048 | — | TODO | — | — | TODO | — | — | TODO | — |
+| 0 | 1334.06 | 1505.96 | +12.9% | 33.00 | 41.20 | +24.8% | 56.25 | 75.58 | +34.4% |
+| 4,096 | 1282.50 | 1457.15 | +13.6% | 31.51 | 46.44 | +47.4% | 54.69 | 58.86 | +7.6% |
+| 32,768 | 1121.21 | 1432.81 | +27.8% | 33.03 | 45.44 | +37.6% | 39.11 | 53.66 | +37.2% |
+| 65,536 | 1089.34 | 1395.77 | +28.1% | 32.51 | 45.05 | +38.6% | 39.45 | 56.53 | +43.3% |
+| 131,072 | 1070.54 | 1292.44 | +20.7% | 33.12 | 42.65 | +28.8% | 44.97 | 59.36 | +32.0% |
+| 258,048 | — | 1129.95 | — | — | 23.22 | — | — | 50.16 | — |
 <!-- /bench -->
+
+![Single user, MTP, one host and RDMA](artifacts/charts/single-mtp-tp2.svg)
 
 ### Multiple users, autoregressive
 
 <!-- bench:multi-ar-tp2 -->
 | Flash-Next Q4 AR<br>Users | Gufo AR (tok/s) | Gufo RDMA AR (tok/s) | Gain |
 | ---: | ---: | ---: | ---: |
-| 1 | TODO | TODO | TODO |
-| 2 | TODO | TODO | TODO |
-| 4 | TODO | TODO | TODO |
-| 6 | TODO | TODO | TODO |
-| 8 | TODO | TODO | TODO |
+| 1 | 25.45 | TODO | TODO |
+| 2 | 47.25 | TODO | TODO |
+| 4 | 76.81 | TODO | TODO |
+| 6 | 96.24 | TODO | TODO |
+| 8 | 107.56 | TODO | TODO |
 <!-- /bench -->
 
 ### Multiple users, MTP
@@ -184,10 +190,12 @@ as above; prefill on the left axis, generation on the right.
 <!-- bench:tp2-q8 -->
 | Flash-Next Q8 RDMA<br>Depth (tokens) | pp (tok/s) | tg AR (tok/s) | tg MTP mixed (tok/s) | tg MTP repetitive (tok/s) |
 | ---: | ---: | ---: | ---: | ---: |
-| 0 | TODO | TODO | TODO | TODO |
-| 4,096 | TODO | TODO | TODO | TODO |
-| 32,768 | TODO | TODO | TODO | TODO |
-| 65,536 | TODO | TODO | TODO | TODO |
-| 131,072 | TODO | TODO | TODO | TODO |
-| 258,048 | TODO | TODO | TODO | TODO |
+| 0 | 916.15 | 31.13 | 41.97 | 68.12 |
+| 4,096 | 907.62 | 31.14 | 40.09 | 58.64 |
+| 32,768 | 871.49 | 30.77 | 41.06 | 48.29 |
+| 65,536 | 690.42 | 30.53 | 41.39 | 51.99 |
+| 131,072 | 823.21 | 30.03 | 37.45 | 53.61 |
+| 258,048 | 774.02 | 28.77 | 38.04 | 53.21 |
 <!-- /bench -->
+
+![Flash-Next Q8 RDMA](artifacts/charts/tp2-q8.svg)

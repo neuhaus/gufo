@@ -139,6 +139,53 @@ def render_table(config: BenchConfig, table_id: str) -> str:
     raise SystemExit(f"no TP2 renderer for table {table_id}")
 
 
+ONE_HOST_LABEL = "Gufo (1 host)"
+BASE_TABLES = {"single-ar-tp2": "single-ar", "single-mtp-tp2": "single-mtp",
+               "multi-ar-tp2": "multi-ar", "multi-mtp-tp2": "multi-mtp"}
+
+
+def chart_rdma(config: BenchConfig, table_id: str, rows: dict[str, dict[str, str]], path: Path) -> str | None:
+    """One host against RDMA, both from the same build: a panel per compared metric.
+
+    Returns the chart's title, or None when there is nothing to draw."""
+    if table_id == "tp2-q8":
+        return Q8_LABEL if chart_q8(config, rows, path) else None
+    from .charts import COLORS, TEXT, _bars, _depth_ticks, _has_data, _lines, _plt, _series
+
+    base = config.table(BASE_TABLES[table_id])
+    labels = list(rows)
+    headers = next(iter(rows.values()), {})
+    metrics = [h[len(RDMA) + 1:] for h in headers if h.startswith(f"{RDMA} ")]
+    panels = [(m, _series(rows, labels, f"Gufo {m}"), _series(rows, labels, f"{RDMA} {m}")) for m in metrics]
+    if not any(_has_data(two) for _, _, two in panels):
+        return None
+    single = base.kind == "single"
+    plt = _plt()
+    width = max(3.6, 0.45 * len(labels) + 1.6) if single else 4.5
+    fig, axes = plt.subplots(1, len(panels), figsize=(width * len(panels), 3.2), squeeze=False)
+    for ax, (metric, one, two) in zip(axes[0], panels):
+        series = [(ONE_HOST_LABEL, one, COLORS["gufo"]), (RDMA, two, COLORS["tp2"])]
+        if single:
+            unit = "prefill tok/s" if metric == "pp" else "generation tok/s"
+            _lines(ax, labels, series, unit, _depth_ticks(labels))
+            ax.set_title("Prefill" if metric == "pp" else f"Generation{metric[2:] and ', ' + metric[3:]}")
+            ax.set_xlabel("context depth (tokens)")
+            ax.legend(loc="lower left")
+        else:
+            _bars(ax, labels, series, "sum of request decode tok/s")
+            ax.set_title(metric if metric.isupper() else metric.capitalize())
+            ax.set_xlabel("concurrent users")
+            ax.legend(loc="upper left")
+    title = f"{model_label(config, base)} · {base.spec.get('title', base.id)} · one host and RDMA"
+    fig.suptitle(title, x=0.01, ha="left", fontsize=10, color=TEXT)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, format="svg", metadata={"Date": None, "Creator": None})
+    plt.close(fig)
+    path.write_text("\n".join(line.rstrip() for line in path.read_text().splitlines()) + "\n")
+    return f"{base.spec.get('title', base.id)}, one host and RDMA"
+
+
 def chart_q8(config: BenchConfig, rows: dict[str, dict[str, str]], path: Path) -> bool:
     """Prefill on the left axis and generation on the right, over depth."""
     from .charts import COLORS, SURFACE, TEXT, TEXT_SECONDARY, _depth_ticks, _has_data, _plt, _series

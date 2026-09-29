@@ -40,6 +40,8 @@ print = functools.partial(print, flush=True)  # progress must reach redirected l
 MODEL_ALIAS = "bench"
 CLIENT_ID = "model-bench"
 REQUEST_TIMEOUT = 3600.0
+# ec-su_axb35-linux exposes the Sixunited AXB35 board's power mode here.
+POWER_MODE_PATH = "/sys/class/ec_su_axb35/apu/power_mode"
 
 WORDS = (
     "the river bends past a quiet town where old mills once ground wheat for "
@@ -444,6 +446,11 @@ class Session:
             self.config, table, self.target, mode=mode, command=command,
             source=self.source, fingerprint=self.fingerprint, notes=notes,
         )
+        # Prefill follows the sustained power limit, so results record it.
+        power = {"rank0": self.power_mode()}
+        if command and command[0] == "tp2":
+            power["rank1"] = self.power_mode(str(self._checked_tp2_config()["remote_host"]))
+        artifact["powerMode"] = power if len(power) > 1 else power["rank0"]
         if command and command[0] == "tp2":
             artifact["topology"] = {
                 "id": "tp2",
@@ -453,6 +460,20 @@ class Session:
                 "rankFingerprints": self.rank_fingerprints(),
             }
         return artifact
+
+    @staticmethod
+    def power_mode(remote_host: str | None = None) -> str | None:
+        """The Sixunited AXB35 EC's power mode (quiet, balanced, performance), if its driver is loaded."""
+        command = ["cat", POWER_MODE_PATH]
+        if remote_host:
+            command = ["ssh", "-o", "BatchMode=yes", remote_host, shlex.join(command)]
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0:
+            return None
+        return completed.stdout.strip() or None
 
     def store(self, path: Path, artifact: dict[str, Any]) -> None:
         existing = None if self.fresh else load_artifact(path)
