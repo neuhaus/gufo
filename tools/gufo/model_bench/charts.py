@@ -96,11 +96,15 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
     `tp2_rows`, the table's Gufo TP2 comparison, adds a two-host series."""
     layout = layout_for(config, table)
     labels = layout.rows
+    # Only measured RDMA rows move the legend or extend the depth axis.
+    tp2_rows = {label: row for label, row in (tp2_rows or {}).items()
+                if any(_number(v) is not None for k, v in row.items() if k.startswith(RDMA))} or None
     if tp2_rows and table.kind == "single":
         # TP2 continues past the depths one host has memory for.
         deeper = [_depth_label(d) for d in table.spec.get("tp2_depths", [])]
-        labels = labels + [label for label in deeper
-                           if any(_number(v) is not None for v in tp2_rows.get(label, {}).values())]
+        labels = labels + [label for label in deeper if label in tp2_rows]
+    # Deeper RDMA rows widen the depth charts so their ticks keep their spacing.
+    stretch = len(labels) / max(len(layout.rows), 1)
 
     def tp2(header: str) -> list[tuple[str, list[float], str]]:
         values = _series(tp2_rows or {}, labels, f"{RDMA} {header}")
@@ -125,7 +129,7 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
         ]
         if not any(_has_data(g, r) for g, r in series):
             return False
-        fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 3.2), squeeze=False)
+        fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels) * stretch, 3.2), squeeze=False)
         for ax, (panel, metric, unit), (g, r) in zip(axes[0], panels, series):
             _lines(ax, labels, [("Gufo", g, COLORS["spec"]),
                                (ref if matched_mode else f"{ref} AR", r, COLORS["ref_spec"]),
@@ -145,7 +149,7 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
         rt = _series(rows, labels, f"{ref} tg" if matched_mode else f"{ref} AR tg")
         reference_name = ref if matched_mode else f"{ref} AR"
         g_color, r_color = (COLORS["spec"], COLORS["ref_spec"]) if table.speculative else (COLORS["gufo"], COLORS["reference"])
-        fig, (a1, a2) = plt.subplots(1, 2, figsize=(8, 3.2))
+        fig, (a1, a2) = plt.subplots(1, 2, figsize=(8 * stretch, 3.2))
         ticks = _depth_ticks(labels)
         _lines(a1, labels, [("Gufo", gp, g_color), (reference_name, rp, r_color), *tp2("pp")],
                "prefill tok/s", ticks)
