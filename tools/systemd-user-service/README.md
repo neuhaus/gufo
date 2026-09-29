@@ -41,8 +41,8 @@ If another local user unit claims the GPU, add a drop-in
 
 ## Prerequisites (both hosts)
 
-- gufo checkout at `~/git/gufo` with a built `build/gpu-tp2/gufo` (the
-  container mounts it read-only)
+- gufo checkout with a built `build/gpu-tp2/gufo` (the container mounts it
+  read-only): `~/git/gufo`, or `GUFO_CHECKOUT` in `head.env`
 - ROCm runtime image in podman (`GUFO_IMAGE`); [Containerfile](Containerfile)
   builds one, and the same image builds gufo:
 
@@ -96,10 +96,11 @@ the worker. Model load takes ~25 s per rank; the server answers
 ## Disk cache
 
 Both ranks keep their half of each continuation snapshot under
-`~/.cache/gufo-tp2/<quant>` on their own disk, so cached prompts survive a
+`<cache>/gufo-tp2/<quant>` on their own disk, so cached prompts survive a
 restart. `GUFO_CACHE_DISK_BYTES` bounds each rank (default 64 GiB).
-`~/.cache/gufo` keeps the model files' identity digests, so a restart skips
-hashing the full weights again (over a minute for Q8).
+`<cache>/gufo` keeps the model files' identity digests, so a restart skips
+hashing the full weights again (over a minute for Q8). `<cache>` is
+`GUFO_CACHE_DIR` from `head.env`, or each host's `~/.cache`.
 
 ## Crash behavior
 
