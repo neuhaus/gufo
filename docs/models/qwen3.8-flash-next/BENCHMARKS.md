@@ -133,13 +133,9 @@ also reach depths one host cannot (context capacity 262144).
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | TODO | TODO | TODO | TODO | TODO | TODO |
 | 4,096 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO |
 | 32,768 | TODO | TODO | TODO | TODO | TODO | TODO |
 | 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
 | 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 196,608 | — | TODO | — | — | TODO | — |
 | 258,048 | — | TODO | — | — | TODO | — |
 <!-- /bench -->
 
@@ -150,13 +146,9 @@ also reach depths one host cannot (context capacity 262144).
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
 | 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
 | 32,768 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
 | 65,536 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
 | 131,072 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
-| 196,608 | — | TODO | — | — | TODO | — | — | TODO | — |
 | 258,048 | — | TODO | — | — | TODO | — | — | TODO | — |
 <!-- /bench -->
 
@@ -194,12 +186,8 @@ as above; prefill on the left axis, generation on the right.
 | ---: | ---: | ---: | ---: | ---: |
 | 0 | TODO | TODO | TODO | TODO |
 | 4,096 | TODO | TODO | TODO | TODO |
-| 8,192 | TODO | TODO | TODO | TODO |
-| 12,288 | TODO | TODO | TODO | TODO |
-| 16,384 | TODO | TODO | TODO | TODO |
 | 32,768 | TODO | TODO | TODO | TODO |
 | 65,536 | TODO | TODO | TODO | TODO |
 | 131,072 | TODO | TODO | TODO | TODO |
-| 196,608 | TODO | TODO | TODO | TODO |
 | 258,048 | TODO | TODO | TODO | TODO |
 <!-- /bench -->

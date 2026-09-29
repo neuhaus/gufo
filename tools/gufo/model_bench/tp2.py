@@ -28,8 +28,8 @@ NONE = "—"
 
 
 def depths(table: TableSpec) -> list[int]:
-    """One host's depths, then the deeper ones only two hosts have memory for."""
-    return [int(d) for d in (*table.spec["depths"], *table.spec.get("tp2_depths", []))]
+    """TP2's depths: some of one host's, then deeper ones only two hosts hold."""
+    return [int(d) for d in table.spec.get("tp2_depths", table.spec["depths"])]
 
 
 def _one_host_depth(table: TableSpec, depth: int) -> bool:

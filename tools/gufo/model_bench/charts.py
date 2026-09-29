@@ -102,7 +102,7 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
     if tp2_rows and table.kind == "single":
         # TP2 continues past the depths one host has memory for.
         deeper = [_depth_label(d) for d in table.spec.get("tp2_depths", [])]
-        labels = labels + [label for label in deeper if label in tp2_rows]
+        labels = labels + [label for label in deeper if label in tp2_rows and label not in labels]
     # Deeper RDMA rows widen the depth charts so their ticks keep their spacing.
     stretch = len(labels) / max(len(layout.rows), 1)
 
