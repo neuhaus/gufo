@@ -22,15 +22,17 @@ TimeoutStopSec=5min
 SyslogIdentifier=gufo-rank1
 ExecStartPre=/bin/sh -c '[ -n "$GUFO_HEAD_HOST" ] && [ -n "$GUFO_MODEL" ] && [ -s %t/gufo.token ] || \
   { echo "no settings from the rank 0 host: start gufo@%i there" >&2; exit 1; }'
-ExecStartPre=/usr/bin/mkdir -p %h/.cache/gufo-tp2/%i %h/.cache/gufo
-ExecStart=/bin/sh -c 'exec podman run --rm --log-driver none --security-opt label=disable \
+ExecStartPre=/bin/sh -c 'cache=$${GUFO_CACHE_DIR:-$HOME/.cache}; \
+  mkdir -p "$cache/gufo-tp2/%i" "$cache/gufo"'
+ExecStart=/bin/sh -c 'checkout=$${GUFO_CHECKOUT:-$HOME/git/gufo}; cache=$${GUFO_CACHE_DIR:-$HOME/.cache}; \
+  exec podman run --rm --log-driver none --security-opt label=disable \
   --userns keep-id:uid=1000,gid=1000 \
   --device /dev/kfd --device /dev/dri \
   --device /dev/infiniband \
   --group-add keep-groups --ulimit memlock=-1 --network host \
-  -v "$HOME/git/gufo:/workspace/gufo:ro" -v /opt/models:/opt/models:ro \
-  -v "$HOME/.cache/gufo-tp2/%i:/cache" \
-  -v "$HOME/.cache/gufo:/xdg-cache/gufo" -e XDG_CACHE_HOME=/xdg-cache \
+  -v "$checkout:/workspace/gufo:ro" -v /opt/models:/opt/models:ro \
+  -v "$cache/gufo-tp2/%i:/cache" \
+  -v "$cache/gufo:/xdg-cache/gufo" -e XDG_CACHE_HOME=/xdg-cache \
   -w /workspace/gufo $GUFO_IMAGE build/gpu-tp2/gufo serve llm \
   --model $GUFO_MODEL \
   --speculative mtp --mtp-model $GUFO_MTP_MODEL \
