@@ -1018,6 +1018,20 @@ with tempfile.TemporaryDirectory() as directory:
                 else:
                     raise AssertionError("speculative runs require AR quality references")
             session.server.assert_not_called()
+            if target == "gufo":
+                session.modes = ["ar"]
+                with patch("gufo.model_bench.llm.run_corpus_benchmark") as bench, \
+                        patch("gufo.model_bench.llm.wait_process_exit"), \
+                        patch("gufo.model_bench.llm.save_artifact"), \
+                        patch("sys.stdout", new=io.StringIO()):
+                    bench.side_effect = lambda **kw: {
+                        "artifactType": "servingBenchmark", "workload": {}, "results": {"c1": {}}}
+                    run_multi(session, table)
+                check([(call.kwargs["mode"], call.kwargs["sessions"])
+                       for call in session.server.call_args_list] == [("ar", 1)] * len(workloads),
+                      "--mode ar qualifies each speculative workload once at C1")
+                session.modes = None
+                session.server.reset_mock()
         with patch("gufo.model_bench.render.load_artifact", return_value=None) as load:
             rendered = render_table(config, table, None)
             check("Gufo AR" not in rendered and "llama.cpp AR" not in rendered,

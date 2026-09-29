@@ -865,11 +865,16 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
         case_ids = {case.identifier for case in cases}
         suite_bytes = suite.read_bytes()
     modes = list(spec.get("modes", ["ar"]))
+    # `--mode ar` on a speculative-only table records the isolated C1 AR
+    # completions its speculative rows are checked against.
+    qualify = (session.target == "gufo" and bool(session.modes) and "ar" in session.modes
+               and "ar" not in modes)
     if session.target != "gufo":
         modes = [m for m in modes if m == "ar" or cfg.reference_speculative is not None]
     if session.modes:
         modes = [m for m in modes if m in session.modes]
-    for mode in modes:
+    plan = ([("ar", [1])] if qualify else []) + [(mode, keys) for mode in modes]
+    for mode, mode_keys in plan:
         # Reference AR keeps the unsuffixed name; its speculative run is suffixed like Gufo's.
         path = artifact_path(cfg, table, session.artifact_target, None if (session.target != "gufo" and mode == "ar") else mode)
         reference = None
@@ -885,7 +890,7 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                     f"qualify C1 AR once and save its report to {ar_path}"
                 )
         combined = None if session.fresh else load_artifact(path)
-        for users in keys:
+        for users in mode_keys:
             if path == ar_path and reference is None and combined is not None and "c1" in combined.get("results", {}):
                 # Gufo AR C2+ compares against this same artifact's C1 completions.
                 reference = load_reference_report(ar_path) if ar_path.exists() else None
@@ -919,9 +924,8 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                         fingerprint=session.fingerprint or {}, source_revision=session.source["revision"],
                         source_dirty=session.source["dirty"], suite_bytes=suite_bytes,
                         corpus_layout=spec.get("corpus_layout", "distinct"), endpoint_profile=session.profile,
-                        cache_prompt=(False if session.tp2_enabled else
-                                      (True if prefill_first else
-                                       (False if not spec.get("cache_prompt", False) else None))),
+                        cache_prompt=(True if prefill_first else
+                                      (False if not spec.get("cache_prompt", False) else None)),
                         prefill_first=prefill_first,
                         pin_slots=prefill_first and session.target == "reference" and session.reference_kind != "ds4",
                         preparation_tokens=0 if session.target == "reference" and session.reference_kind == "ds4" else 1,
@@ -936,11 +940,8 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                         report["topology"] = {
                             "id": "tp2",
                             "worldSize": 2,
-                            "requestTransport": "openai-chat-completions-json",
-                            "limitations": [
-                                "C1 only", "greedy only", "uncached only",
-                                "non-streaming only", "no published benchmark comparison",
-                            ],
+                            "requestTransport": "openai-chat-completions-" + (
+                                "sse" if session.stream_requests else "json"),
                             "rankFingerprints": session.rank_fingerprints(),
                         }
                     if session.target == "reference" and session.reference_kind == "ds4":
