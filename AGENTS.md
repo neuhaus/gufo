@@ -48,6 +48,31 @@ video generation or duplicate suites for routine edits. A missing-model skip
 is not a quality pass. Broaden checks when shared behavior changes or failures
 expose risk.
 
+## Verification discipline
+
+Named-target builds are for iteration, not for evidence. A target that is not
+built is not a target that works, and `ctest -L <label>` runs only the binaries
+that already exist.
+
+- Before describing a branch, PR or change as healthy: run a plain
+  `cmake --build` over all targets and a full `ctest`, and name the exclusions
+  (`-E external-model,slow`) and the reason for each. A named-target build does
+  not establish this.
+- After changing shared code — options, fault-injection paths, link libraries,
+  or anything a default build consumes — re-run the **default** path, not only
+  the new mode. A change can leave every new test green while breaking the
+  path that was verified earlier.
+- Adding a source file used by a widely-consumed translation unit means
+  auditing every target that compiles that unit. Test support libraries are
+  consumers too, and they are not in the default build of the main binary.
+- Do not call a check unrunnable before trying the container route. `nix` works
+  under `podman` with the repo bind-mounted, which is how the pinned
+  clang-format gate is run here.
+- In any check you write, keep the expected value and the observed value
+  independent. A prediction that is also its own result cannot fail.
+- Prefer a pre-existing `main` checkout as the baseline when a check fails, so
+  a new defect is not attributed to inherited state or vice versa.
+
 ## Profiling and kernels
 
 Apply [.agents/skills/optimize-kernel/SKILL.md](.agents/skills/optimize-kernel/SKILL.md).
