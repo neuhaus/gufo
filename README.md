@@ -1,7 +1,7 @@
 # Gufo: the Strix Halo inference engine
 
 <p align="center">
-  <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
+  <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180"><img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
 Gufo is a vertical local inference engine specifically built and optimized for the AMD Strix Halo hardware:
