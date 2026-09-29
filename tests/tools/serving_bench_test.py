@@ -722,6 +722,21 @@ check("/dev/infiniband" in local_tp2 and "/dev/infiniband/uverbs0" not in local_
       "TP2 containers receive every RDMA device node")
 check(tp2_session.artifact_target == "gufo-tp2" and tp2_session.stream_requests,
       "TP2 results stream and sit beside the one-host artifacts")
+from gufo.model_bench.tp2 import depths as tp2_depths, render_table as render_tp2
+
+tp2_single = tp2_config.table("single-ar")
+check(tp2_depths(tp2_single)[-2:] == [196608, 258048]
+      and 258048 + tp2_single.spec["prompt_tokens"] + tp2_single.spec["output_tokens"]
+      <= tp2_single.spec["tp2_context"],
+      "TP2 adds the depths only two hosts hold, within its context")
+deep = {table_id: parse_table(render_tp2(tp2_config, table_id))
+        for table_id in ("single-ar-tp2", "single-mtp-tp2", "tp2-q8")}
+check(deep["single-ar-tp2"]["258,048"]["Gufo pp"] == "—"
+      and deep["single-ar-tp2"]["258,048"]["Gain"] == "—"
+      and deep["single-ar-tp2"]["131,072"]["Gufo pp"] != "—"
+      and deep["single-mtp-tp2"]["196,608"]["Gain pp"] == "—"
+      and "258,048" in deep["tp2-q8"],
+      "rows past one host's depths show no one-host value or gain")
 check(public_command(local_tp2).count("<redacted>") == 1,
       "TP2 token is redacted from the combined command")
 check("--tp-cache-reuse" not in local_tp2,

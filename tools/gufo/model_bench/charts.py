@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import BenchConfig, TableSpec
-from .render import MARKER_RE, _number, layout_for, model_label, parse_table
+from .render import MARKER_RE, _depth_label, _number, layout_for, model_label, parse_table
 
 # Categorical slots from the validated default palette: Gufo, reference, Gufo speculative.
 COLORS = {"gufo": "#2a78d6", "reference": "#eb6834", "spec": "#1baf7a", "ref_spec": "#eda100",
@@ -95,6 +95,9 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
     `tp2_rows`, the table's Gufo TP2 comparison, adds a two-host series."""
     layout = layout_for(config, table)
     labels = layout.rows
+    if tp2_rows and table.kind == "single":
+        # TP2 continues past the depths one host has memory for.
+        labels = labels + [_depth_label(d) for d in table.spec.get("tp2_depths", [])]
 
     def tp2(header: str) -> list[tuple[str, list[float], str]]:
         values = _series(tp2_rows or {}, labels, f"Gufo TP2 {header}")

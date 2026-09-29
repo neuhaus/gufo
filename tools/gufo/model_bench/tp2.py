@@ -22,6 +22,16 @@ TP2_Q8 = "gufo-tp2-q8"
 ONE_HOST = "gufo-onehost"
 TABLES = ("single-ar-tp2", "single-mtp-tp2", "multi-ar-tp2", "multi-mtp-tp2", "tp2-q8")
 Q8_LABEL = "Flash-Next Q8 TP2"
+NONE = "—"
+
+
+def depths(table: TableSpec) -> list[int]:
+    """One host's depths, then the deeper ones only two hosts have memory for."""
+    return [int(d) for d in (*table.spec["depths"], *table.spec.get("tp2_depths", []))]
+
+
+def _one_host_depth(table: TableSpec, depth: int) -> bool:
+    return depth in table.spec["depths"]
 
 
 def _one_host(config: BenchConfig, table: TableSpec, mode: str | None = None) -> dict[str, Any] | None:
@@ -43,7 +53,9 @@ def _best(values: list[str | None]) -> str | None:
     return max((v for v in values if _number(v) is not None), key=_number, default=None)
 
 
-def _pair(one: str | None, two: str | None) -> list[str]:
+def _pair(one: str | None, two: str | None, one_host: bool = True) -> list[str]:
+    if not one_host:
+        return [NONE, two or TODO, NONE]
     one, two = one or TODO, two or TODO
     return [one, two, gain(_number(two), _number(one), "higher")]
 
@@ -61,8 +73,9 @@ def render_table(config: BenchConfig, table_id: str) -> str:
         header = [f"{model_label(config, base)}<br>Depth (tokens)",
                   "Gufo pp (tok/s)", "Gufo TP2 pp (tok/s)", "Gain",
                   "Gufo tg (tok/s)", "Gufo TP2 tg (tok/s)", "Gain"]
-        rows = [[_depth_label(d), *_pair(_stat(one, d, "pp"), _stat(two, d, "pp")),
-                 *_pair(_stat(one, d, "tg"), _stat(two, d, "tg"))] for d in base.spec["depths"]]
+        rows = [[_depth_label(d), *_pair(_stat(one, d, "pp"), _stat(two, d, "pp"), _one_host_depth(base, d)),
+                 *_pair(_stat(one, d, "tg"), _stat(two, d, "tg"), _one_host_depth(base, d))]
+                for d in depths(base)]
         return _table(header, rows)
     if table_id == "single-mtp-tp2":
         base = config.table("single-mtp")
@@ -75,12 +88,13 @@ def render_table(config: BenchConfig, table_id: str) -> str:
             label = workload.spec["label"]
             header += [f"Gufo tg {label} (tok/s)", f"Gufo TP2 tg {label} (tok/s)", f"Gain {label}"]
         rows = []
-        for depth in base.spec["depths"]:
+        for depth in depths(base):
+            one_host = _one_host_depth(base, depth)
             row = [_depth_label(depth),
                    *_pair(_best([_stat(one, depth, "pp") for one, _ in reports]),
-                          _best([_stat(two, depth, "pp") for _, two in reports]))]
+                          _best([_stat(two, depth, "pp") for _, two in reports]), one_host)]
             for one, two in reports:
-                row += _pair(_stat(one, depth, "tg"), _stat(two, depth, "tg"))
+                row += _pair(_stat(one, depth, "tg"), _stat(two, depth, "tg"), one_host)
             rows.append(row)
         return _table(header, rows)
     if table_id == "multi-ar-tp2":
@@ -116,7 +130,7 @@ def render_table(config: BenchConfig, table_id: str) -> str:
         header = [f"{Q8_LABEL}<br>Depth (tokens)", "pp (tok/s)", "tg AR (tok/s)"]
         header += [f"tg {spec} {w.spec['label']} (tok/s)" for w in workloads]
         rows = []
-        for depth in ar.spec["depths"]:
+        for depth in depths(ar):
             cells = [_stat(ar_report, depth, "pp"), _stat(ar_report, depth, "tg")]
             cells += [_stat(report, depth, "tg") for report in mtp_reports]
             rows.append([_depth_label(depth), *(cell or TODO for cell in cells)])
@@ -128,7 +142,7 @@ def chart_q8(config: BenchConfig, rows: dict[str, dict[str, str]], path: Path) -
     """Prefill on the left axis and generation on the right, over depth."""
     from .charts import COLORS, SURFACE, TEXT, TEXT_SECONDARY, _depth_ticks, _has_data, _plt, _series
 
-    labels = [_depth_label(d) for d in config.table("single-ar").spec["depths"]]
+    labels = [_depth_label(d) for d in depths(config.table("single-ar"))]
     spec = config.speculative["label"]
     workloads = config.table("single-mtp").workload_tables()
     pp = _series(rows, labels, "pp")

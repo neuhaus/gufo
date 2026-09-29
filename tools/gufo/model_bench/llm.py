@@ -633,6 +633,9 @@ def run_single(session: Session, table: TableSpec, display_table: TableSpec | No
         return
     cfg.require_files(table.variant)
     depths = [int(d) for d in spec["depths"]]
+    if session.tp2_enabled:
+        # Two hosts hold more KV state: TP2 also measures the depths one host cannot.
+        depths += [int(d) for d in spec.get("tp2_depths", [])]
     if session.depths:
         depths = [d for d in depths if d in session.depths]
     keys = _selected_rows(session, table, {d: f"{d:,}" for d in depths}, display_table)
@@ -647,7 +650,8 @@ def run_single(session: Session, table: TableSpec, display_table: TableSpec | No
     base_seed = int(spec.get("prefix", {}).get("seed", 1))
     mode = cfg.speculative["mode"] if table.speculative else "ar"
 
-    context = session.context or int(spec["context"])
+    context = session.context or int(spec["tp2_context" if session.tp2_enabled and "tp2_context" in spec
+                                          else "context"])
     server = session.server(table, mode=mode, context=context, sessions=1, tag="single")
     rows: dict[str, Any] = {}
     with server:
