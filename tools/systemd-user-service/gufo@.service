@@ -54,7 +54,7 @@ ExecStartPre=/bin/sh -c '\
       GUFO_SESSIONS=$GUFO_SESSIONS GUFO_MAX_PENDING=$GUFO_MAX_PENDING \
       GUFO_CACHE_DISK_BYTES=$GUFO_CACHE_DISK_BYTES && \
     systemctl --user start gufo-rank1@%i.service" < %t/gufo.token'
-ExecStartPre=/usr/bin/mkdir -p %h/.cache/gufo-tp2/%i
+ExecStartPre=/usr/bin/mkdir -p %h/.cache/gufo-tp2/%i %h/.cache/gufo
 ExecStart=/bin/sh -c 'model=$(printenv GUFO_MODEL_$(echo %i | tr a-z- A-Z_)); \
   exec podman run --rm --log-driver none --security-opt label=disable \
   --userns keep-id:uid=1000,gid=1000 \
@@ -63,6 +63,7 @@ ExecStart=/bin/sh -c 'model=$(printenv GUFO_MODEL_$(echo %i | tr a-z- A-Z_)); \
   --group-add keep-groups --ulimit memlock=-1 --network host \
   -v "$HOME/git/gufo:/workspace/gufo:ro" -v /opt/models:/opt/models:ro \
   -v "$HOME/.cache/gufo-tp2/%i:/cache" \
+  -v "$HOME/.cache/gufo:/xdg-cache/gufo" -e XDG_CACHE_HOME=/xdg-cache \
   -w /workspace/gufo $GUFO_IMAGE build/gpu-tp2/gufo serve llm \
   --model "$model" \
   --speculative mtp --mtp-model $GUFO_MTP_MODEL \
