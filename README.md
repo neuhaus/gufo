@@ -13,7 +13,7 @@ See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-
 for user-facing changes and release history.
 
 > [!NOTE]
-> This is the **Gufo RDMA version for Dual Strix Halo systems with Infiniband or RoCEv2 networking**. Featuring higher performance thanks to tensor parallelism, larger contexts and a higher quality quantisation: Qwen 3.8 Flash Next Q8. Enjoy!
+> This is the **Gufo RDMA version** adding supprot for Dual Strix Halo systems with Infiniband or RoCEv2 networking. Enjoy higher performance thanks to tensor parallelism, larger contexts and a higher quality quantisation: Qwen 3.8 Flash Next Q8.
 
 ## Models and benchmarks
 
