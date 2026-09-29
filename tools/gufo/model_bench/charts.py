@@ -98,7 +98,9 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
     labels = layout.rows
     if tp2_rows and table.kind == "single":
         # TP2 continues past the depths one host has memory for.
-        labels = labels + [_depth_label(d) for d in table.spec.get("tp2_depths", [])]
+        deeper = [_depth_label(d) for d in table.spec.get("tp2_depths", [])]
+        labels = labels + [label for label in deeper
+                           if any(_number(v) is not None for v in tp2_rows.get(label, {}).values())]
 
     def tp2(header: str) -> list[tuple[str, list[float], str]]:
         values = _series(tp2_rows or {}, labels, f"{RDMA} {header}")
