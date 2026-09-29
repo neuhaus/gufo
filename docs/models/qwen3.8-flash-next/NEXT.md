@@ -22,21 +22,21 @@ Changes go to the feature branches first, then merge into `rdma`.
 
 ## Now
 
-Local, not pushed: `feat/tp2-rdma` 02d97a9 and `rdma` 5ecf598 merge upstream
-`main` with #282 (model sampling defaults); two harness conflicts resolved
-(`tools/gufo/serving_bench.py`, `tools/gufo/model_bench/llm.py`). Both build on
-the hosts; the harness test passes locally. When the hosts are free:
+`feat/tp2-rdma` 561a6fc and `rdma` 7773c75 (pushed) contain upstream `main`
+with #282 (model sampling defaults) and the fix for the rank-1 crash it caused
+(its defaults log read a scheduler rank 1 lacks). Qualified: format check, CPU
+suite, and on Q4 and Q8 MTP pairs the defaults (reproducible, equal to the
+explicit preset, differ without the presence penalty) and seeded batches.
 
-1. CPU suite and TP tests on both branches (`ctest -L cpu -LE perf`,
-   `tp_control_test`, `tp_executor_test`); a sampled TP2 request with the new
-   defaults (thinking off uses presence penalty 1.5); then push both.
-2. Reproduce the published one-host prefill: Nix build of upstream `89d58eb`
+1. Reproduce the published one-host prefill: Nix build of upstream `89d58eb`
    (the published pp's source), `model-bench run --target gufo --table
    single-ar` into a scratch `--artifacts-dir`; the published d0 pp is 1628.52.
-   Our CMake `gpu-tp2` build measured 1351 on one host (decode equal): check
-   whether the preset (gpu-test base, assertions) causes it; if so, switch
-   the units and docs to a release build with TP2.
-3. Nix build `.#tp2-rdma` of `rdma` (in `nixbox` on box1), copy its closure to
+   Our CMake `gpu-tp2` build measured 1351 on one host (decode equal). Not the
+   preset: `gpu-tp2` and `release` are both RelWithDebInfo, and the test
+   builds' `-UNDEBUG` reaches no production target. Compare the Nix build,
+   the same commit built with CMake in the container, and `gpu-tp2`, to
+   separate toolchain from code.
+2. Nix build `.#tp2-rdma` of `rdma` (in `nixbox` on box1), copy its closure to
    `~/nixroot` on both hosts (mounted at `/nix` in the rank containers), then
    run `~/claude-runs/benchrun.sh` (one host with the same binary as
    `gufo-onehost`, TP2 Q4 as `gufo-tp2`, TP2 Q8 as `gufo-tp2-q8`); update the
