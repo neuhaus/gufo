@@ -2,8 +2,8 @@
 
 TP2 runs of the published tables store their artifacts beside the one-host
 ones, under the target `gufo-tp2` (Q4) or `gufo-tp2-q8`. These tables compare
-them with a one-host run of the same build (`gufo-onehost`), or with the
-published one-host artifacts where that run is missing; the Q8 table has no
+them only with a one-host run of the same build (`gufo-onehost`): the
+published one-host rows come from another build and date. The Q8 table has no
 one-host counterpart, because the Q8 model does not fit one host.
 """
 
@@ -21,7 +21,9 @@ TP2 = "gufo-tp2"
 TP2_Q8 = "gufo-tp2-q8"
 ONE_HOST = "gufo-onehost"
 TABLES = ("single-ar-tp2", "single-mtp-tp2", "multi-ar-tp2", "multi-mtp-tp2", "tp2-q8")
-Q8_LABEL = "Flash-Next Q8 TP2"
+# Readers know the link, not the parallelism scheme: tables and charts say RDMA.
+RDMA = "Gufo RDMA"
+Q8_LABEL = "Flash-Next Q8 RDMA"
 NONE = "—"
 
 
@@ -35,9 +37,8 @@ def _one_host_depth(table: TableSpec, depth: int) -> bool:
 
 
 def _one_host(config: BenchConfig, table: TableSpec, mode: str | None = None) -> dict[str, Any] | None:
-    """The same build on one host, else the published one-host artifact."""
-    same_build = load_artifact(artifact_path(config, table, ONE_HOST, mode))
-    return same_build or load_artifact(artifact_path(config, table, "gufo", mode))
+    """The same build on one host."""
+    return load_artifact(artifact_path(config, table, ONE_HOST, mode))
 
 
 def _stat(report: dict[str, Any] | None, depth: int, key: str) -> str | None:
@@ -71,8 +72,8 @@ def render_table(config: BenchConfig, table_id: str) -> str:
         base = config.table("single-ar")
         one, two = _one_host(config, base), load_artifact(artifact_path(config, base, TP2))
         header = [f"{model_label(config, base)}<br>Depth (tokens)",
-                  "Gufo pp (tok/s)", "Gufo TP2 pp (tok/s)", "Gain",
-                  "Gufo tg (tok/s)", "Gufo TP2 tg (tok/s)", "Gain"]
+                  "Gufo pp (tok/s)", f"{RDMA} pp (tok/s)", "Gain",
+                  "Gufo tg (tok/s)", f"{RDMA} tg (tok/s)", "Gain"]
         rows = [[_depth_label(d), *_pair(_stat(one, d, "pp"), _stat(two, d, "pp"), _one_host_depth(base, d)),
                  *_pair(_stat(one, d, "tg"), _stat(two, d, "tg"), _one_host_depth(base, d))]
                 for d in depths(base)]
@@ -83,10 +84,10 @@ def render_table(config: BenchConfig, table_id: str) -> str:
         reports = [(_one_host(config, w), load_artifact(artifact_path(config, w, TP2)))
                    for w in workloads]
         header = [f"{model_label(config, base)}<br>Depth (tokens)",
-                  "Gufo pp (tok/s)", "Gufo TP2 pp (tok/s)", "Gain pp"]
+                  "Gufo pp (tok/s)", f"{RDMA} pp (tok/s)", "Gain pp"]
         for workload in workloads:
             label = workload.spec["label"]
-            header += [f"Gufo tg {label} (tok/s)", f"Gufo TP2 tg {label} (tok/s)", f"Gain {label}"]
+            header += [f"Gufo tg {label} (tok/s)", f"{RDMA} tg {label} (tok/s)", f"Gain {label}"]
         rows = []
         for depth in depths(base):
             one_host = _one_host_depth(base, depth)
@@ -101,7 +102,7 @@ def render_table(config: BenchConfig, table_id: str) -> str:
         base = config.table("multi-ar")
         one, two = _one_host(config, base, "ar"), load_artifact(artifact_path(config, base, TP2, "ar"))
         header = [f"{model_label(config, base)}<br>Users",
-                  "Gufo AR (tok/s)", "Gufo TP2 AR (tok/s)", "Gain"]
+                  "Gufo AR (tok/s)", f"{RDMA} AR (tok/s)", "Gain"]
         rows = [[str(c), *_pair(_rate(one, c), _rate(two, c))] for c in base.spec["concurrency"]]
         return _table(header, rows)
     if table_id == "multi-mtp-tp2":
@@ -113,7 +114,7 @@ def render_table(config: BenchConfig, table_id: str) -> str:
         header = [f"{model_label(config, base)}<br>Users"]
         for workload in workloads:
             label = workload.spec["label"]
-            header += [f"Gufo {label} (tok/s)", f"Gufo TP2 {label} (tok/s)", "Gain"]
+            header += [f"Gufo {label} (tok/s)", f"{RDMA} {label} (tok/s)", "Gain"]
         rows = []
         for users in base.spec["concurrency"]:
             row = [str(users)]

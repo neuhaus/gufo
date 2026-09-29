@@ -737,6 +737,9 @@ check(deep["single-ar-tp2"]["258,048"]["Gufo pp"] == "—"
       and deep["single-mtp-tp2"]["196,608"]["Gain pp"] == "—"
       and "258,048" in deep["tp2-q8"],
       "rows past one host's depths show no one-host value or gain")
+check(deep["single-ar-tp2"]["0"]["Gufo pp"] == "TODO"
+      and deep["single-ar-tp2"]["0"]["Gain"] == "TODO",
+      "RDMA tables never compare with the published one-host build")
 check(public_command(local_tp2).count("<redacted>") == 1,
       "TP2 token is redacted from the combined command")
 check("--tp-cache-reuse" not in local_tp2,

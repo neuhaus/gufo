@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import BenchConfig, TableSpec
+from .tp2 import RDMA
 from .render import MARKER_RE, _depth_label, _number, layout_for, model_label, parse_table
 
 # Categorical slots from the validated default palette: Gufo, reference, Gufo speculative.
@@ -100,8 +101,8 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
         labels = labels + [_depth_label(d) for d in table.spec.get("tp2_depths", [])]
 
     def tp2(header: str) -> list[tuple[str, list[float], str]]:
-        values = _series(tp2_rows or {}, labels, f"Gufo TP2 {header}")
-        return [("Gufo TP2", values, COLORS["tp2"])] if _has_data(values) else []
+        values = _series(tp2_rows or {}, labels, f"{RDMA} {header}")
+        return [(RDMA, values, COLORS["tp2"])] if _has_data(values) else []
 
     ref = config.reference_name
     spec_label = config.speculative["label"]
@@ -175,7 +176,7 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
             colors = ("gufo", "reference") if modes[0] == "ar" else ("spec", "ref_spec")
             series = [(layout.columns[1].header, g, COLORS[colors[0]]),
                       (layout.columns[2].header, r, COLORS[colors[1]]),
-                      *(("Gufo TP2 AR", v, c) for _, v, c in tp2("AR" if modes[0] == "ar" else spec_label))]
+                      *((f"{RDMA} AR", v, c) for _, v, c in tp2("AR" if modes[0] == "ar" else spec_label))]
         else:
             ga, ra, gs = (_series(rows, labels, h) for h in ("Gufo AR", f"{ref} AR", f"Gufo {spec_label}"))
             if not _has_data(ga, gs):
