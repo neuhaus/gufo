@@ -1,6 +1,6 @@
 # TP2 and full Q8: status and plan
 
-As of 2026-09-29. Fork-only status for two-host TP2 and full Q8; update it when
+As of 2026-09-30. Fork-only status for two-host TP2 and full Q8; update it when
 the status changes and delete what it supersedes. How TP2 works and how to
 qualify a change: [TP2.md](TP2.md); evidence: [EXPERIMENTS.md](EXPERIMENTS.md#tp2)
 and [QUALITY.md](QUALITY.md#full-q8).
@@ -61,6 +61,20 @@ explicit preset, differ without the presence penalty) and seeded batches.
 6. **Poisoned pair**: two production crashes (2026-09-28) were not
    reproduced by a 10-minute cancel storm; the first poisoning error is now
    logged (`event=tp_worker_failed reason=…`).
+7. **TP2 over USB4**: thunderbolt-ibverbs with block-striped RDMA writes over
+   two USB4 cables (4 DMA rings, 44 Gbit/s one way, 85 both ways; not yet
+   published) runs TP2 unchanged through `--tp-rdma-device` (RoCE v2 GID),
+   with output identical to InfiniBand. Q4, 25.8k-token prompt, 3 samples
+   each: prefill 1824 against 1892 tok/s, decode 32.6 against 34.5 tok/s.
+   The gap is per-exchange latency, not bandwidth: its provider polls the CQ
+   by system call. Gufo-side candidates, to measure first: signal only every
+   n-th write so the comm thread polls fewer completions; keep the exchange
+   windows page-aligned for the driver's planned zero-copy send. One QP per
+   rail device (4 QPs, each exchange split four ways, as NCCL does with
+   several HCAs) would reach about 40 Gbit/s on the unmodified driver too,
+   but gains nothing on the striping driver and multiplies completions; it
+   pays only if the striping stays out of upstream. Bound first: perftest
+   4 QPs on 4 devices against 1 striped QP at 3.4 MB and 10 KiB.
 
 ## Not verified
 
