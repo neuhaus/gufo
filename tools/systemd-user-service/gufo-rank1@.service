@@ -13,11 +13,16 @@
 # tagged with this unit in the journal.
 [Unit]
 Description=Gufo TP=2 two-host LLM server worker, rank 1 %i
+# A failing start check repeats three times at most per minute.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=exec
 Restart=on-failure
 RestartSec=5
+# gufo exits with 2 on invalid options, which a restart does not fix
+RestartPreventExitStatus=2
 TimeoutStopSec=5min
 SyslogIdentifier=gufo-rank1
 ExecStartPre=/bin/sh -c '[ -n "$GUFO_HEAD_HOST" ] && [ -n "$GUFO_MODEL" ] && [ -s %t/gufo.token ] || \

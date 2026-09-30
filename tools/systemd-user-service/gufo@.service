@@ -24,11 +24,16 @@
 # (gufo@.service.d/local.conf) with Conflicts=<unit>.
 [Unit]
 Description=Gufo TP=2 two-host LLM server, %i (rank 0)
+# A failing start check repeats three times at most per minute.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=exec
 Restart=on-failure
 RestartSec=5
+# gufo exits with 2 on invalid options, which a restart does not fix
+RestartPreventExitStatus=2
 TimeoutStopSec=5min
 SyslogIdentifier=gufo-rank0
 EnvironmentFile=%h/.config/gufo/head.env
@@ -36,8 +41,9 @@ ExecStartPre=/bin/sh -c 'umask 077; od -An -tx1 -N24 /dev/urandom | tr -dc 0-9a-
 # The worker connects to this host's address on the RDMA link: GUFO_TP_ADDR,
 # or the IPv4 address of GUFO_TP_NETDEV, or of the netdev of the only active
 # RDMA port 1 (the port the verbs communicator uses). With GUFO_TP_RDMA_DEVICE
-# set, or no unique RDMA netdev, it is the address the peer's ssh connection
-# came from, since a USB4 rail's RoCE netdev may be a local dummy. Only TCP
+# set, or no unique RDMA netdev on real hardware, it is the address the peer's
+# ssh connection came from, since a USB4 rail's RoCE netdev may be a local
+# dummy. Only TCP
 # (bootstrap and control) uses this address; the exchanges use the device.
 ExecStartPre=/bin/sh -c '\
   var=GUFO_MODEL_$(echo %i | tr a-z- A-Z_); model=$(printenv $var); \
@@ -52,6 +58,7 @@ ExecStartPre=/bin/sh -c '\
     dev=$(rdma link show 2>/dev/null | grep "/1 " | grep "state ACTIVE" | sed -n "s/.* netdev \\([^ ]*\\).*/\\1/p" | sort -u); \
     [ -n "$dev" ] || dev=$(for n in /sys/class/net/*; do [ -d "$n/device/infiniband" ] && [ "$(cat "$n/dev_port" 2>/dev/null)" = 0 ] && basename "$n"; done); \
     [ "$(echo "$dev" | wc -w)" -eq 1 ] || dev=; \
+    [ -z "$dev" ] || [ -e "/sys/class/net/$dev/device" ] || dev=; \
   fi; \
   [ -n "$addr" ] || [ -z "$dev" ] || addr=$(ip -o -4 addr show dev "$dev" | awk "{print \\$4}" | cut -d/ -f1 | head -n 1); \
   [ -n "$addr" ] || [ -z "$dev" ] || { echo "no IPv4 address on $dev: set GUFO_TP_ADDR" >&2; exit 1; }; \
