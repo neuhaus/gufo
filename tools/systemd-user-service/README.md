@@ -55,7 +55,8 @@ If another local user unit claims the GPU, add a drop-in
   ```
 - the RDMA device nodes under `/dev/infiniband`; the units pass the whole
   directory, so gufo can pick any device with `--tp-rdma-device`
-- models under `/opt/models` at the same paths (mounted read-only)
+- the models in one directory at the same path on both hosts
+  (`GUFO_MODEL_DIR`, default `/opt/models`; mounted read-only)
 - on the head host: passwordless ssh to the worker host, and `rdma` and `ip`
   (iproute2) to find its RDMA-link address
 
@@ -89,8 +90,8 @@ ssh <worker-host> journalctl --user -u gufo-rank1@q8 -f  # rank 1 logs
 ```
 
 `head.env` names one model per quantization (`GUFO_MODEL_Q8`,
-`GUFO_MODEL_Q4`, ...); the instance name selects it, and the head hands it to
-the worker. Model load takes ~25 s per rank; the server answers
+`GUFO_MODEL_Q4`, ...) relative to `GUFO_MODEL_DIR`; the instance name selects
+it, and the head hands it to the worker. Model load takes ~25 s per rank; the server answers
 `http://<head>:8000/v1/models` ~1 minute after `start`.
 
 ## Disk cache
