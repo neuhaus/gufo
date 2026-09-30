@@ -21,25 +21,27 @@ RestartSec=5
 TimeoutStopSec=5min
 SyslogIdentifier=gufo-rank1
 ExecStartPre=/bin/sh -c '[ -n "$GUFO_HEAD_HOST" ] && [ -n "$GUFO_MODEL" ] && [ -s %t/gufo.token ] || \
-  { echo "no settings from the rank 0 host: start gufo@%i there" >&2; exit 1; }'
+  { echo "no settings from the rank 0 host: start gufo@%i there" >&2; exit 1; }; \
+  [ -z "$GUFO_TP_RDMA_DEVICE" ] || [ -e "/sys/class/infiniband/$GUFO_TP_RDMA_DEVICE" ] || \
+    { echo "no RDMA device $GUFO_TP_RDMA_DEVICE (is its driver loaded?)" >&2; exit 1; }'
 ExecStartPre=/bin/sh -c 'cache=$${GUFO_CACHE_DIR:-$HOME/.cache}; \
   mkdir -p "$cache/gufo-tp2/%i" "$cache/gufo"'
-ExecStart=/bin/sh -c 'checkout=$${GUFO_CHECKOUT:-$HOME/git/gufo}; cache=$${GUFO_CACHE_DIR:-$HOME/.cache}; \
+ExecStart=/bin/sh -c 'dir=$${GUFO_MODEL_DIR:-/opt/models}; checkout=$${GUFO_CHECKOUT:-$HOME/git/gufo}; cache=$${GUFO_CACHE_DIR:-$HOME/.cache}; \
   exec podman run --rm --log-driver none --security-opt label=disable \
   --userns keep-id:uid=1000,gid=1000 \
   --device /dev/kfd --device /dev/dri \
-  --device /dev/infiniband \
+  --device /dev/infiniband $${GUFO_RDMA_DRIVERS:+-v "$${GUFO_RDMA_DRIVERS%%/*}:$${GUFO_RDMA_DRIVERS%%/*}:ro" -e RDMAV_DRIVERS=$GUFO_RDMA_DRIVERS} \
   --group-add keep-groups --ulimit memlock=-1 --network host \
-  -v "$checkout:/workspace/gufo:ro" -v /opt/models:/opt/models:ro \
+  -v "$checkout:/workspace/gufo:ro" -v "$dir:$dir:ro" \
   -v "$cache/gufo-tp2/%i:/cache" \
   -v "$cache/gufo:/xdg-cache/gufo" -e XDG_CACHE_HOME=/xdg-cache \
   -w /workspace/gufo $GUFO_IMAGE build/gpu-tp2/gufo serve llm \
-  --model $GUFO_MODEL \
-  --speculative mtp --mtp-model $GUFO_MTP_MODEL \
+  --model "$dir/$GUFO_MODEL" \
+  --speculative mtp --mtp-model "$dir/$GUFO_MODEL_MTP" \
   --draft-tokens 7 \
   --cache-disk /cache --cache-disk-bytes "$${GUFO_CACHE_DISK_BYTES:-68719476736}" \
   --sessions $GUFO_SESSIONS --max-pending $GUFO_MAX_PENDING \
-  --served-model-name qwen3.8-flash-next \
   --tp-world-size 2 --tp-rank 1 --tp-bootstrap-host $GUFO_HEAD_HOST \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
+  $${GUFO_TP_RDMA_DEVICE:+--tp-rdma-device $GUFO_TP_RDMA_DEVICE} \
   --tp-control-token "$(cat %t/gufo.token)"'
