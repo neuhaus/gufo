@@ -49,7 +49,7 @@ ExecStartPre=/bin/sh -c '\
   var=GUFO_MODEL_$(echo %i | tr a-z- A-Z_); model=$(printenv $var); \
   [ -n "$model" ] || { echo "head.env sets no $var for gufo@%i" >&2; exit 1; }; \
   dir=$${GUFO_MODEL_DIR:-/opt/models}; \
-  for f in "$model" "$GUFO_MODEL_MTP"; do [ -e "$dir/$f" ] || \
+  for f in "$model" "$GUFO_MODEL_MTP" $${GUFO_MODEL_MMPROJ}; do [ -e "$dir/$f" ] || \
     { echo "no model file $dir/$f" >&2; exit 1; }; done; \
   [ -z "$GUFO_TP_RDMA_DEVICE" ] || [ -e "/sys/class/infiniband/$GUFO_TP_RDMA_DEVICE" ] || \
     { echo "no RDMA device $GUFO_TP_RDMA_DEVICE (is its driver loaded?)" >&2; exit 1; }; \
@@ -68,6 +68,7 @@ ExecStartPre=/bin/sh -c '\
     systemctl --user stop \\"gufo-rank1@*.service\\"; \
     systemctl --user set-environment GUFO_HEAD_HOST=$addr GUFO_IMAGE=$GUFO_IMAGE \
       GUFO_MODEL_DIR=$GUFO_MODEL_DIR GUFO_MODEL=$model GUFO_MODEL_MTP=$GUFO_MODEL_MTP \
+      GUFO_MODEL_MMPROJ=$GUFO_MODEL_MMPROJ \
       GUFO_SESSIONS=$GUFO_SESSIONS GUFO_MAX_PENDING=$GUFO_MAX_PENDING \
       GUFO_CACHE_DISK_BYTES=$GUFO_CACHE_DISK_BYTES \
       GUFO_CHECKOUT=$GUFO_CHECKOUT GUFO_CACHE_DIR=$GUFO_CACHE_DIR \
@@ -88,6 +89,7 @@ ExecStart=/bin/sh -c 'model=$(printenv GUFO_MODEL_$(echo %i | tr a-z- A-Z_)); \
   -w /workspace/gufo $GUFO_IMAGE build/gpu-tp2/gufo serve llm \
   --model "$dir/$model" \
   --speculative mtp --mtp-model "$dir/$GUFO_MODEL_MTP" \
+  $${GUFO_MODEL_MMPROJ:+--mmproj "$dir/$GUFO_MODEL_MMPROJ"} \
   --draft-tokens 7 \
   --cache-disk /cache --cache-disk-bytes "$${GUFO_CACHE_DISK_BYTES:-68719476736}" \
   --sessions $GUFO_SESSIONS --max-pending $GUFO_MAX_PENDING \

@@ -43,6 +43,7 @@ ExecStart=/bin/sh -c 'dir=$${GUFO_MODEL_DIR:-/opt/models}; checkout=$${GUFO_CHEC
   -w /workspace/gufo $GUFO_IMAGE build/gpu-tp2/gufo serve llm \
   --model "$dir/$GUFO_MODEL" \
   --speculative mtp --mtp-model "$dir/$GUFO_MODEL_MTP" \
+  $${GUFO_MODEL_MMPROJ:+--mmproj "$dir/$GUFO_MODEL_MMPROJ"} \
   --draft-tokens 7 \
   --cache-disk /cache --cache-disk-bytes "$${GUFO_CACHE_DISK_BYTES:-68719476736}" \
   --sessions $GUFO_SESSIONS --max-pending $GUFO_MAX_PENDING \
