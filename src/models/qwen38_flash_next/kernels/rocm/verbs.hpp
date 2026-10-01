@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
@@ -15,11 +16,18 @@ struct IbrverbsConfig {
   /// TCP bootstrap address used by rank 1. Rank 0 binds to all interfaces.
   std::string bootstrap_host;
   std::uint16_t bootstrap_port{18515};
+  /// HIP device index.
   std::uint32_t device_index{0};
-  std::uint32_t gid_index{0};
+  /// RDMA device (HCA) name; empty selects the host's only one.
+  std::string rdma_device;
+  std::uint32_t rdma_port{1};
+  /// GID table index; unset uses 0 on InfiniBand and, on RoCE, the port's
+  /// RoCE v2 GID (see SelectRoceV2Gid).
+  std::optional<std::uint32_t> gid_index;
 };
 
-/// Creates a two-rank RC communicator. Each exchange is one RDMA write with
+/// Creates a two-rank RC communicator over native InfiniBand or RoCE v2; both
+/// ranks must use the same link layer. Each exchange is one RDMA write with
 /// immediate data of a header and the partial into the peer's next receive
 /// window; completions arrive through an event-driven completion channel,
 /// and the bootstrap socket stays open only to detect a lost peer. Overlapped

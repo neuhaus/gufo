@@ -1,6 +1,7 @@
 # Qwen3.8-Flash-Next TP=2
 
-Two-host tensor-parallel serving over InfiniBand RDMA. It serves Q4 and full
+Two-host tensor-parallel serving over RDMA: native InfiniBand, RoCE v2, or USB4
+cables as RoCE v2 devices ([below](#usb4)). It serves Q4 and full
 Q8, AR and MTP, images, concurrent requests and history reuse. It needs
 libibverbs and the build option `GUFO_ENABLE_TP2_RDMA` (off by default). Its
 measurements are in [EXPERIMENTS.md](EXPERIMENTS.md#tp2), not in the published
@@ -36,6 +37,39 @@ build/gpu-tp2/gufo serve llm --model "$MODEL" --speculative mtp --mtp-model "$MT
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
   --tp-control-token SHARED_TOKEN --sessions 4
 ```
+
+The link uses port 1 of the host's only RDMA device; `--tp-rdma-device NAME`
+and `--tp-rdma-port N` choose another. On InfiniBand it uses GID 0; on RoCE
+(an Ethernet link layer) the port's RoCE v2 GID, preferring its IPv4 address's
+GID. `--tp-gid-index` overrides that, and is needed when the port has several
+candidates. Both ranks must use the same link layer. Each rank logs its choice as
+`event=rdma_ready`. RoCE v2 is qualified over USB4 only.
+
+### USB4
+
+Two Strix Halo hosts linked by USB4 cables can run TP2 without network cards:
+[thunderbolt-ibverbs](https://github.com/neuhaus/donnerkeule/tree/feat/write-striping)
+turns each cable's DMA rings into RoCE v2 RDMA devices. Its write striping
+spreads Gufo's single QP over every ring of every cable to the other host;
+without it a QP stays on one ring (about 10 Gbit/s). With two 40 Gb/s cables
+it reaches 44 Gbit/s one way. Load it with an IPv4 address on its
+`roce_netdev` (a dummy netdev will do) and pick any of its devices:
+
+```sh
+sudo ip link add tbv0 type dummy
+sudo ip addr add 10.77.0.1/24 dev tbv0 && sudo ip link set tbv0 up   # .2 on rank 1
+sudo modprobe thunderbolt_ibverbs profile=linux_perf tbnet=prefer_rdma \
+  lanes=2 register_verbs=1 roce_netdev=tbv0 native_write_striping=1
+ibv_devices                        # usb4_rdma0 .. usb4_rdma3 with two cables
+build/gpu-tp2/gufo serve llm ... --tp-rdma-device usb4_rdma0
+```
+
+Both ranks produce output identical to InfiniBand. Against FDR InfiniBand
+(ConnectX-3, PCIe 3.0 x4), Q4 with a 25.8k-token prompt prefilled at 1824
+against 1892 tok/s and decoded at 32.6 against 34.5 tok/s; USB4 costs more
+CPU (several cores in kernel workers) and latency per exchange. The links
+must train at 2 × 20 Gb/s; check `rx_speed` and `rx_lanes` in
+`/sys/bus/thunderbolt/devices/*/` after plugging.
 
 Sampling, streaming, stop sequences, tool calls, images (`--mmproj` on both
 ranks), cancellation, `--request-timeout-ms`, history reuse and the disk cache

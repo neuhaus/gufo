@@ -33,7 +33,8 @@ C1 workload. Audio excludes loading.
 Each model guide lists the required files and complete benchmark settings.
 
 **Two hosts.** Qwen3.8 Flash-Next can also run across two Strix Halo hosts
-connected by InfiniBand, with tensor parallelism over RDMA (TP2): faster
+connected by InfiniBand, RoCE v2 or USB4 cables, with tensor parallelism over
+RDMA (TP2): faster
 decode and prefill than one host, and room for checkpoints that do not fit one.
 It is the only model with multi-host support so far and needs an optional build
 with libibverbs (`-DGUFO_ENABLE_TP2_RDMA=ON`); see
