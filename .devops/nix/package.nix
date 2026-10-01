@@ -8,6 +8,7 @@
   curl,
   libpng,
   libjpeg,
+  libwebp,
   openssl,
   ffmpeg-headless,
   rocmPackages,
@@ -66,6 +67,7 @@ stdenv.mkDerivation {
     curl
     libpng
     libjpeg
+    libwebp
     openssl
     ffmpeg-headless
     rocmPackages.clr
