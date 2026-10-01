@@ -111,3 +111,19 @@ benchmark and numerical quality tests; they do not establish upstream model
 parity. Sampled DSpark may differ across concurrency levels; fixed-path replay
 and greedy equality remain checked. API behavior and references are in
 [SERVER.md](../../docs/SERVER.md).
+
+For an already running TP2 pair, `tp2_constraints.py` checks automatic and
+required tools, JSON schemas, streaming, concurrent constraints and a mixed
+constrained/unconstrained cohort. Start an isolated pair with at least two
+sessions and thinking disabled, then run once with `--speculative off` and once
+with `--speculative mtp`, matching the server's loaded mode:
+
+```sh
+python3 tests/functional/tp2_constraints.py --url http://127.0.0.1:8100 \
+  --speculative mtp --output /tmp/tp2-constraints-mtp
+```
+
+The report retains every response and its per-request timings. Constrained
+requests must propose zero drafts; the plain MTP control must propose drafts.
+Retain both ranks' server logs alongside the report to verify the loaded mode
+and rank agreement.
