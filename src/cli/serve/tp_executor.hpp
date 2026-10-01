@@ -166,6 +166,10 @@ public:
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override;
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override;
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override;
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override;
+  [[nodiscard]] sampling::JsonConstraint::ToolFormat ToolFormat()
+      const override;
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override;
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(

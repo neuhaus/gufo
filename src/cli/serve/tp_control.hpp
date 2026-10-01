@@ -156,6 +156,11 @@ struct TpControlCommand {
   /// same sampler for multi-token decoding, and checks rank 0's tokens against
   /// its own choice only when this is greedy.
   sampling::SamplingConfig sampling{};
+  /// kSingle only: decoding is constrained (structured output or a tool
+  /// call). The constraint itself stays on rank 0, which selects every token,
+  /// so rank 1 neither checks rank 0's greedy choices nor runs multi-token
+  /// cycles for the request. Set on the wire when `sampling` has a constraint.
+  bool constrained{false};
   /// kInstruction only. An instruction belongs to the `kSingle` request named
   /// by `sequence`, or with sequence 0 to none (a reset or drop between
   /// requests) or to the requests its batch names, and carries no request

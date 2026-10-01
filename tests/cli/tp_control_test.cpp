@@ -197,6 +197,21 @@ int main() {
     std::string why;
     Require(!server->SendCommand(invalid, &why) && !why.empty(),
             "TP C1 command with invalid sampling is refused");
+    Require(!got.constrained, "TP C1 command is unconstrained by default");
+
+    // Rank 1 must know a request is constrained: rank 0 then picks every
+    // token itself, so rank 1 neither checks its greedy choice nor decodes
+    // multi-token cycles.
+    TpControlCommand constrained = command;
+    constrained.sequence = 9;
+    constrained.constrained = true;
+    Require(server->SendCommand(constrained, &server_error), server_error);
+    TpControlCommand got_constrained;
+    Require(client->ReceiveCommand(&got_constrained, &client_error),
+            client_error);
+    Require(got_constrained.constrained &&
+                got_constrained.sampling.can_use_unmodified_argmax(),
+            "TP C1 command carries the constraint flag apart from sampling");
   }
 
   // An instruction is one model call for rank 1 to execute within the request

@@ -27,7 +27,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 15;         // requests and rank-1 executor
+constexpr std::uint16_t kVersion = 16;         // requests and rank-1 executor
                                                // instructions for concurrent
                                                // requests
 constexpr std::uint16_t kHello = 1;
@@ -146,7 +146,8 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
   return command.max_tokens != 0 || command.cache_prompt ||
          command.cache_prefix_tokens != 0 || !command.prompt_tokens.empty() ||
          !command.client_id.empty() || !command.prompt_context.empty() ||
-         !IsDefaultSampling(command.sampling);
+         !IsDefaultSampling(command.sampling) || command.constrained ||
+         command.sampling.constraint != nullptr;
 }
 
 [[nodiscard]] std::uint32_t FloatBits(float value) {
@@ -774,6 +775,8 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU64(&payload, config.repeat_last_n);
     AppendU32(&payload, FloatBits(config.frequency_penalty));
     AppendU32(&payload, FloatBits(config.presence_penalty));
+    AppendU32(&payload,
+              command.constrained || config.constraint != nullptr ? 1U : 0U);
   } else {
     const auto& instruction = command.instruction;
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.op));
@@ -878,6 +881,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
     std::uint64_t repeat_last_n = 0;
     std::uint32_t frequency_penalty = 0;
     std::uint32_t presence_penalty = 0;
+    std::uint32_t constrained = 0;
     if (!ReadU32(command_prompt_, &offset, &temperature, error) ||
         !ReadU32(command_prompt_, &offset, &top_k, error) ||
         !ReadU32(command_prompt_, &offset, &top_p, error) ||
@@ -887,9 +891,14 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &repeat_penalty, error) ||
         !ReadU64(command_prompt_, &offset, &repeat_last_n, error) ||
         !ReadU32(command_prompt_, &offset, &frequency_penalty, error) ||
-        !ReadU32(command_prompt_, &offset, &presence_penalty, error)) {
+        !ReadU32(command_prompt_, &offset, &presence_penalty, error) ||
+        !ReadU32(command_prompt_, &offset, &constrained, error)) {
       return reject("TP control request sampling is truncated");
     }
+    if (constrained > 1) {
+      return reject("TP control request constraint flag is invalid");
+    }
+    parsed.constrained = constrained != 0;
     config.temperature = BitsFloat(temperature);
     config.top_k = static_cast<std::int32_t>(top_k);
     config.top_p = BitsFloat(top_p);
