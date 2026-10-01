@@ -4332,10 +4332,10 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
       request.client_id.empty() ? "anonymous" : request.client_id;
   if (state->control != nullptr) {
     return impl_->StartTpRequest(
-        state, std::move(prompt->tokens), max_tokens, sampling_config,
+        state, std::move(prompt->tokens), max_tokens, effective_sampling,
         is_cancelled, stream_output, client_id, request.stop_sequences,
-        state->scheduler->runner().InitialOutputState(request), request_start,
-        request.cache_prompt, prompt->cache_prefix_tokens,
+        state->scheduler->runner().InitialOutputState(effective_request),
+        request_start, request.cache_prompt, prompt->cache_prefix_tokens,
         std::move(prompt->context));
   }
   auto scheduled_request = state->scheduler->Submit(

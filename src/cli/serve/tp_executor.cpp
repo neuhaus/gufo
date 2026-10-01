@@ -634,6 +634,15 @@ std::vector<TextExecutionPlan> TpMirroredRunner::SupportedPlans() const {
   return inner_->SupportedPlans();
 }
 
+std::shared_ptr<const sampling::ConstraintVocabulary>
+TpMirroredRunner::BuildConstraintVocabulary() const {
+  return inner_->BuildConstraintVocabulary();
+}
+
+sampling::JsonConstraint::ToolFormat TpMirroredRunner::ToolFormat() const {
+  return inner_->ToolFormat();
+}
+
 std::vector<TextRunnerToken> TpMirroredRunner::Tokenize(
     std::string_view text) const {
   return inner_->Tokenize(text);
@@ -821,7 +830,11 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
   // through the base implementation instead, which selects here, on rank 0
   // only, and mirrors the `Advance`; forwarding it to the wrapped runner would
   // let that `Advance` bypass this wrapper.
-  if (max_tokens < 2 || !multi_token_decode_) {
+  // A constrained request (structured output, tool calls) also runs one
+  // token at a time: its constraint stays on rank 0, so rank 1 could not make
+  // a cycle's draft and acceptance decisions.
+  if (max_tokens < 2 || !multi_token_decode_ ||
+      sampler.config().constraint != nullptr) {
     return TextModelRunner::DecodeStep(state, max_tokens, sampler);
   }
   auto& mirrored = Mirrored(state);
@@ -849,7 +862,12 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
 
 std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
     std::span<const TextRunnerDecode> decodes) const {
-  if (decodes.size() < 2 || !multi_token_decode_) {
+  if (decodes.size() < 2 || !multi_token_decode_ ||
+      std::ranges::any_of(decodes, [](const TextRunnerDecode& decode) {
+        return decode.sampler.get().config().constraint != nullptr;
+      })) {
+    // The base batch runs each member's DecodeStep, which takes constrained
+    // members one token at a time.
     return TextModelRunner::DecodeBatch(decodes);
   }
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
@@ -1247,7 +1265,8 @@ struct TpExecutor::Request {
   Request(const TpControlCommand& begin, std::vector<TextRunnerToken> tokens,
           std::size_t states)
       : prompt(std::move(tokens)),
-        greedy(begin.sampling.can_use_unmodified_argmax()),
+        greedy(begin.sampling.can_use_unmodified_argmax() &&
+               !begin.constrained),
         sampler(begin.sampling, prompt),
         own(states) {}
 
