@@ -193,7 +193,7 @@ int main() {
                 received.sampling.can_use_unmodified_argmax(),
             "TP C1 command preserves the sampling configuration");
     TpControlCommand invalid = sampled;
-    invalid.sampling.top_p = 0.0F;
+    invalid.sampling.top_p = 1.5F;
     std::string why;
     Require(!server->SendCommand(invalid, &why) && !why.empty(),
             "TP C1 command with invalid sampling is refused");
