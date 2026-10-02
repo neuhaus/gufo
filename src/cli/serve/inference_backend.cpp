@@ -3958,8 +3958,15 @@ bool InferenceBackend::load(
     new_state->tp_max_requests =
         session_count + scheduler_policy.max_pending_requests;
     if (tp_world_size > 1) {
+      // Each rank offers its own RAM-cache limit and the pair uses the
+      // smaller one, so a limit above the automatic budget needs the same
+      // --cache-ram-bytes on both ranks.
       const TpControlConfig control_config{
-          .snapshot_budget_bytes = HostSnapshotBudgetBytes(),
+          .snapshot_budget_bytes =
+              ram_cache_config.capacity_bytes == 0
+                  ? HostSnapshotBudgetBytes()
+                  : std::min<std::uint64_t>(ram_cache_config.capacity_bytes,
+                                            HostSnapshotCeilingBytes()),
           .rank = tp_rank,
           .world_size = tp_world_size,
           .max_context = max_context,

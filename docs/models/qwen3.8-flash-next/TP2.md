@@ -74,6 +74,8 @@ must train at 2 × 20 Gb/s; check `rx_speed` and `rx_lanes` in
 Sampling, streaming, stop sequences, tool calls, images (`--mmproj` on both
 ranks), cancellation, `--request-timeout-ms`, history reuse and the disk cache
 (`--cache-disk` on both ranks, each on its own disk) work as on one host.
+A RAM cache above the automatic budget needs the same `--cache-ram-bytes` on
+both ranks; the pair uses the smaller of the two ranks' limits.
 Cancellations and timeouts take effect between model calls, so a long prefill
 stops at its next chunk. Up to `--sessions` requests run at once, their
 decoders batched; more wait up to `--max-pending`, the rest get HTTP 429.
@@ -137,7 +139,8 @@ configuration and prepared images) and closes with `kEnd`. Mirrored calls:
   can reset the state);
 - snapshot, restore, prefix reuse and cancellation preparation, each
   acknowledged by rank 1 before rank 0 continues; snapshot bytes stay on each
-  host, and the budget is the smaller host's.
+  host, and the budget is the smaller rank's (its automatic budget, or its
+  `--cache-ram-bytes`).
 
 Every model call binds the communicator's scope to its instruction's index on
 both ranks. Rules the compiler does not enforce: every state-changing call must

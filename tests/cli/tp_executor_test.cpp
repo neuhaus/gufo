@@ -101,6 +101,8 @@ struct ToyOptions {
   bool fail_capture_once{false};
   bool fail_restore_once{false};
   std::size_t cache_budget{4096};
+  /// Most an explicit RAM-cache limit may claim, if offered.
+  std::optional<std::size_t> cache_ceiling;
   std::function<void()> capture_hook;
   /// Runs before every prefill chunk.
   std::function<void()> prefill_hook;
@@ -235,6 +237,7 @@ public:
             .temporary_scratch_bytes = 0,
             .retained_snapshot_capacity_bytes =
                 options_.cache ? options_.cache_budget : 0U,
+            .retained_snapshot_ceiling_bytes = options_.cache_ceiling,
             .requires_device_runtime_lock = true};
   }
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
@@ -1077,6 +1080,19 @@ int main() {
             respond, &error) &&
             error.find("not open") != std::string::npos,
         "a batch member of an unknown request is a protocol failure: " + error);
+  }
+
+  // Rank 1 holds the other half of every snapshot, so an explicit RAM-cache
+  // limit cannot claim more than the budget both ranks agreed on.
+  {
+    auto toy = std::make_shared<ToyRunner>(ToyOptions{
+        .cache = true, .cache_budget = 4096, .cache_ceiling = 65536});
+    const TpMirroredRunner runner(toy, std::make_shared<CaptureSink>(), 8192);
+    const auto claim = runner.ResourceClaim();
+    Require(claim.retained_snapshot_capacity_bytes == 4096,
+            "the automatic budget stays below the agreed one");
+    Require(claim.retained_snapshot_ceiling_bytes == 8192,
+            "the explicit-limit ceiling is the agreed budget");
   }
 
   // The mirrored runner alone: every call belongs to the request its state is
