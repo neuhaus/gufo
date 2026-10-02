@@ -96,7 +96,9 @@ std::optional<ChatRequest> ConstrainChatRequest(
   if (!request.tools.empty() &&
       request.tool_choice != ChatRequest::ToolChoice::kNone) {
     std::vector<sampling::JsonConstraint::Tool> tools;
-    std::vector<sampling::JsonConstraint::Tool> native_tools;
+    std::vector<std::pair<json::Value, bool>> schemas;
+    const bool required =
+        request.tool_choice == ChatRequest::ToolChoice::kRequired;
     auto format = runner.ToolFormat();
     for (const auto& tool : request.tools) {
       const auto definition = tool.definition_json.empty()
@@ -106,49 +108,22 @@ std::optional<ChatRequest> ConstrainChatRequest(
       const auto* strict = function ? function->find("strict") : nullptr;
       const bool enforce = strict && strict->as_bool();
       auto schema = json::parse(tool.parameters_json);
-      const auto* properties = schema.find("properties");
-      const auto* additional = schema.find("additionalProperties");
-      const bool untyped = !enforce && (!properties || properties->empty()) &&
-                           (!additional || additional->is_bool());
-      if (!enforce) {
-        if (!schema.contains("type"))
-          schema["type"] = "object";
-        if (!schema.contains("properties"))
-          schema["properties"] = json::Value::object();
-        if (!schema.contains("additionalProperties"))
-          schema["additionalProperties"] = false;
-      }
-      std::shared_ptr<const sampling::JsonConstraint> arguments;
-      std::shared_ptr<const sampling::JsonConstraint> native;
-      try {
-        arguments = sampling::JsonConstraint::Compile(schema, enforce);
-        native =
-            sampling::JsonConstraint::ToolParameters(schema, enforce, format);
-      } catch (const std::invalid_argument&) {
-        if (enforce)
-          throw;
-        // Non-strict tool parameters are guidance, unlike response_format.
-        // An unrestricted/unsupported tool schema must not prevent a valid
-        // structured answer. Keep the declared tool name and JSON arguments.
-        arguments = sampling::JsonConstraint::Object();
-        // An untyped non-strict tool already uses best-effort native values.
-        // Preserve that template: injecting a competing JSON envelope changes
-        // the prompt, cache identity and even whether the model ends its turn.
-        if (untyped)
-          native = sampling::JsonConstraint::OpenToolParameters(format);
-      }
-      tools.emplace_back(tool.name, std::move(arguments));
-      native_tools.emplace_back(tool.name, std::move(native));
+      auto native = sampling::JsonConstraint::ToolParameters(schema, enforce,
+                                                             format, required);
+      tools.emplace_back(tool.name, std::move(native));
+      schemas.emplace_back(std::move(schema), enforce);
     }
-    if (std::ranges::all_of(native_tools, [](const auto& tool) {
-          return tool.second != nullptr;
-        }))
-      tools = std::move(native_tools);
-    else
+    if (std::ranges::any_of(
+            tools, [](const auto& tool) { return tool.second == nullptr; })) {
       format = sampling::JsonConstraint::ToolFormat::kJson;
+      // Compile the fallback only when native parameter tags cannot represent
+      // these values. Normal native requests reuse the cached grammar directly.
+      for (std::size_t i = 0; i < tools.size(); ++i)
+        tools[i].second = sampling::JsonConstraint::ToolParameters(
+            schemas[i].first, schemas[i].second, format);
+    }
     grammar = sampling::JsonConstraint::WithTools(
-        grammar, std::move(tools),
-        request.tool_choice == ChatRequest::ToolChoice::kRequired,
+        grammar, std::move(tools), required,
         !request.response_format && request.parallel_tool_calls, format);
     if (format == sampling::JsonConstraint::ToolFormat::kJson)
       instruction +=
@@ -492,6 +467,9 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
            << "state_abi=" << state_abi << '\n'
            << "payload_layout=qwen-gfx1151-live-prefix-v3\n"
+           // Older learned boundaries could keep logits from an earlier
+           // prefix. Their payload has no readiness tag to distinguish them.
+           << "checkpoint_frontier=complete-prefix-v1\n"
            << "numerics=qwen-bf16-fp32-prefill-v1\n"
            << "rmsnorm=fused-square-sum-v1\n"
            << "prefill_attention=visible-causal-tail-v1\n"
@@ -1100,12 +1078,18 @@ public:
     if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
       capacity = free_bytes;
     }
+    // Snapshot buffers are device allocations, but on a unified-memory APU
+    // they are carved from the same RAM as every host allocation, and HIP's
+    // free figure does not see host pressure. Cap them by the host budget too.
+    std::size_t snapshot_capacity = HostSnapshotBudgetBytes();
+    if (capacity.has_value())
+      snapshot_capacity = std::min(snapshot_capacity, *capacity);
     return {
         .resident_weights_bytes = resident_weights,
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = usage.request_state_bytes,
         .temporary_scratch_bytes = usage.temporary_scratch_bytes,
-        .retained_snapshot_capacity_bytes = capacity,
+        .retained_snapshot_capacity_bytes = snapshot_capacity,
         .requires_device_runtime_lock = true,
     };
   }
@@ -3430,6 +3414,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
+                            TextRunnerRamCacheOptions ram_cache_config,
                             const TextTpConfig& tp_config) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
@@ -3511,7 +3496,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config));
+                std::move(resolved_disk_cache_config), ram_cache_config);
   }
   if (architecture == "qwen4exp") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
@@ -3585,7 +3570,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config), tp_config);
+                std::move(resolved_disk_cache_config), ram_cache_config,
+                tp_config);
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
@@ -3617,7 +3603,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
-              std::move(resolved_disk_cache_config));
+              std::move(resolved_disk_cache_config), ram_cache_config);
 #else
   (void)model_path;
   (void)max_context;
@@ -3627,6 +3613,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)speculative_config;
   (void)disk_cache_config;
   (void)vision_model_path;
+  (void)ram_cache_config;
   (void)tp_config;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
@@ -3640,7 +3627,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
-                            TextDiskCacheConfig disk_cache_config) {
+                            TextDiskCacheConfig disk_cache_config,
+                            TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
@@ -3761,7 +3749,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     Logger::Info("loader",
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache));
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -3780,7 +3769,8 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config) {
+    TextDiskCacheConfig disk_cache_config,
+    TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "DeepSeek model must not be null");
     return false;
@@ -3846,7 +3836,8 @@ bool InferenceBackend::load(
       };
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache));
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
@@ -3865,7 +3856,8 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config, const TextTpConfig& tp_config) {
+    TextDiskCacheConfig disk_cache_config,
+    TextRunnerRamCacheOptions ram_cache_config, const TextTpConfig& tp_config) {
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
@@ -4014,7 +4006,8 @@ bool InferenceBackend::load(
         };
       }
       auto runner_pool = std::make_shared<TextRunnerPool>(
-          std::move(pool_runner), session_count, std::move(runner_disk_cache));
+          std::move(pool_runner), session_count, std::move(runner_disk_cache),
+          ram_cache_config);
       new_state->scheduler = std::make_shared<TextGenerationScheduler>(
           std::move(runner_pool), prefill_policy, scheduler_policy);
     }
