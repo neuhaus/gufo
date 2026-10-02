@@ -108,12 +108,17 @@ the assistant turn verbatim:
 | 3 | 5,620 | 5,320 | 300 | live frontier from turn 2 |
 
 Now change one thing: edit the *last user message* of turn 3 and resend. The
-first 5,320 tokens are byte-identical, but the divergence falls after the last
-retained checkpoint, so there is nothing to resume from:
+first 5,320 tokens are byte-identical. The longest usable retained checkpoint
+wins, which can be the previous turn's frontier. If the longest usable
+checkpoint is instead the intermediate position at 4,096 tokens, that prefix
+can be restored and only the suffix is prefilled. If earlier checkpoints have
+been evicted or refused by the byte budget,
+and all remaining checkpoints fall after the edit, reuse is impossible:
 
 | Turn | Prompt | Reused | Prefilled | Common prefix |
 | --- | ---: | ---: | ---: | ---: |
-| 3' | 5,620 | 0 | 5,620 | 5,599 |
+| 3', intermediate checkpoint retained | 5,620 | 4,096 | 1,524 | 5,599 |
+| 3', no usable earlier checkpoint | 5,620 | 0 | 5,620 | 5,599 |
 
 That gap between "common prefix" and "reused" is the signature of the
 exact-prefix limitation. See #331.
@@ -121,43 +126,53 @@ exact-prefix limitation. See #331.
 ## What gets retained
 
 The unit of retention is a **checkpoint**, not a conversation. A single request
-can retain two: the frontier it reused, frozen before prefill mutates it, and
-its own boundary or complete prompt.
+can retain up to four intermediate checkpoints in addition to its branching
+fallback and complete prompt. Prefill stops at those positions and captures the
+whole model state before advancing. Positions lie on a 2,048-token grid spread
+across the prompt; the final grid point is within 2,048 tokens of its end.
+Warm continuations skip grid positions less than 2,048 tokens beyond the reused
+frontier. Capture runs asynchronously while that session is frozen, so other
+requests can continue; a single execution slot skips the extra worker.
+Coincident RAM and disk boundaries share one copy. Admission
+remains subject to the existing byte budget, and intermediate copies preserve
+the original branching fallback. These intermediate checkpoints live in RAM;
+the disk tier continues to retain prompt and learned shared-prefix boundaries.
 
-The entry table holds `sessions x 2` entries. The first `sessions` of them own
-a real session state and are the only ones a request can execute in; the rest
-exist purely to hold snapshots.
+Execution and retention have separate limits. `--sessions N` allocates N
+mutable execution states and controls active request concurrency. A separate
+pool holds **128 immutable checkpoint records**, regardless of session count.
+These records allocate no extra execution states: with `--sessions 1`, several
+inactive conversations can still be remembered.
 
-```mermaid
-flowchart TB
-  subgraph T["Entry table with --sessions 2"]
-    direction LR
-    S0["entry 0<br/>session state<br/>+ snapshot"]
-    S1["entry 1<br/>session state<br/>+ snapshot"]
-    X2["entry 2<br/>snapshot only"]
-    X3["entry 3<br/>snapshot only"]
-  end
-  C1["conversation A<br/>2 checkpoints"] --> S0
-  C1 --> X2
-  C2["conversation B<br/>2 checkpoints"] --> S1
-  C2 --> X3
-```
+This is a checkpoint limit, not a guaranteed conversation count. One history
+can occupy several records, and the byte budget may bind before all 128 are
+used. The server identifies related checkpoints by exact token prefixes and
+matching input identities, not a client-supplied conversation ID.
 
-Two checkpoints per conversation against `sessions x 2` entries means the cache
-holds roughly **`--sessions` conversations** (source, matching measurement).
-This is the most frequently misread part of the configuration: `--sessions` is
-normally chosen for request concurrency, but it also bounds how many distinct
-conversations stay resumable.
+When space is needed, RAM retention prefers removing:
 
-Exceeding it does not degrade gradually. With round-robin traffic the entry
-about to be needed is always the least recently used one, so reuse collapses
-from about 95% to 0% when conversations exceed sessions by one **(measured)**.
-See #341.
+1. A full-prompt retry copy with a stable fallback still retained.
+2. An intermediate copy with a related stable continuation retained.
+3. An older stable boundary covered by a newer one.
+4. Remaining checkpoints, oldest-used first within each priority.
 
-The limit is reported at startup:
+Under entry pressure, an edited branch can first replace its incompatible
+tail, preserving earlier shared checkpoints. Optional history/retry copies
+are skipped rather than removing another prefix family's last useful copy.
+Retry copies cannot displace earlier history or stable boundaries either.
+A new stable boundary can replace its own older boundary when that avoids
+removing another family's last copy. Sources are rechecked before replacement
+because another request may have changed the record.
+
+The original resume point stays protected during intermediate/retry admission.
+Earlier checkpoints remain best-effort: under pressure, edits and rewind may
+need more prefill. Rotation beyond the actual memory or record capacity can
+still lose reuse; this is not unlimited retention.
+
+The actual selected limits are reported at startup:
 
 ```text
-event=snapshot_cache_configured sessions=2 snapshot_entries=4 retained_conversations=2 capacity_bytes=99007139840
+event=snapshot_cache_configured sessions=1 snapshot_entries=128 capacity_bytes=8589934592
 ```
 
 ## Invariants
@@ -183,19 +198,46 @@ loop stops rather than trying the next candidate, in both tiers **(source)**.
 
 ## Limits
 
-Three budgets, each able to bind first.
+Independent limits can each bind first. Payload memory is allocated only when
+captured; RAM-retained snapshots and their captures in progress share the RAM budget.
 
 | Limit | Default | Set by |
 | --- | --- | --- |
-| Retained snapshot bytes, RAM | `MemAvailable / 2` | not configurable |
+| Retained snapshot bytes, RAM | smaller of 32 GiB and half the available host RAM; 27B also checks HIP free memory | `--cache-ram-bytes` |
+| RAM checkpoint records | 128, independent of `--sessions` | internal safety limit |
 | Disk bytes | 8 GiB | `--cache-disk-bytes` |
 | Disk staging bytes | smallest of 1 GiB, `MemAvailable / 8`, the disk budget | `--cache-disk-staging-bytes` |
 
-The RAM budget is sampled **after** the model and sessions are allocated, then
-halved. It therefore shrinks as `--context` and `--sessions` grow, which is
-exactly when snapshots are largest. On Flash-Next at 262144 context a single
-snapshot reached 5.70 GB against a 7.76 GB budget, so a second could not be
-retained **(measured)**. See #343.
+`--cache-ram-bytes 0` selects automatic sizing. A positive value replaces the
+32 GiB automatic cap, but remains clamped to the model's reported budget.
+Zero does not disable reuse. For an 8 GiB cap, use
+`--cache-ram-bytes 8589934592`.
+
+The model budget is sampled after weights and execution states are allocated,
+then fixed for the server run. Flash-Next and Qwen3.8-27B use half the available
+host RAM, respecting container/cgroup limits. 27B also clamps this to HIP's free
+device memory. CPU and GPU allocations compete for the same physical RAM on
+Strix Halo, so HIP's free-memory estimate alone is not enough.
+For example, 44 GiB available at load gives at most a 22 GiB RAM cache,
+even when HIP reports more free memory. An explicit limit cannot bypass this
+model budget.
+The RAM payload budget excludes weights, execution states, token metadata
+and disk staging. It also excludes temporary host buffers used to save
+checkpoints to disk; this is not a limit on total server memory.
+
+The 32 GiB automatic cap limits default growth on a lightly loaded machine.
+It leaves room for several 27B histories: two 3.7 GB checkpoints per history
+would consume about 30 GB for four conversations, before optional copies.
+The 128-record safety limit bounds metadata and lookup work without requiring
+more execution sessions. Neither guarantees a conversation count: roughly,
+divide the byte budget by the retained checkpoint bytes per conversation.
+For example, 8 GiB holds at most eight sets of two 512 MiB checkpoints, or
+two sets of two 2 GiB checkpoints, before extra copies and in-flight captures.
+
+Increasing context or sessions can still reduce the reported memory budget.
+On Flash-Next at 262144 context a single snapshot reached 5.70 GB against a
+7.76 GB budget, so a second could not be retained **(measured)**. The automatic
+cap does not fix this large-context constraint. See #343.
 
 Snapshot size scales with retained tokens and differs sharply between models:
 roughly 0.5 GB at 5k tokens on Flash-Next, and 3.7 GB at 24k tokens on
@@ -203,8 +245,8 @@ Qwen3.8-27B **(measured)**. The 1 GiB disk staging default is therefore below a
 single 27B checkpoint at moderate depth, which reduces `--cache-disk` to a
 no-op unless raised. See #259.
 
-Eviction is least-recently-used in both tiers, with no awareness of
-conversation, prefix depth or rebuild cost.
+RAM eviction follows the checkpoint priorities above. Disk eviction remains
+global least-recently-used, without conversation or rebuild-cost awareness.
 
 ## The disk tier
 
@@ -212,13 +254,32 @@ conversation, prefix depth or rebuild cost.
 written before a restart restored a 24,866-token prompt in 1.8 s against about
 50 s for a cold prefill **(measured)**.
 
-It also does something the memory tier cannot: it **learns shared-prefix
-boundaries**. When several prompts share a long prefix and then diverge, it can
+It also **learns exact shared-prefix boundaries**, which the RAM tier does
+not currently do. When several prompts share a long prefix and then diverge, it can
 capture a checkpoint at the divergence point so later conversations resume from
-it. This is why a system prompt shared across separate conversations is
-reusable with `--cache-disk` and not without. The boundary is not learned on
+it. RAM's intermediate checkpoints may reuse part of a shared prefix; disk can
+retain the learned divergence boundary itself. The boundary is not learned on
 first sight; in one run it became usable from the fifth conversation
 **(measured)**. See #267.
+
+**Disk checkpoints are spaced at least 2048 tokens apart.** A conversation
+advances a few hundred tokens per turn, so writing every turn serialises, fsyncs
+and retains a nearly identical snapshot. A checkpoint less than 2048 tokens past
+the longest stored entry that is still a prefix of it is skipped and logged as
+`min_step`; the RAM tier still retains it. When RAM does not retain it either,
+the device state is not copied at all, so a skipped checkpoint costs no capture
+time on the request path. Learned shared-prefix boundaries are
+exempt, because they sit close to a deeper entry by construction. On a
+Qwen3.8-27B functional run this cut disk writes from 31 to 5 and written bytes
+from 6.97 GiB to 1.37 GiB **(measured)**.
+
+The trade-off is what a disk-only restore resumes from. After a restart, or
+once RAM evicted the conversation, a request restores the nearest stored entry
+and re-prefills up to 2048 tokens plus its own turn, instead of resuming
+exactly at the previous frontier. Greedy output is unchanged. Sampled output can
+differ from the pre-restart response, because the re-prefilled gap follows
+different chunk shapes, as with any partial hit. Plain continuation from RAM is
+unaffected.
 
 Disk entries are evicted by global LRU on last access, so one active run whose
 checkpoints are all recent will displace every other conversation in age order
@@ -237,8 +298,11 @@ Anything that changes the token prefix. In practice:
   checkpoints after it. Appending a new one does not.
 - **Reasoning the client cannot replay** — thinking is on by default for Qwen
   and `reasoning_content` is not part of the OpenAI schema, so an ordinary
-  client omits it when sending the conversation back. The retained checkpoint
-  then stops advancing for the rest of the session **(measured)**. See #335.
+  client omits it when sending the conversation back. Gufo retains each turn's
+  boundary before the assistant opening, so the next turn can reuse the prior
+  history and process the rewritten assistant plus new input. That boundary
+  must be saved on warm hits too; retaining only the old resume point caused
+  cache reuse to stop advancing for the rest of the session. See #335.
 
 These do **not** invalidate reuse **(measured)**: changing `temperature`,
 `top_p`, `seed`, `max_tokens`, penalties or `stop` between turns; streaming
@@ -253,9 +317,11 @@ still populate the cache.
 | --- | --- |
 | `event=snapshot_cache_configured` | retained capacity, at startup |
 | `event=snapshot action=removed reason=entry_capacity` | a retained prefix was evicted because every entry was taken |
+| `event=snapshot action=skipped reason=entry_capacity` | no checkpoint record could be replaced safely for this capture |
 | `event=snapshot action=skipped reason=byte_capacity` | a checkpoint did not fit the RAM budget |
 | `event=disk_cache action=removed reason=lru` | a disk entry was evicted to stay inside `--cache-disk-bytes` |
 | `event=disk_cache action=skipped reason=staging_capacity` | a checkpoint exceeded `--cache-disk-staging-bytes` and was never written |
+| `event=disk_cache action=skipped reason=min_step` | a checkpoint was less than 2048 tokens past a stored prefix; RAM still retains it |
 
 Per-request outcomes appear in the completion log and in `usage.gufo`:
 `cache_hit`, `cache_miss_reason`, `cache_common_prefix_tokens`,
@@ -275,8 +341,17 @@ Reading them:
 
 ## Verifying changes
 
-- `tools/serving/check-continuation.py` covers cancellation, reasoning replay,
-  images and restart persistence against a live server.
+- `tests/functional/` covers rotation through independent conversations, a long
+  history interrupted by tiny side requests, edits/rewind, advancing boundaries,
+  cancellation and disk restart. Uncached controls check the answers; CPU tests
+  exercise byte and record pressure without loading models.
+- `tests/functional/continuation.py` covers cancellation, reasoning replay,
+  images and restart persistence against a live server. After a restart,
+  greedy and exact restores must reproduce their output; sampled restores may
+  re-prefill less than one disk step.
+- `tests/functional/cache_disk_spacing.py`, part of the `cache` suite, checks
+  disk checkpoint spacing for a growing conversation, the restore after
+  restart, and that a learned branch boundary is still written.
 - `tests/cli/continuation_cache_test.cpp`,
   `tests/cli/continuation_disk_store_test.cpp` and
   `tests/cli/text_model_runner_test.cpp` cover retention, admission, eviction

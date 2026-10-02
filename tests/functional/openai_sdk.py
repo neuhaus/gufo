@@ -27,6 +27,12 @@ from metrics import CaseComplete, Recorder
 from tool_reasoning import check_tool_reasoning, response_result
 from discovery import check_discovery
 from image_inputs import check_image_inputs
+from tool_agent import (check_tool_agent, check_tool_agent_loop, check_tool_history,
+                        check_untyped_agent_tools, check_mixed_tool_schemas,
+                        check_tool_schema_edges)
+from cache_edits import check_cache_edits
+from cache_growth import check_cache_growth
+from cache_rotation import check_cache_rotation
 
 
 class CompletionStreamChoice(CompletionChoice):
@@ -953,7 +959,7 @@ def check_long_context(client, model, checks, context, vision=False):
     assert repeated.output_text == response.output_text, repeated
     checks["long_responses_sampled_replay"] = repeated.to_dict()
 
-    messages += [{"role": "assistant", "content": first["text"]},
+    messages = [*messages, {"role": "assistant", "content": first["text"]},
                  {"role": "user", "content": "Give the same keyword again as JSON."},
                  {"role": "assistant", "content": response.output_text},
                  {"role": "user", "content": "Explain how to calculate 123 times 456."}]
@@ -2328,8 +2334,8 @@ def check_server_metrics(client, model, checks, width):
 
 SDK_SUITES = ("discovery", "responses", "stops", "conversation", "image-inputs", "structured", "structured-limits",
               "tool-reasoning",
-              "tools", "auto-tools", "tool-edges", "sampling-defaults", "sampling-ranges", "batch",
-              "long-context", "state-edges", "progress", "metrics")
+              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "tool-untyped", "tool-mixed", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
+              "long-context", "state-edges", "progress", "metrics", "cache-edits", "cache-growth", "cache-rotation")
 
 
 def main():
@@ -2416,6 +2422,17 @@ def main():
             "auto-tools": lambda: check_auto_tools(client, args.model, checks, args.vision),
             "tool-edges": lambda: check_tool_edges(client, args.model, checks),
             "tool-reasoning": lambda: check_tool_reasoning(client, args.model, checks, chat_result),
+            "tool-agent": lambda: check_tool_agent(
+                client, args.model, checks, chat_result, args.vision, image_content),
+            "tool-agent-loop": lambda: check_tool_agent_loop(client, args.model, checks, chat_result),
+            "tool-history": lambda: check_tool_history(
+                client, args.model, checks, chat_result, args.vision, image_content),
+            "tool-untyped": lambda: check_untyped_agent_tools(
+                client, args.model, checks, chat_result, args.vision, image_content),
+            "tool-mixed": lambda: check_mixed_tool_schemas(
+                client, args.model, checks, chat_result, args.vision, image_content),
+            "tool-schema-edges": lambda: check_tool_schema_edges(
+                client, args.model, checks, chat_result, args.vision, image_content),
             "state-edges": lambda: check_state_edges(
                 client, args.model, checks, args.speculative, args.vision),
             "sampling-defaults": lambda: check_sampling_defaults(
@@ -2430,6 +2447,9 @@ def main():
                 client, args.model, checks, args.concurrency, args.vision,
                 args.allow_missing_progress),
             "metrics": lambda: check_server_metrics(client, args.model, checks, args.concurrency),
+            "cache-edits": lambda: check_cache_edits(client, args.model, checks, chat_result),
+            "cache-growth": lambda: check_cache_growth(client, args.model, checks, chat_result),
+            "cache-rotation": lambda: check_cache_rotation(client, args.model, checks, chat_result),
         }
         selected = ([name for name in suites if name != "image-inputs" or args.vision]
                     if args.suite == "all" else

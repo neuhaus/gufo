@@ -64,7 +64,9 @@ Their detailed contracts are defined in [Command-Line Interface](CLI.md) and
 Qwen HTTP requests share one immutable `QwenGpuModel` containing the mapped
 weights and tokenizer. Each request leases a preallocated `QwenGpuExecutor`
 with independent KV, recurrent, graph, activation, and logit state.
-`--sessions N` controls the bounded session pool. The scheduler batches ready
+`--sessions N` controls the bounded execution session pool, not the number of
+remembered conversations. Checkpoints have separate entry and memory limits;
+see [KV cache](KV-CACHE.md#limits). The scheduler batches ready
 requests when the model runner supports their execution mode.
 
 Text serving defaults match llama.cpp for context and generation length:
@@ -173,6 +175,16 @@ work can batch across ready requests. See the
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
 
+`--cache-ram-bytes 0` (the default) selects an automatic snapshot budget capped
+at 32 GiB and half the available host RAM after model/state allocation, respecting
+container limits. 27B also checks HIP free memory. A positive value sets a byte
+cap, still clamped to that model budget; it cannot bypass the host-memory cap.
+Disk staging and temporary disk-save buffers are separate from this RAM budget.
+The 128 checkpoint records are independent of `--sessions`; more than one can
+belong to a conversation.
+Payloads are allocated only when captured. Under pressure, optional copies
+give way before another conversation's last useful checkpoint.
+
 Prompt reuse is enabled by default; how the cache finds, retains and
 evicts that state is described in [the KV cache](KV-CACHE.md).
 `cache_prompt: false` on
@@ -182,9 +194,9 @@ requests retain a checkpoint before the assistant-generation suffix, including
 when a client drops the interrupted assistant and appends `"."` after a tool result. DeepSeek
 also accounts for tokenization changes where adjacent user/tool turns join.
 Qwen requests retain this checkpoint with thinking enabled or disabled.
-Warm continuations checkpoint the reused frontier and prefill the new suffix
-together. A second full-prompt checkpoint enables exact retries without
-prefill; both checkpoints share the existing snapshot-memory budget.
+Warm continuations preserve the reused frontier before prefill and save the
+new stable boundary too. A second full-prompt checkpoint enables exact retries
+without prefill; all copies share the same snapshot-memory budget.
 Exact live continuations reuse generated tokens. The server reports cached
 and newly processed tokens separately; resuming from the checkpoint processes
 the short suffix. System instructions, tool definitions and image identities
@@ -610,11 +622,12 @@ ordinary continuation.
   which frame a rendered call; dotted and namespaced names such as
   `github.create_issue` are accepted. OpenAI itself documents a narrower set
   for this field, so a name outside `[A-Za-z0-9_-]` is portable to gufo but not
-  to every OpenAI-compatible service. The same name rule applies to an
-  assistant `tool_calls` entry that replays a call. Unsupported tool types,
-  malformed entries, unrenderable declared names and non-object parameters
-  return 400 `invalid_tools` before generation; because messages parse first,
-  an unrenderable name in a replayed call returns 400 `invalid_messages`.
+  to every OpenAI-compatible service. Historical names in assistant
+  `tool_calls` and Responses `function_call` items are preserved verbatim,
+  including Unicode and names absent from the current tools. This does not
+  authorize new calls to them. History still requires a non-empty string name and
+  JSON-object arguments; embedded NUL names are unsupported. Malformed history
+  and invalid declarations return 400 before generation.
 - shared top-k, min-p, repeat, frequency and presence sampling controls
 
 Streaming objects use `chat.completion.chunk` and end with the compatibility
@@ -655,13 +668,22 @@ omitted controls keep their model/CLI defaults.
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. With `auto`, ordinary text and reasoning remain allowed; once a
 call starts, decoding constrains its name and argument format. Non-strict tools
-keep optional arguments optional. Untyped arguments retain native best-effort
-semantics; schemas that cannot use native tags fall back to JSON.
-`tool_choice: "required"` constrains decoding to a declared call,
-so the requirement is forced rather than checked afterwards. Where the backend
-cannot constrain sampling, an unmet `required` choice still returns
+keep optional arguments optional. Open nested objects retain native syntax and
+declared requirements/types, including nested fields; unsupported schema
+keywords remain guidance. Unsupported property-admitting rules, including
+conditional branches, leave those objects open without discarding declared
+requirements. Qwen wildcard fields and ambiguous string/null unions use JSON
+to preserve types. Constrained JSON keys follow schema order, with additional
+keys last. Impossible non-strict schemas fall back to JSON-object arguments;
+impossible strict schemas are rejected before generation.
+`tool_choice: "required"` and named choices constrain decoding to a declared
+call. Extended schemas retain compact JSON on this path, avoiding extra
+native framing tokens; ordinary native calls keep their existing format. Where
+the backend cannot constrain sampling, an unmet `required` choice still returns
 `tool_choice_unsatisfied` (HTTP 502, or an SSE error after streaming starts).
 Stops and token limits terminate normally without emitting incomplete calls.
+With no tools or `tool_choice:"none"`, tool markers are ordinary text and do
+not interrupt reasoning or delay streaming.
 
 Stop sequences match accepted output bytes, including reasoning and tool
 markup, before streaming or response parsing. Partial prefixes are buffered;
