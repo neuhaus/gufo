@@ -252,6 +252,14 @@ public:
 
   /// Drop all reuse state. Requires no outstanding leases or reservations.
   void Clear();
+
+  /// Longest retained prefix of prompt with a matching input identity,
+  /// ignoring stable-prefix fallback rules. Leases nothing.
+  [[nodiscard]] std::size_t CachedPrefixTokens(
+      std::span<const ContinuationToken> prompt,
+      std::span<const std::uint8_t> input_identity = {},
+      std::span<const ContinuationInputPrefix> input_prefixes = {}) const;
+
   [[nodiscard]] std::size_t capacity() const noexcept;
   /// Immutable checkpoint records, independent of execution capacity().
   [[nodiscard]] std::size_t entry_capacity() const noexcept;
