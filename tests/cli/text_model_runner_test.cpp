@@ -142,6 +142,7 @@ public:
         .per_request_state_bytes = 64,
         .temporary_scratch_bytes = 16,
         .retained_snapshot_capacity_bytes = retained_snapshot_capacity_bytes_,
+        .retained_snapshot_ceiling_bytes = retained_snapshot_ceiling_bytes,
         .requires_device_runtime_lock = false,
     };
   }
@@ -279,6 +280,11 @@ protected:
   std::size_t measured_bytes_;
   std::size_t state_capacity_bytes_;
   std::size_t retained_snapshot_capacity_bytes_;
+
+public:
+  std::optional<std::size_t> retained_snapshot_ceiling_bytes;
+
+private:
 };
 
 void TestBoundedPrefillDecodeAndPrefixReuse() {
@@ -1609,43 +1615,53 @@ void TestEntryCapacityEvictionIsLogged() {
 }
 
 void TestSnapshotCacheCapacityIsReportedAtStartup() {
-  for (const std::size_t budget :
-       {std::size_t{0}, std::size_t{256}, std::size_t{64} << 30}) {
-    for (const std::size_t requested :
-         {std::size_t{0}, std::size_t{64}, std::size_t{48} << 30}) {
-      for (const std::size_t sessions : {1U, 2U}) {
-        auto stats = std::make_shared<FakeStats>();
-        auto runner = std::make_shared<SnapshotRunner>(stats, 64, 256, budget);
-        std::ostringstream startup_log;
-        auto* previous = std::clog.rdbuf(startup_log.rdbuf());
-        {
-          TextRunnerPool pool(runner, sessions, std::nullopt,
-                              {.capacity_bytes = requested});
+  using gufo::server::TextRunnerRamCacheOptions;
+  // Automatic sizing takes the model budget; an explicit limit may use the
+  // larger ceiling the model reports, or the budget when it reports none.
+  for (const std::optional<std::size_t> ceiling :
+       {std::optional<std::size_t>{}, std::optional{std::size_t{128} << 30}}) {
+    for (const std::size_t budget :
+         {std::size_t{0}, std::size_t{256}, std::size_t{64} << 30}) {
+      for (const std::size_t requested :
+           {std::size_t{0}, std::size_t{64}, std::size_t{48} << 30,
+            std::size_t{96} << 30}) {
+        for (const std::size_t sessions : {1U, 2U}) {
+          auto stats = std::make_shared<FakeStats>();
+          auto runner =
+              std::make_shared<SnapshotRunner>(stats, 64, 256, budget);
+          runner->retained_snapshot_ceiling_bytes = ceiling;
+          std::ostringstream startup_log;
+          auto* previous = std::clog.rdbuf(startup_log.rdbuf());
+          {
+            TextRunnerPool pool(runner, sessions, std::nullopt,
+                                {.capacity_bytes = requested});
+          }
+          std::clog.rdbuf(previous);
+          const auto output = startup_log.str();
+          const auto automatic =
+              std::min(budget, TextRunnerRamCacheOptions::kAutomaticMaxBytes);
+          const auto maximum = ceiling.value_or(budget);
+          const auto capacity =
+              requested == 0 ? automatic : std::min(requested, maximum);
+          const std::string expected =
+              "event=snapshot_cache_configured sessions=" +
+              std::to_string(sessions) +
+              " snapshot_entries=128 capacity_bytes=" +
+              std::to_string(capacity) +
+              " automatic_bytes=" + std::to_string(automatic) +
+              " max_bytes=" + std::to_string(maximum) + "\n";
+          const auto position = output.find(expected);
+          Expect(position != std::string::npos &&
+                     output.find(expected, position + expected.size()) ==
+                         std::string::npos,
+                 "startup reports actual session, entry and byte limits once");
+          Expect(output.find("retained_conversations") == std::string::npos,
+                 "startup does not present session count as conversation "
+                 "capacity");
+          Expect(stats->states_created == sessions,
+                 "checkpoint record capacity never creates extra execution "
+                 "states");
         }
-        std::clog.rdbuf(previous);
-        const auto output = startup_log.str();
-        const std::string expected =
-            "event=snapshot_cache_configured sessions=" +
-            std::to_string(sessions) +
-            " snapshot_entries=128 "
-            "capacity_bytes=" +
-            std::to_string(
-                std::min(budget, requested == 0
-                                     ? gufo::server::TextRunnerRamCacheOptions::
-                                           kAutomaticMaxBytes
-                                     : requested)) +
-            "\n";
-        const auto position = output.find(expected);
-        Expect(position != std::string::npos &&
-                   output.find(expected, position + expected.size()) ==
-                       std::string::npos,
-               "startup reports actual session, entry and byte limits once");
-        Expect(
-            output.find("retained_conversations") == std::string::npos,
-            "startup does not present session count as conversation capacity");
-        Expect(
-            stats->states_created == sessions,
-            "checkpoint record capacity never creates extra execution states");
       }
     }
   }
