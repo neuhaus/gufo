@@ -120,11 +120,11 @@ C1, context capacity 133121, AR. Peak memory reported by HIP.
 ## Two Strix Halos over RDMA
 
 Gufo RDMA runs one model on two such hosts: every layer is split between them,
-and they exchange partial sums over InfiniBand RDMA ([how it works](TP2.md)).
+and they exchange partial sums over RDMA ([how it works](TP2.md)).
 The workloads are those of the one-host tables; "Gufo" is the same build on
 one host, and gain is Gufo RDMA over it. With twice the memory, single users
-also reach depths one host cannot (context capacity 262144). Both were measured
-on September 29, 2026 (`ea76571`) in the balanced power mode (85 W sustained),
+also reach depths one host cannot (context capacity 262144). The Q4 single-user
+comparisons were measured on September 29, 2026 (`ea76571`) in the balanced power mode (85 W sustained),
 so prefill is lower than in the one-host tables above; decode is not
 power-bound.
 
@@ -160,27 +160,44 @@ power-bound.
 
 ### Multiple users, autoregressive
 
+October 2, 2026 (`c19211e`), same production build on one host and two hosts
+over USB4 RoCE v2 with write striping. Both hosts use balanced mode and the
+recorded fan curves. Same pp2048 prose prompt, tg128, context 4096 per user;
+every session prefills before timed decoding. Rates sum individual decode rates.
+
 <!-- bench:multi-ar-tp2 -->
 | Flash-Next Q4 AR<br>Users | Gufo AR (tok/s) | Gufo RDMA AR (tok/s) | Gain |
 | ---: | ---: | ---: | ---: |
-| 1 | 25.45 | TODO | TODO |
-| 2 | 47.25 | TODO | TODO |
-| 4 | 76.81 | TODO | TODO |
-| 6 | 96.24 | TODO | TODO |
-| 8 | 107.56 | TODO | TODO |
+| 1 | 26.59 | 32.93 | +23.8% |
+| 2 | 47.17 | 46.66 | -1.1% |
+| 4 | 75.60 | 91.60 | +21.2% |
+| 6 | 93.61 | 107.83 | +15.2% |
+| 8 | 105.12 | 129.10 | +22.8% |
 <!-- /bench -->
 
+![Multiple users, autoregressive, one host and RDMA](artifacts/charts/multi-ar-tp2.svg)
+
 ### Multiple users, MTP
+
+Same configuration and preparation as the AR table, with mixed/repetitive
+prompts. All 129 prepared completions across both topologies and all modes
+match fresh AR controls; C1 MTP output and draft counts match fresh MTP controls.
 
 <!-- bench:multi-mtp-tp2 -->
 | Flash-Next Q4 MTP<br>Users | Gufo mixed (tok/s) | Gufo RDMA mixed (tok/s) | Gain | Gufo repetitive (tok/s) | Gufo RDMA repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 2 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 4 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 6 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 8 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 1 | 31.99 | 36.34 | +13.6% | 60.62 | 69.70 | +15.0% |
+| 2 | 49.66 | 67.00 | +34.9% | 91.28 | 104.74 | +14.7% |
+| 4 | 75.41 | 89.64 | +18.9% | 120.15 | 150.81 | +25.5% |
+| 6 | 90.30 | 97.63 | +8.1% | 134.06 | 164.76 | +22.9% |
+| 8 | 102.63 | 118.40 | +15.4% | 143.90 | 183.70 | +27.7% |
 <!-- /bench -->
+
+C1 repetitive RDMA is **69.70 ± 3.57 tok/s** (mean ± sample standard
+deviation, four warmed cohorts); all valid samples are retained. Its timing
+variability limits a precise gain claim. Other cells use one warmed cohort.
+
+![Multiple users, MTP, one host and RDMA](artifacts/charts/multi-mtp-tp2.svg)
 
 ### Full Q8 model
 

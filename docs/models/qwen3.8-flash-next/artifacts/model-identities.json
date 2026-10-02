@@ -44,5 +44,67 @@
       "build": "nix build, production gfx1151 binary"
     },
     "qualification": "attention-tiles-review.json"
+  },
+  "benchmarks-rdma-concurrency-2026-10-02": {
+    "revision": "c19211e759fed9a075424406bdef11b01416120b",
+    "binarySha256": "c4a97b7d8d7cf2c1a7ada5a5faf45043c21229e090746f13d19724504ccad334",
+    "build": "cmake --preset release -DGUFO_ENABLE_TP2_RDMA=ON; cmake --build --preset release --target gufo --parallel 4",
+    "container": "localhost/gufo-tp2-dev:7.2.3",
+    "transport": "json",
+    "link": "USB4 RoCE v2, native write striping",
+    "powerMode": "balanced",
+    "models": [
+      {
+        "file": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+        "sha256": "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082"
+      },
+      {
+        "file": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+        "sha256": "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9"
+      },
+      {
+        "file": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf",
+        "sha256": "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3"
+      },
+      {
+        "file": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf",
+        "sha256": "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a"
+      },
+      {
+        "file": "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+        "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+      }
+    ],
+    "thermalSettings": {
+      "rank0": {
+        "apu/power_mode": "balanced",
+        "fan1/rampup_curve": "50,60,70,80,85",
+        "fan1/rampdown_curve": "45,55,65,75,80",
+        "fan1/mode": "curve",
+        "fan2/rampup_curve": "50,60,70,80,85",
+        "fan2/rampdown_curve": "45,55,65,75,80",
+        "fan2/mode": "curve",
+        "fan3/rampup_curve": "50,60,70,80,85",
+        "fan3/rampdown_curve": "45,55,65,75,80",
+        "fan3/mode": "curve"
+      },
+      "rank1": {
+        "apu/power_mode": "balanced",
+        "fan1/rampup_curve": "50,60,70,80,85",
+        "fan1/rampdown_curve": "45,55,65,75,80",
+        "fan1/mode": "curve",
+        "fan2/rampup_curve": "50,60,70,80,85",
+        "fan2/rampdown_curve": "45,55,65,75,80",
+        "fan2/mode": "curve",
+        "fan3/rampup_curve": "50,60,70,80,85",
+        "fan3/rampdown_curve": "45,55,65,75,80",
+        "fan3/mode": "curve"
+      }
+    },
+    "providerSha256": "d107164e8039851d07fc89377bed8a87344ec1348163146063f3475640cfd5e5",
+    "method": "Matched pp2048 prose/repetitive prompts, tg128, C1/2/4/6/8, context 4096 per user; JSON HTTP, greedy seed 1, thinking off; fresh server per point, every session prepared with one token before timed decode. Rates sum individual server decode rates and average across cohorts.",
+    "qualification": "rdma-concurrency-validation.json",
+    "repetitions": "One warmed cohort per point except RDMA repetitive C1, which retains the original cohort plus three focused repeats (mean and sample standard deviation).",
+    "note": "Interrupted measurements from before the confirmed balanced/fan configuration and failed repeat launches are retained only in ignored run logs."
   }
 }
