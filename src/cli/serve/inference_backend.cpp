@@ -1082,14 +1082,18 @@ public:
     // they are carved from the same RAM as every host allocation, and HIP's
     // free figure does not see host pressure. Cap them by the host budget too.
     std::size_t snapshot_capacity = HostSnapshotBudgetBytes();
-    if (capacity.has_value())
+    std::size_t snapshot_ceiling = HostSnapshotCeilingBytes();
+    if (capacity.has_value()) {
       snapshot_capacity = std::min(snapshot_capacity, *capacity);
+      snapshot_ceiling = std::min(snapshot_ceiling, *capacity);
+    }
     return {
         .resident_weights_bytes = resident_weights,
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = usage.request_state_bytes,
         .temporary_scratch_bytes = usage.temporary_scratch_bytes,
         .retained_snapshot_capacity_bytes = snapshot_capacity,
+        .retained_snapshot_ceiling_bytes = snapshot_ceiling,
         .requires_device_runtime_lock = true,
     };
   }
@@ -1826,6 +1830,7 @@ public:
         .per_request_state_bytes = std::nullopt,
         .temporary_scratch_bytes = std::nullopt,
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -2605,6 +2610,7 @@ public:
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -3932,8 +3938,15 @@ bool InferenceBackend::load(
     new_state->tp_max_requests =
         session_count + scheduler_policy.max_pending_requests;
     if (tp_world_size > 1) {
+      // Each rank offers its own RAM-cache limit and the pair uses the
+      // smaller one, so a limit above the automatic budget needs the same
+      // --cache-ram-bytes on both ranks.
       const TpControlConfig control_config{
-          .snapshot_budget_bytes = HostSnapshotBudgetBytes(),
+          .snapshot_budget_bytes =
+              ram_cache_config.capacity_bytes == 0
+                  ? HostSnapshotBudgetBytes()
+                  : std::min<std::uint64_t>(ram_cache_config.capacity_bytes,
+                                            HostSnapshotCeilingBytes()),
           .rank = tp_rank,
           .world_size = tp_world_size,
           .max_context = max_context,
