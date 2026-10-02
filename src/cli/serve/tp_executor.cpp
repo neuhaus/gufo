@@ -624,8 +624,14 @@ TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
 
 TextRunnerResourceClaim TpMirroredRunner::ResourceClaim() const {
   auto claim = inner_->ResourceClaim();
-  claim.retained_snapshot_capacity_bytes = std::min(
-      claim.retained_snapshot_capacity_bytes.value_or(0), snapshot_budget_);
+  // Rank 1 holds the other half of every snapshot within the budget both
+  // ranks agreed on, so neither limit may go beyond it.
+  const auto automatic = claim.retained_snapshot_capacity_bytes.value_or(0);
+  claim.retained_snapshot_capacity_bytes =
+      std::min(automatic, snapshot_budget_);
+  claim.retained_snapshot_ceiling_bytes =
+      std::min(claim.retained_snapshot_ceiling_bytes.value_or(automatic),
+               snapshot_budget_);
   return claim;
 }
 
