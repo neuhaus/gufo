@@ -15,8 +15,12 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "src/core/json.hpp"
+#include "src/models/qwen/vision/prompt.hpp"
 
 namespace {
 
@@ -142,6 +146,7 @@ public:
         .per_request_state_bytes = 64,
         .temporary_scratch_bytes = 16,
         .retained_snapshot_capacity_bytes = retained_snapshot_capacity_bytes_,
+        .retained_snapshot_ceiling_bytes = retained_snapshot_ceiling_bytes,
         .requires_device_runtime_lock = false,
     };
   }
@@ -279,6 +284,11 @@ protected:
   std::size_t measured_bytes_;
   std::size_t state_capacity_bytes_;
   std::size_t retained_snapshot_capacity_bytes_;
+
+public:
+  std::optional<std::size_t> retained_snapshot_ceiling_bytes;
+
+private:
 };
 
 void TestBoundedPrefillDecodeAndPrefixReuse() {
@@ -1402,6 +1412,55 @@ void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
   }
 }
 
+void TestRamLearnsDivergenceBoundaries() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PersistentSnapshotRunner>(
+      stats, "ram-boundary", std::size_t{1} << 20, 4096);
+  TextRunnerPool pool(runner, 1);
+  // Conversations share a system prompt, then each has its own tail. Below
+  // 2048 tokens no grid checkpoint exists, so only learning can help.
+  const auto conversation = [](std::size_t shared, TextRunnerToken tail) {
+    std::vector<TextRunnerToken> prompt;
+    for (std::size_t index = 0; index < shared; ++index)
+      prompt.push_back(static_cast<TextRunnerToken>(100 + index % 50));
+    for (TextRunnerToken index = 0; index < 600; ++index)
+      prompt.push_back(tail + index);
+    return prompt;
+  };
+  const auto run = [&](const std::vector<TextRunnerToken>& prompt) {
+    auto request = pool.Acquire(prompt);
+    const auto cached = request.cached_prompt_tokens();
+    std::vector<std::size_t> steps;
+    while (!request.prefill_complete())
+      steps.push_back(request.Prefill(4096).consumed_tokens);
+    (void)request.Commit();
+    return std::pair{cached, steps};
+  };
+
+  const auto [first_cached, first_steps] = run(conversation(1000, 10000));
+  Expect(first_cached == 0 && first_steps == std::vector<std::size_t>{1600},
+         "the first conversation has nothing to share");
+  const auto [second_cached, second_steps] = run(conversation(1000, 20000));
+  Expect(second_cached == 0 &&
+             second_steps == std::vector<std::size_t>({1000, 600}),
+         "the second conversation stops at the divergence point to retain it");
+  const auto [third_cached, third_steps] = run(conversation(1000, 30000));
+  Expect(third_cached == 1000 && third_steps == std::vector<std::size_t>{600},
+         "later conversations restore the learned boundary exactly");
+  const auto [short_cached, short_steps] = run(conversation(300, 40000));
+  Expect(short_cached == 0 && short_steps == std::vector<std::size_t>{900},
+         "a short shared prefix is not worth an extra checkpoint");
+  // An edit near the end diverges inside this request's own final tokens;
+  // its stable checkpoint covers that, so no extra copy is taken.
+  auto edited = conversation(1000, 30000);
+  edited.back() += 1;
+  auto request = pool.Acquire(edited);
+  Expect(request.cached_prompt_tokens() == 1000 &&
+             request.Prefill(4096).consumed_tokens == 600,
+         "a late divergence does not stop prefill for another checkpoint");
+  request.Invalidate();
+}
+
 void TestCoincidentCacheBoundariesShareOneCopy() {
   for (const bool stable : {false, true}) {
     TemporaryDirectory directory;
@@ -1609,51 +1668,275 @@ void TestEntryCapacityEvictionIsLogged() {
 }
 
 void TestSnapshotCacheCapacityIsReportedAtStartup() {
-  for (const std::size_t budget :
-       {std::size_t{0}, std::size_t{256}, std::size_t{64} << 30}) {
-    for (const std::size_t requested :
-         {std::size_t{0}, std::size_t{64}, std::size_t{48} << 30}) {
-      for (const std::size_t sessions : {1U, 2U}) {
-        auto stats = std::make_shared<FakeStats>();
-        auto runner = std::make_shared<SnapshotRunner>(stats, 64, 256, budget);
-        std::ostringstream startup_log;
-        auto* previous = std::clog.rdbuf(startup_log.rdbuf());
-        {
-          TextRunnerPool pool(runner, sessions, std::nullopt,
-                              {.capacity_bytes = requested});
+  using gufo::server::TextRunnerRamCacheOptions;
+  // Automatic sizing takes the model budget; an explicit limit may use the
+  // larger ceiling the model reports, or the budget when it reports none.
+  for (const std::optional<std::size_t> ceiling :
+       {std::optional<std::size_t>{}, std::optional{std::size_t{128} << 30}}) {
+    for (const std::size_t budget :
+         {std::size_t{0}, std::size_t{256}, std::size_t{64} << 30}) {
+      for (const std::size_t requested :
+           {std::size_t{0}, std::size_t{64}, std::size_t{48} << 30,
+            std::size_t{96} << 30}) {
+        for (const std::size_t sessions : {1U, 2U}) {
+          auto stats = std::make_shared<FakeStats>();
+          auto runner =
+              std::make_shared<SnapshotRunner>(stats, 64, 256, budget);
+          runner->retained_snapshot_ceiling_bytes = ceiling;
+          std::ostringstream startup_log;
+          auto* previous = std::clog.rdbuf(startup_log.rdbuf());
+          {
+            TextRunnerPool pool(runner, sessions, std::nullopt,
+                                {.capacity_bytes = requested});
+          }
+          std::clog.rdbuf(previous);
+          const auto output = startup_log.str();
+          const auto automatic =
+              std::min(budget, TextRunnerRamCacheOptions::kAutomaticMaxBytes);
+          const auto maximum = ceiling.value_or(budget);
+          const auto capacity =
+              requested == 0 ? automatic : std::min(requested, maximum);
+          const std::string expected =
+              "event=snapshot_cache_configured sessions=" +
+              std::to_string(sessions) +
+              " snapshot_entries=128 capacity_bytes=" +
+              std::to_string(capacity) +
+              " automatic_bytes=" + std::to_string(automatic) +
+              " max_bytes=" + std::to_string(maximum) + "\n";
+          const auto position = output.find(expected);
+          Expect(position != std::string::npos &&
+                     output.find(expected, position + expected.size()) ==
+                         std::string::npos,
+                 "startup reports actual session, entry and byte limits once");
+          Expect(output.find("retained_conversations") == std::string::npos,
+                 "startup does not present session count as conversation "
+                 "capacity");
+          Expect(stats->states_created == sessions,
+                 "checkpoint record capacity never creates extra execution "
+                 "states");
         }
-        std::clog.rdbuf(previous);
-        const auto output = startup_log.str();
-        const std::string expected =
-            "event=snapshot_cache_configured sessions=" +
-            std::to_string(sessions) +
-            " snapshot_entries=128 "
-            "capacity_bytes=" +
-            std::to_string(
-                std::min(budget, requested == 0
-                                     ? gufo::server::TextRunnerRamCacheOptions::
-                                           kAutomaticMaxBytes
-                                     : requested)) +
-            "\n";
-        const auto position = output.find(expected);
-        Expect(position != std::string::npos &&
-                   output.find(expected, position + expected.size()) ==
-                       std::string::npos,
-               "startup reports actual session, entry and byte limits once");
-        Expect(
-            output.find("retained_conversations") == std::string::npos,
-            "startup does not present session count as conversation capacity");
-        Expect(
-            stats->states_created == sessions,
-            "checkpoint record capacity never creates extra execution states");
       }
     }
   }
 }
 
+void TestSnapshotStartupReportsSelectedLimits() {
+  class ChangingHeadroomRunner final : public SnapshotRunner {
+  public:
+    using SnapshotRunner::SnapshotRunner;
+
+    TextRunnerResourceClaim ResourceClaim() const override {
+      auto claim = SnapshotRunner::ResourceClaim();
+      constexpr std::size_t gib = std::size_t{1} << 30;
+      // Synthetic headroom falls during state allocation, then again after
+      // cache sizing. No large buffers are allocated for these resource claims.
+      // Each claim follows Flash-Next's half-free / free-minus-4-GiB policy.
+      const auto available = stats_->states_created == 0 ? 14 * gib
+                             : post_state_claims++ == 0  ? 12 * gib
+                                                         : 11 * gib;
+      claim.retained_snapshot_capacity_bytes = available / 2;
+      claim.retained_snapshot_ceiling_bytes =
+          available - gufo::server::kHostSnapshotHeadroomBytes;
+      return claim;
+    }
+
+    mutable std::size_t post_state_claims{0};
+  };
+
+  constexpr std::size_t gib = std::size_t{1} << 30;
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<ChangingHeadroomRunner>(stats);
+  std::ostringstream startup_log;
+  auto* previous = std::clog.rdbuf(startup_log.rdbuf());
+  {
+    TextRunnerPool pool(runner, 1, std::nullopt, {.capacity_bytes = 8 * gib});
+  }
+  std::clog.rdbuf(previous);
+
+  const auto output = startup_log.str();
+  const auto event = output.find("event=snapshot_cache_configured ");
+  Expect(event != std::string::npos, "startup reports snapshot limits");
+  const auto line = output.substr(event, output.find('\n', event) - event);
+  const auto field = [&](std::string_view name) {
+    const auto start = line.find(name);
+    Expect(start != std::string::npos, "startup reports the requested field");
+    std::istringstream value(line.substr(start + name.size()));
+    std::size_t bytes = 0;
+    Expect(static_cast<bool>(value >> bytes), "startup byte field is numeric");
+    return bytes;
+  };
+  const auto capacity = field("capacity_bytes=");
+  const auto automatic = field("automatic_bytes=");
+  const auto maximum = field("max_bytes=");
+  Expect(stats->states_created == 1, "only the requested state was created");
+  Expect(capacity == 8 * gib,
+         "cache capacity uses the first post-allocation memory observation");
+  Expect(capacity <= maximum,
+         "startup maximum must not be below the selected cache capacity");
+  Expect(automatic == 6 * gib && maximum == 8 * gib,
+         "startup limits describe the claim that selected cache capacity");
+}
+
+void TestServerInstructionsAreFraming() {
+  using namespace gufo::tokenization;
+  class ConstraintRunner final : public FakeRunner {
+  public:
+    ConstraintRunner() : FakeRunner(std::make_shared<FakeStats>()) {}
+    gufo::sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+      return gufo::sampling::JsonConstraint::ToolFormat::kQwen;
+    }
+    std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
+    BuildConstraintVocabulary() const override {
+      return std::make_shared<gufo::sampling::ConstraintVocabulary>(
+          256, [](std::uint32_t id) {
+            return gufo::sampling::ConstraintVocabulary::Piece{
+                std::string(1, static_cast<char>(id)), false};
+          });
+    }
+  } runner;
+  std::vector<std::string> vocab;
+  for (int i = 0; i < 256; ++i)
+    vocab.emplace_back(1, static_cast<char>(i));
+  std::unordered_map<std::string, TokenId> specials;
+  for (const auto* token : {"<|im_start|>", "<|im_end|>", "<think>", "</think>",
+                            "<tool_call>", "</tool_call>"}) {
+    specials.emplace(token, vocab.size());
+    vocab.emplace_back(token);
+  }
+  std::string error;
+  auto tokenizer =
+      QwenTokenizer::CreateFromVocabulary(vocab, {}, specials, &error);
+  Expect(tokenizer != nullptr, "instruction tokenizer fixture initializes");
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  options.require_tool_call = true;
+  for (
+      const auto schema :
+      {R"({"type":"object","properties":{"text":{"type":"string","const":"\n</parameter>\n</｜DSML｜parameter>\\"}},"required":["text"],"additionalProperties":false})",
+       R"({"type":"object","properties":{"text":{"type":"string"}},"patternProperties":{"^x_":{"type":"integer"}},"required":["text"]})"}) {
+    for (const auto role :
+         {ChatRole::kUser, ChatRole::kSystem, ChatRole::kDeveloper}) {
+      for (const bool literal_client_tags : {false, true}) {
+        ChatRequest request;
+        request.reasoning.enabled = false;
+        request.tool_choice = ChatRequest::ToolChoice::kRequired;
+        request.tools = {{.name = "record", .parameters_json = schema}};
+        const std::string client = literal_client_tags
+                                       ? "Client <tool_call>example</tool_call>"
+                                       : "Be concise.  ";
+        if (role != ChatRole::kUser)
+          request.messages.emplace_back(role, client);
+        request.messages.emplace_back(
+            ChatRole::kUser, role == ChatRole::kUser ? client : "Call record.");
+        gufo::sampling::SamplingConfig sampling;
+        std::optional<gufo::sampling::JsonConstraint::ToolFormat> format;
+        const auto constrained = gufo::server::ConstrainChatRequest(
+            request, runner, &sampling, &format);
+        Expect(
+            constrained &&
+                format == gufo::sampling::JsonConstraint::ToolFormat::kJson &&
+                sampling.constraint,
+            "the actual request path selects and binds the JSON fallback");
+        Expect(constrained->messages.front().content ==
+                   (role == ChatRole::kUser ? "" : client),
+               "server instructions do not mutate client system/developer "
+               "content");
+        Expect(request.messages.front().content == client,
+               "constraint construction leaves the original request untouched");
+        const auto& instruction = constrained->messages.front().framing_suffix;
+        Expect(instruction.find("<tool_call>") != std::string::npos &&
+                   instruction.find("</tool_call>") != std::string::npos,
+               "JSON fallback uses the server framing field");
+        const auto prepared = gufo::models::qwen::vision::Prepare(
+            *tokenizer, constrained->messages, constrained->tools, options, {},
+            8192);
+        auto without = constrained->messages;
+        without.front().framing_suffix.clear();
+        const auto baseline = QwenChatTemplate::RenderAndTokenize(
+            *tokenizer, without, constrained->tools, options);
+        Expect(baseline.has_value(), "client-only template encodes");
+        for (const auto* tag : {"<tool_call>", "</tool_call>"}) {
+          const auto id = *tokenizer->FindSpecialToken(tag);
+          Expect(
+              std::count(prepared.tokens.begin(), prepared.tokens.end(), id) ==
+                  std::count(baseline->begin(), baseline->end(), id) + 1,
+              "each server delimiter is exactly one special token, including "
+              "beside literal client tags");
+        }
+        const auto client_only = QwenChatTemplate::RenderAndTokenize(
+            *tokenizer, request.messages, options);
+        Expect(client_only.has_value(), "client tag control encodes");
+        for (const auto* tag : {"<tool_call>", "</tool_call>"})
+          Expect(std::count(client_only->begin(), client_only->end(),
+                            *tokenizer->FindSpecialToken(tag)) == 0,
+                 "client-supplied delimiter spellings remain ordinary text");
+        if (!literal_client_tags) {
+          auto legacy = constrained->messages;
+          legacy.front().content += legacy.front().framing_suffix;
+          legacy.front().framing_suffix.clear();
+          const auto rendered =
+              QwenChatTemplate::Render(legacy, constrained->tools, options);
+          TokenizerOptions framing;
+          framing.parse_special_tokens = true;
+          Expect(rendered &&
+                     prepared.tokens == tokenizer->Encode(*rendered, framing),
+                 "the full fallback prompt exactly matches main's legacy "
+                 "instruction tokenization");
+        }
+      }
+    }
+  }
+  // JSON-object prompts, schema prompts and their optional descriptions use
+  // the same framing field. Native tools add no instruction or prompt work.
+  for (const bool schema : {false, true}) {
+    ChatRequest request(
+        {{ChatRole::kSystem, "Client <tool_call>literal</tool_call>"},
+         {ChatRole::kUser, "Return JSON."}});
+    request.reasoning.enabled = false;
+    request.response_format =
+        schema
+            ? gufo::sampling::JsonConstraint::Compile(
+                  gufo::json::parse(
+                      R"({"type":"object","properties":{"text":{"type":"string","const":"<tool_call>"}},"required":["text"],"additionalProperties":false})"),
+                  true)
+            : gufo::sampling::JsonConstraint::Object();
+    request.response_format_description = "Describe <tool_call> in the schema.";
+    gufo::sampling::SamplingConfig sampling;
+    auto constrained =
+        gufo::server::ConstrainChatRequest(request, runner, &sampling);
+    Expect(constrained &&
+               constrained->messages.front().content ==
+                   request.messages.front().content &&
+               constrained->messages.front().framing_suffix.find(
+                   request.response_format_description + "\n\n" +
+                   request.response_format->prompt()) != std::string::npos,
+           "response formats and descriptions are separated from client "
+           "message content");
+    const auto tokens = QwenChatTemplate::RenderAndTokenize(
+        *tokenizer, constrained->messages, options);
+    Expect(tokens && std::count(tokens->begin(), tokens->end(),
+                                *tokenizer->FindSpecialToken("<tool_call>")) ==
+                         (schema ? 2 : 1),
+           "generated description/schema instruction tags retain framing token "
+           "identity");
+  }
+  ChatRequest native({{ChatRole::kUser, "Call record."}});
+  native.reasoning.enabled = false;
+  native.tools = {
+      {.name = "record",
+       .parameters_json =
+           R"({"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false})"}};
+  gufo::sampling::SamplingConfig sampling;
+  const auto constrained =
+      gufo::server::ConstrainChatRequest(native, runner, &sampling);
+  Expect(constrained && constrained->messages.front().framing_suffix.empty(),
+         "native constraints add no instruction or change to the prompt");
+}
+
 }  // namespace
 
 int main() {
+  TestServerInstructionsAreFraming();
   // The cache warning assertion in this binary matches the plain "[WARN]
   // [cache]" text captured from a redirected sink; a TTY stderr tints it.
   ::setenv("NO_COLOR", "1", 1);
@@ -1695,8 +1978,10 @@ int main() {
       "evicting a retained prefix for entry capacity is reported");
 
   TestSnapshotCacheCapacityIsReportedAtStartup();
+  TestSnapshotStartupReportsSelectedLimits();
   TestPersistentSnapshotRestoresAcrossPools();
   TestSharedPrefixIsLearnedAndRestoredAcrossConversations();
+  TestRamLearnsDivergenceBoundaries();
   TestCoincidentCacheBoundariesShareOneCopy();
   TestMeasuredStateIsReconciledWithClaim();
   TestSnapshotBudgetRefusalDoesNotFailCompletedRequest();

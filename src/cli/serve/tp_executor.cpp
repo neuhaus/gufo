@@ -643,6 +643,13 @@ sampling::JsonConstraint::ToolFormat TpMirroredRunner::ToolFormat() const {
   return inner_->ToolFormat();
 }
 
+// Device probes are local to rank 0's GPU and exchange nothing with rank 1.
+TextModelRunner::DeviceProbeStatus TpMirroredRunner::PollDevice() const {
+  return inner_->PollDevice();
+}
+
+bool TpMirroredRunner::DeviceUsable() const { return inner_->DeviceUsable(); }
+
 std::vector<TextRunnerToken> TpMirroredRunner::Tokenize(
     std::string_view text) const {
   return inner_->Tokenize(text);

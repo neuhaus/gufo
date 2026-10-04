@@ -170,6 +170,8 @@ public:
   BuildConstraintVocabulary() const override;
   [[nodiscard]] sampling::JsonConstraint::ToolFormat ToolFormat()
       const override;
+  [[nodiscard]] DeviceProbeStatus PollDevice() const override;
+  [[nodiscard]] bool DeviceUsable() const override;
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override;
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
