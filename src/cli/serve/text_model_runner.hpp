@@ -168,6 +168,8 @@ struct TextDecodeSelection {
 
 struct TextDecodeStep {
   std::vector<TextDecodeSelection> selections;
+  /// Number of speculative verification rounds actually executed.
+  std::size_t draft_rounds{0};
   std::size_t draft_tokens{0};
   std::size_t draft_accepted_tokens{0};
   bool stop{false};
@@ -256,6 +258,7 @@ public:
       const {
     return sampling::JsonConstraint::ToolFormat::kJson;
   }
+  /// Reuse a compiled grammar bound to this runner's vocabulary.
   [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint> BindConstraint(
       std::shared_ptr<const sampling::JsonConstraint> grammar) const;
 
@@ -366,6 +369,17 @@ public:
   [[nodiscard]] virtual bool CanReuse(const TextRunnerSnapshot&) const {
     return true;
   }
+  enum class DeviceProbeStatus { kUsable, kPending, kLost };
+  /// Submit or poll one private device probe without waiting. Called only by
+  /// the scheduler between work units. Pending work is reused, never queued
+  /// again.
+  [[nodiscard]] virtual DeviceProbeStatus PollDevice() const {
+    return DeviceProbeStatus::kUsable;
+  }
+  /// Bounded check, run only after a failed work unit, that the execution
+  /// device still accepts work. False means the context is permanently lost;
+  /// a probe that is still pending at its bound reports true.
+  [[nodiscard]] virtual bool DeviceUsable() const { return true; }
 
   /// Captures an immutable exact continuation at CheckpointPosition(state).
   ///
@@ -543,6 +557,13 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+/// Build output constraints and attach server-authored instructions as framing,
+/// preserving client message content and the model's native prompt layout.
+[[nodiscard]] std::optional<ChatRequest> ConstrainChatRequest(
+    const ChatRequest& request, const TextModelRunner& runner,
+    sampling::SamplingConfig* sampling,
+    std::optional<sampling::JsonConstraint::ToolFormat>* tool_format = nullptr);
 
 }  // namespace gufo::server
 

@@ -212,6 +212,20 @@ int main() {
     Require(got_constrained.constrained &&
                 got_constrained.sampling.can_use_unmodified_argmax(),
             "TP C1 command carries the constraint flag apart from sampling");
+    Require(got_constrained.stop_at_eos && got.stop_at_eos,
+            "TP C1 command stops at EOS by default");
+
+    // A raw completion with ignore_eos decodes past EOS; rank 1's multi-token
+    // cycles must not stop there either.
+    TpControlCommand past_eos = command;
+    past_eos.sequence = 10;
+    past_eos.constrained = true;
+    past_eos.stop_at_eos = false;
+    Require(server->SendCommand(past_eos, &server_error), server_error);
+    TpControlCommand got_past_eos;
+    Require(client->ReceiveCommand(&got_past_eos, &client_error), client_error);
+    Require(!got_past_eos.stop_at_eos && got_past_eos.constrained,
+            "TP C1 command carries EOS handling beside the constraint flag");
   }
 
   // An instruction is one model call for rank 1 to execute within the request

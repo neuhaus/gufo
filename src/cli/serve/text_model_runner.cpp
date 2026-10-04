@@ -14,8 +14,88 @@
 
 #include "src/cli/serve/continuation_disk_store.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/core/json.hpp"
 
 namespace gufo::server {
+
+std::optional<ChatRequest> ConstrainChatRequest(
+    const ChatRequest& request, const TextModelRunner& runner,
+    sampling::SamplingConfig* sampling,
+    std::optional<sampling::JsonConstraint::ToolFormat>* tool_format) {
+  if (!request.response_format &&
+      (request.tools.empty() ||
+       request.tool_choice == ChatRequest::ToolChoice::kNone))
+    return std::nullopt;
+  auto constrained = request;
+  auto instruction = request.response_format ? request.response_format->prompt()
+                                             : std::string();
+  auto grammar = request.response_format;
+  if (!request.tools.empty() &&
+      request.tool_choice != ChatRequest::ToolChoice::kNone) {
+    std::vector<sampling::JsonConstraint::Tool> tools;
+    std::vector<std::pair<json::Value, bool>> schemas;
+    const bool required =
+        request.tool_choice == ChatRequest::ToolChoice::kRequired;
+    auto format = runner.ToolFormat();
+    for (const auto& tool : request.tools) {
+      const auto definition = tool.definition_json.empty()
+                                  ? json::Value()
+                                  : json::parse(tool.definition_json);
+      const auto* function = definition.find("function");
+      const auto* strict = function ? function->find("strict") : nullptr;
+      const bool enforce = strict && strict->as_bool();
+      auto schema = json::parse(tool.parameters_json);
+      auto native = sampling::JsonConstraint::ToolParameters(schema, enforce,
+                                                             format, required);
+      tools.emplace_back(tool.name, std::move(native));
+      schemas.emplace_back(std::move(schema), enforce);
+    }
+    if (std::ranges::any_of(
+            tools, [](const auto& tool) { return tool.second == nullptr; })) {
+      format = sampling::JsonConstraint::ToolFormat::kJson;
+      // Compile the fallback only when native parameter tags cannot represent
+      // these values. Normal native requests reuse the cached grammar directly.
+      for (std::size_t i = 0; i < tools.size(); ++i)
+        tools[i].second = sampling::JsonConstraint::ToolParameters(
+            schemas[i].first, schemas[i].second, format);
+    }
+    grammar = sampling::JsonConstraint::WithTools(
+        grammar, std::move(tools), required,
+        !request.response_format && request.parallel_tool_calls, format);
+    if (tool_format)
+      *tool_format = format;
+    if (format == sampling::JsonConstraint::ToolFormat::kJson)
+      instruction +=
+          "\nIf a tool is needed, respond using the JSON tool-call form "
+          "<tool_call>{\"name\":\"function_name\",\"arguments\":{...}}</"
+          "tool_call>. "
+          "Tool arguments must follow the chosen function's schema.";
+    if (request.response_format)
+      instruction += " The JSON response schema applies to the final answer.";
+  }
+  if (!request.response_format_description.empty())
+    instruction.insert(0, request.response_format_description + "\n\n");
+  if (instruction.empty()) {
+    // Native constraints follow the model's existing template. In particular
+    // they do not change prompt tokens or invalidate continuation checkpoints.
+  } else if (!constrained.messages.empty() &&
+             (constrained.messages.front().role ==
+                  tokenization::ChatRole::kSystem ||
+              constrained.messages.front().role ==
+                  tokenization::ChatRole::kDeveloper)) {
+    constrained.messages.front().framing_suffix += "\n\n" + instruction;
+  } else {
+    tokenization::ChatMessage message{tokenization::ChatRole::kSystem, ""};
+    message.framing_suffix = std::move(instruction);
+    constrained.messages.insert(constrained.messages.begin(),
+                                std::move(message));
+  }
+  if (runner.InitialOutputState(request) ==
+      TextGenerationBackend::InitialOutputState::kReasoning)
+    grammar = sampling::JsonConstraint::WithReasoning(grammar);
+  sampling->constraint = runner.BindConstraint(grammar);
+  return constrained;
+}
 
 namespace {
 
@@ -87,6 +167,8 @@ struct ValidatedRunner {
   TextRunnerDescriptor descriptor;
   TextRunnerResourceClaim resources;
   std::vector<TextExecutionPlan> plans;
+  std::size_t snapshot_automatic_bytes{0};
+  std::size_t snapshot_max_bytes{0};
 };
 
 std::optional<std::size_t> PerStateReservationBytes(
@@ -395,14 +477,16 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
             const auto resources = validated->runner->ResourceClaim();
             const auto automatic =
                 resources.retained_snapshot_capacity_bytes.value_or(0);
+            validated->snapshot_automatic_bytes = std::min(
+                TextRunnerRamCacheOptions::kAutomaticMaxBytes, automatic);
+            validated->snapshot_max_bytes =
+                resources.retained_snapshot_ceiling_bytes.value_or(automatic);
             if (options.capacity_bytes == 0)
-              return std::min(TextRunnerRamCacheOptions::kAutomaticMaxBytes,
-                              automatic);
+              return validated->snapshot_automatic_bytes;
             // An explicit limit is the operator's choice to trade headroom
             // for retention, bounded so the host keeps a fixed reserve.
-            return std::min(
-                options.capacity_bytes,
-                resources.retained_snapshot_ceiling_bytes.value_or(automatic));
+            return std::min(options.capacity_bytes,
+                            validated->snapshot_max_bytes);
           },
       .on_event = EmitSnapshotEvent,
       .state_reusable = std::move(state_reusable),
@@ -522,22 +606,16 @@ struct TextRunnerPool::Impl {
             TextRunnerRamCacheOptions::kMaxEntries) {
     // Entry and byte limits constrain retention independently of session count.
     if (validated.descriptor.capabilities.snapshot) {
-      // Report what --cache-ram-bytes would select automatically and the most
-      // it may claim, so operators can size it before snapshots are refused.
-      const auto resources = validated.runner->ResourceClaim();
-      const auto automatic =
-          std::min(TextRunnerRamCacheOptions::kAutomaticMaxBytes,
-                   resources.retained_snapshot_capacity_bytes.value_or(0));
-      const auto maximum = resources.retained_snapshot_ceiling_bytes.value_or(
-          resources.retained_snapshot_capacity_bytes.value_or(0));
-      Logger::Info("cache",
-                   "event=snapshot_cache_configured sessions=" +
-                       std::to_string(state_count) + " snapshot_entries=" +
-                       std::to_string(cache.entry_capacity()) +
-                       " capacity_bytes=" +
-                       std::to_string(cache.snapshot_capacity_bytes()) +
-                       " automatic_bytes=" + std::to_string(automatic) +
-                       " max_bytes=" + std::to_string(maximum));
+      // Report the same post-allocation limits that selected the capacity.
+      Logger::Info(
+          "cache",
+          "event=snapshot_cache_configured sessions=" +
+              std::to_string(state_count) + " snapshot_entries=" +
+              std::to_string(cache.entry_capacity()) + " capacity_bytes=" +
+              std::to_string(cache.snapshot_capacity_bytes()) +
+              " automatic_bytes=" +
+              std::to_string(validated.snapshot_automatic_bytes) +
+              " max_bytes=" + std::to_string(validated.snapshot_max_bytes));
     }
     if (disk_cache_options.has_value()) {
       if (!validated.descriptor.persistence.has_value()) {
@@ -1377,7 +1455,11 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   const std::size_t position = impl_->runner->CheckpointPosition(state);
   if (position < impl_->lease.cached_tokens() || position > checkpoint.size()) {
     throw std::runtime_error(
-        "text runner checkpoint is outside executed token history");
+        "text runner checkpoint is outside executed token history: position=" +
+        std::to_string(position) +
+        " cached=" + std::to_string(impl_->lease.cached_tokens()) +
+        " prompt=" + std::to_string(impl_->prompt.size()) +
+        " generated=" + std::to_string(impl_->generated.size()));
   }
   checkpoint.resize(position);
   if (capabilities.snapshot && capabilities.fork) {

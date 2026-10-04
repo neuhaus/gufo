@@ -8,6 +8,7 @@
 #include <exception>
 #include <iomanip>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -27,6 +28,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::size_t kDecodeProgressInterval = 50;
+constexpr std::size_t kNoSession = std::numeric_limits<std::size_t>::max();
 
 struct OutputBudget {
   explicit OutputBudget(std::size_t byte_limit) : limit(byte_limit) {}
@@ -62,6 +64,17 @@ struct OutputBudget {
   std::atomic<std::size_t> max_buffered_bytes{0};
 };
 
+struct ScheduledRequest;
+
+/// Requests holding each execution session, for `/slots`. No other mutex is
+/// acquired while this table's mutex is held.
+struct SessionTable {
+  explicit SessionTable(std::size_t count) : requests(count) {}
+
+  std::mutex mutex;
+  std::vector<std::shared_ptr<const ScheduledRequest>> requests;
+};
+
 struct ScheduledRequest {
   std::uint64_t id{0};
   std::string client_id{"anonymous"};
@@ -76,10 +89,12 @@ struct ScheduledRequest {
   bool publish_token_pieces{false};
   bool publish_prompt_progress{false};
   TextGenerationScheduler::Clock::time_point request_start;
+  TextGenerationScheduler::Clock::time_point stream_start_deadline;
   std::optional<TextGenerationScheduler::Clock::time_point> deadline;
   std::size_t max_output_bytes{0};
   std::size_t max_buffered_output_bytes{0};
   std::shared_ptr<OutputBudget> output_budget;
+  std::shared_ptr<SessionTable> sessions;
 
   std::atomic<bool> cancellation_requested{false};
   std::atomic<TextRequestPhase> phase{TextRequestPhase::kQueued};
@@ -103,6 +118,8 @@ struct ScheduledRequest {
   std::condition_variable output_condition;
   std::deque<std::string> output_pieces;
   std::optional<TextGenerationBackend::PromptProgress> pending_progress;
+  // Set at admission for streams; the consumer reports its start at most once.
+  bool admitted{false};
   std::size_t buffered_output_bytes{0};
   // A stalled consumer trips backpressure on every token, so the debug line is
   // written once per request. Only the scheduler thread touches this.
@@ -115,8 +132,23 @@ struct ScheduledRequest {
   std::size_t prefix_position{0};
   bool prefix_considered{false};
   std::optional<TextGenerationScheduler::Clock::time_point> prefix_wait_start;
+  // The held `/slots` session while counted_processing is set. Only the
+  // scheduler worker changes it.
+  std::size_t session{kNoSession};
+  // Copies of result counters for `/slots`, which reads them from another
+  // thread while the scheduler worker updates `result`.
+  std::atomic<std::size_t> live_cached_prompt_tokens{0};
+  std::atomic<std::size_t> live_prefill_tokens{0};
+  std::atomic<std::size_t> live_generated_tokens{0};
   std::exception_ptr failure;
   bool terminal{false};
+
+  ~ScheduledRequest() {
+    // A completed stream may be discarded without ever consuming its output.
+    // Return any remaining charge when the last request owner releases it.
+    if (output_budget != nullptr)
+      output_budget->Release(buffered_output_bytes);
+  }
 };
 
 struct PendingClient {
@@ -147,6 +179,12 @@ void PublishTerminal(const std::shared_ptr<ScheduledRequest>& request,
     request->failure = std::move(failure);
     request->terminal = true;
     if (std::exchange(request->counted_processing, false)) {
+      if (request->session != kNoSession) {
+        const std::lock_guard<std::mutex> sessions_lock(
+            request->sessions->mutex);
+        request->sessions->requests[std::exchange(request->session, kNoSession)]
+            .reset();
+      }
       detail::RequestsProcessing().fetch_sub(1, std::memory_order_relaxed);
     }
     request->phase.store(TextRequestPhase::kTerminal,
@@ -230,6 +268,18 @@ void LogBackpressure(const std::shared_ptr<ScheduledRequest>& request,
   return false;
 }
 
+/// Lets a streaming consumer commit its response before prompt processing.
+void PublishAdmission(const std::shared_ptr<ScheduledRequest>& request) {
+  if (!request->publish_token_pieces) {
+    return;
+  }
+  {
+    const std::lock_guard<std::mutex> lock(request->output_mutex);
+    request->admitted = true;
+  }
+  request->output_condition.notify_one();
+}
+
 /// Replaces unread progress, so a slow consumer holds at most one update.
 void PublishPromptProgress(const std::shared_ptr<ScheduledRequest>& request) {
   if (!request->publish_prompt_progress) {
@@ -292,6 +342,7 @@ struct TextGenerationScheduler::Impl {
       throw std::invalid_argument(
           "text generation scheduler runner pool must not be null");
     }
+    sessions = std::make_shared<SessionTable>(runner_pool->capacity());
     if (prefill_policy.decode_active_tokens == 0) {
       throw std::invalid_argument(
           "active-decode prefill budget must be at least one token");
@@ -324,6 +375,7 @@ struct TextGenerationScheduler::Impl {
         runner_pool->runner()
             .Descriptor()
             .capabilities.batched_multi_token_decode_max_width;
+    device_lost_requests.reserve(runner_pool->capacity());
     worker = std::jthread(
         [this](const std::stop_token& stop_token) { Run(stop_token); });
   }
@@ -440,7 +492,18 @@ struct TextGenerationScheduler::Impl {
     auto request = std::move(client.requests.front());
     client.requests.pop_front();
     // Admission reserves a session before potentially slow cache preparation.
-    // Publish the transfer before removing it from the deferred count.
+    // Publish the transfer before removing it from the deferred count. Admit
+    // holds fewer than capacity requests here, so a session is always free.
+    {
+      const std::lock_guard<std::mutex> sessions_lock(sessions->mutex);
+      const auto free = std::find(sessions->requests.begin(),
+                                  sessions->requests.end(), nullptr);
+      if (free != sessions->requests.end()) {
+        request->session =
+            static_cast<std::size_t>(free - sessions->requests.begin());
+        *free = request;
+      }
+    }
     request->counted_processing = true;
     detail::RequestsProcessing().fetch_add(1, std::memory_order_relaxed);
     SetQueuedCountLocked(queued_count - 1);
@@ -468,6 +531,35 @@ struct TextGenerationScheduler::Impl {
       return true;
     }
     return false;
+  }
+
+  [[nodiscard]] std::vector<TextGenerationBackend::SessionState>
+  SessionSnapshot() const {
+    std::vector<TextGenerationBackend::SessionState> states(
+        runner_pool->capacity());
+    const std::lock_guard<std::mutex> lock(sessions->mutex);
+    for (std::size_t index = 0; index < states.size(); ++index) {
+      auto& state = states[index];
+      state.speculative = multi_token_decode;
+      const auto& request = sessions->requests[index];
+      if (request == nullptr) {
+        continue;
+      }
+      // Identity, prompt size and limit are fixed before admission.
+      const std::size_t generated =
+          request->live_generated_tokens.load(std::memory_order_relaxed);
+      state.processing = true;
+      state.request_id = request->id;
+      state.prompt_tokens = request->result.prompt_tokens;
+      state.cached_prompt_tokens =
+          request->live_cached_prompt_tokens.load(std::memory_order_relaxed);
+      state.processed_prompt_tokens =
+          request->live_prefill_tokens.load(std::memory_order_relaxed);
+      state.generated_tokens = generated;
+      state.remaining_tokens =
+          request->token_limit - std::min(generated, request->token_limit);
+    }
+    return states;
   }
 
   [[nodiscard]] std::vector<std::shared_ptr<ScheduledRequest>> QueuedSnapshot()
@@ -499,6 +591,10 @@ struct TextGenerationScheduler::Impl {
 
   void CompleteCancelled(
       const std::shared_ptr<ScheduledRequest>& request) noexcept {
+    if (device_lost.load(std::memory_order_acquire)) {
+      CompleteFailure(request, device_lost_failure);
+      return;
+    }
     try {
       if (request->runner_request) {
         const auto retained = request->runner_request.Cancel();
@@ -510,6 +606,7 @@ struct TextGenerationScheduler::Impl {
       request->result.cancelled = true;
       FinalizeResult(request, TextGenerationBackend::FinishReason::kCancelled);
       LogDecodeProgress(request, true);
+      RecordRequestMetrics(request->result);
       PublishTerminal(request, {}, true);
     } catch (...) {
       PublishTerminal(request, std::current_exception(), true);
@@ -517,13 +614,69 @@ struct TextGenerationScheduler::Impl {
   }
 
   void CompleteFailure(const std::shared_ptr<ScheduledRequest>& request,
-                       std::exception_ptr failure) noexcept {
+                       std::exception_ptr failure,
+                       bool classified = false) noexcept {
+    if (IsTerminal(request))
+      return;
+    if (!classified)
+      failure = ClassifyFailure(std::move(failure));
     if (request->runner_request) {
-      request->runner_request.Invalidate();
+      if (device_lost.load(std::memory_order_acquire)) {
+        // Retain the lease, snapshots and their workers until process exit.
+        // Resetting state, freeing snapshots or joining transfers on the dead
+        // context can block or crash before the supervisor can restart us.
+        device_lost_requests.push_back(request);
+      } else {
+        request->runner_request.Invalidate();
+      }
     }
     request->result.completion_tokens = request->result.tokens.size();
     LogDecodeProgress(request, true);
     PublishTerminal(request, std::move(failure), true);
+  }
+
+  void MarkDeviceLost(std::string_view reason) noexcept {
+    if (device_lost.exchange(true, std::memory_order_acq_rel))
+      return;
+    detail::DeviceLostTotal().fetch_add(1, std::memory_order_relaxed);
+    try {
+      Logger::Error("scheduler", "event=device_lost remedy=restart reason=" +
+                                     std::string(reason));
+    } catch (...) {
+      // Loss remains observable even if logging fails.
+    }
+  }
+
+  // A GPU reset leaves this process's device context permanently unusable,
+  // and every later work unit then fails with a raw driver message. Probe the
+  // device only after a model failure, on this thread between work units, so
+  // the probe never overlaps this scheduler's own GPU work.
+  [[nodiscard]] std::exception_ptr ClassifyFailure(
+      std::exception_ptr failure) noexcept {
+    if (failure == nullptr)
+      return failure;
+    if (device_lost.load(std::memory_order_acquire))
+      return device_lost_failure;
+    try {
+      std::string reason = "unknown failure";
+      try {
+        std::rethrow_exception(failure);
+      } catch (const TextGenerationError&) {
+        return failure;
+      } catch (const std::exception& error) {
+        reason = error.what();
+      } catch (...) {
+        // A non-standard exception keeps the generic reason.
+      }
+      if (!device_lost.load(std::memory_order_acquire)) {
+        if (runner_pool->runner().DeviceUsable())
+          return failure;
+        MarkDeviceLost(reason);
+      }
+      return device_lost_failure;
+    } catch (...) {
+      return failure;
+    }
   }
 
   void CompleteDeadline(
@@ -535,6 +688,12 @@ struct TextGenerationScheduler::Impl {
 
   [[nodiscard]] bool CompleteIfStopped(
       const std::shared_ptr<ScheduledRequest>& request) noexcept {
+    if (IsTerminal(request))
+      return true;
+    if (device_lost.load(std::memory_order_acquire)) {
+      CompleteFailure(request, device_lost_failure);
+      return true;
+    }
     try {
       if (DeadlineExceeded(request)) {
         CompleteDeadline(request);
@@ -579,6 +738,9 @@ struct TextGenerationScheduler::Impl {
     request->result.cache_shared_prefix_ms = cache_commit.shared_prefix_ms;
     FinalizeResult(request, finish_reason);
     LogDecodeProgress(request, true);
+    // Recorded here rather than by the HTTP adapter, so a client that leaves
+    // before reading the result still counts.
+    RecordRequestMetrics(request->result);
     PublishTerminal(request);
   }
 
@@ -615,7 +777,8 @@ struct TextGenerationScheduler::Impl {
       std::size_t waiting) {
     if (std::exchange(request->prefix_considered, true) ||
         !request->cache_prompt ||
-        // Parked requests hold no session; bound them like admitted ones.
+        // Parked requests hold no runner lease; bound their reservations like
+        // admitted ones.
         waiting + 1 >= runner_pool->capacity())
       return false;
     std::shared_ptr<ScheduledRequest> leader;
@@ -737,8 +900,16 @@ struct TextGenerationScheduler::Impl {
            prefilling.size() + decoding.size() + capturing.size() <
                runner_pool->capacity()) {
       auto request = PopReleased(waiting);
-      if (request == nullptr)
+      if (request == nullptr) {
+        // Parked followers already reserve a visible admission session. They
+        // may resume in place, but new arrivals must respect those
+        // reservations.
+        if (prefilling.size() + decoding.size() + capturing.size() +
+                waiting.size() >=
+            runner_pool->capacity())
+          return;
         request = PopQueued();
+      }
       if (request == nullptr) {
         return;
       }
@@ -775,6 +946,8 @@ struct TextGenerationScheduler::Impl {
         request->result.cache_checkpoint_tokens = lookup.checkpoint_tokens;
         request->result.cached_prompt_tokens =
             request->runner_request.cached_prompt_tokens();
+        request->live_cached_prompt_tokens.store(
+            request->result.cached_prompt_tokens, std::memory_order_relaxed);
         request->result.cache_restore_bytes =
             request->runner_request.cache_restore_bytes();
         request->result.cache_restore_ms =
@@ -788,6 +961,7 @@ struct TextGenerationScheduler::Impl {
                                        .count();
         request->result.resident_requests_at_admission =
             prefilling.size() + decoding.size() + capturing.size() + 1;
+        PublishAdmission(request);
         PublishPromptProgress(request);
         request->phase.store(TextRequestPhase::kAdmitted,
                              std::memory_order_release);
@@ -836,6 +1010,8 @@ struct TextGenerationScheduler::Impl {
               .count();
       request->result.prefill_ms += step_ms;
       request->result.prefill_tokens += step.consumed_tokens;
+      request->live_prefill_tokens.store(request->result.prefill_tokens,
+                                         std::memory_order_relaxed);
       detail::TotalPromptTokens().fetch_add(step.consumed_tokens,
                                             std::memory_order_relaxed);
       ++request->result.prefill_chunks;
@@ -954,6 +1130,8 @@ struct TextGenerationScheduler::Impl {
     }
     request->generated_output_bytes += selection.piece.size();
     request->result.tokens.push_back(selection.token);
+    request->live_generated_tokens.store(request->result.tokens.size(),
+                                         std::memory_order_relaxed);
     detail::TotalGenTokens().fetch_add(1, std::memory_order_relaxed);
     const auto piece = request->stop_filter.enabled()
                            ? request->stop_filter.Push(selection.piece)
@@ -1031,6 +1209,7 @@ struct TextGenerationScheduler::Impl {
           request->token_limit - request->result.tokens.size() +
           (request->preview_token.has_value() ? 1 : 0);
       const auto step = request->runner_request.DecodeStep(remaining);
+      request->result.draft_rounds += step.draft_rounds;
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
 
@@ -1153,6 +1332,11 @@ struct TextGenerationScheduler::Impl {
     if (prepared.empty()) {
       return;
     }
+    if (device_lost.load(std::memory_order_acquire)) {
+      for (const auto& item : prepared)
+        CompleteFailure(item.request, device_lost_failure);
+      return;
+    }
     if (prepared.size() == 1) {
       try {
         prepared.front().request->runner_request.Advance();
@@ -1166,6 +1350,8 @@ struct TextGenerationScheduler::Impl {
     const auto plan = runner_pool->SelectDecodePlan(prepared.size());
     if (plan.kind != TextExecutionPlanKind::kBatched) {
       for (const auto& item : prepared) {
+        if (CompleteIfStopped(item.request))
+          continue;
         try {
           item.request->runner_request.Advance();
           FinishAdvanced(item.request, item.decode_start);
@@ -1193,13 +1379,24 @@ struct TextGenerationScheduler::Impl {
       return;
     }
 
+    // Classify every failed lane before committing a successful peer: its
+    // snapshot/commit may also touch the context that just failed.
+    for (auto& failure : failures) {
+      if (failure)
+        failure = ClassifyFailure(std::move(failure));
+      if (device_lost.load(std::memory_order_acquire)) {
+        for (const auto& item : prepared)
+          CompleteFailure(item.request, device_lost_failure);
+        return;
+      }
+    }
     const std::string execution_plan =
         "batched-w" + std::to_string(plan.physical_width);
     for (std::size_t i = 0; i < prepared.size(); ++i) {
       const auto& item = prepared[i];
       if (failures[i]) {
         if (!CompleteIfStopped(item.request))
-          CompleteFailure(item.request, failures[i]);
+          CompleteFailure(item.request, failures[i], true);
         continue;
       }
       item.request->result.physical_execution_width = std::max(
@@ -1247,6 +1444,11 @@ struct TextGenerationScheduler::Impl {
     if (prepared.empty()) {
       return;
     }
+    if (device_lost.load(std::memory_order_acquire)) {
+      for (const auto& item : prepared)
+        CompleteFailure(item.request, device_lost_failure);
+      return;
+    }
     if (prepared.size() == 1) {
       StepMultiTokenDecode(prepared.front().request);
       return;
@@ -1281,12 +1483,23 @@ struct TextGenerationScheduler::Impl {
       return;
     }
 
+    for (auto& step : steps) {
+      if (step.failure)
+        step.failure = ClassifyFailure(std::move(step.failure));
+      if (device_lost.load(std::memory_order_acquire)) {
+        for (const auto& item : prepared)
+          CompleteFailure(item.request, device_lost_failure);
+        return;
+      }
+    }
     for (std::size_t index = 0; index < prepared.size(); ++index) {
       const auto& item = prepared[index];
+      if (CompleteIfStopped(item.request))
+        continue;
       const auto& step = steps[index];
       if (step.failure) {
         if (!CompleteIfStopped(item.request))
-          CompleteFailure(item.request, step.failure);
+          CompleteFailure(item.request, step.failure, true);
         continue;
       }
       if (step.execution_plan.physical_width >=
@@ -1300,6 +1513,7 @@ struct TextGenerationScheduler::Impl {
                 : (runner_pool->capacity() == 1 ? "serial-c1"
                                                 : "serial-fallback");
       }
+      item.request->result.draft_rounds += step.draft_rounds;
       item.request->result.draft_tokens += step.draft_tokens;
       item.request->result.draft_accepted_tokens += step.draft_accepted_tokens;
 
@@ -1413,6 +1627,8 @@ struct TextGenerationScheduler::Impl {
     // Cold requests waiting for a resident prefill of their shared prefix.
     std::deque<std::shared_ptr<ScheduledRequest>> waiting;
     while (!stop_token.stop_requested()) {
+      if (device_lost.load(std::memory_order_acquire))
+        break;
       ProcessQueuedCancellations();
 
       for (std::size_t count = capturing.size(); count != 0; --count) {
@@ -1428,16 +1644,35 @@ struct TextGenerationScheduler::Impl {
         }
       }
       Admit(prefilling, decoding, capturing, waiting, stop_token);
+      if (device_lost.load(std::memory_order_acquire))
+        break;
       if (prefilling.empty() && decoding.empty()) {
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
           return stop_token.stop_requested() || stopping ||
                  (queued_count != 0 &&
-                  capturing.size() < runner_pool->capacity());
+                  capturing.size() + waiting.size() < runner_pool->capacity());
         };
-        if (capturing.empty() && waiting.empty())
-          queue_condition.wait(lock, wake);
-        else
+        if (capturing.empty() && waiting.empty()) {
+          // Only the idle wait has a timer. Arrival interrupts it immediately;
+          // no clock checks or device polling are added to active work units.
+          while (!wake()) {
+            if (queue_condition.wait_for(
+                    lock, scheduler_policy.device_probe_interval, wake))
+              break;
+            lock.unlock();
+            try {
+              if (runner_pool->runner().PollDevice() ==
+                  TextModelRunner::DeviceProbeStatus::kLost)
+                MarkDeviceLost("idle device probe failed");
+            } catch (...) {
+              // An inconclusive probe must not kill a usable model.
+            }
+            lock.lock();
+            if (device_lost.load(std::memory_order_acquire))
+              break;
+          }
+        } else
           queue_condition.wait_for(lock, std::chrono::milliseconds(1), wake);
         continue;
       }
@@ -1538,6 +1773,7 @@ struct TextGenerationScheduler::Impl {
   TextPrefillPolicy prefill_policy;
   TextSchedulerPolicy scheduler_policy;
   std::shared_ptr<OutputBudget> output_budget;
+  std::shared_ptr<SessionTable> sessions;
   bool incremental_prefill_supported{false};
   bool final_token_advance_required{true};
   bool incremental_text_is_exact{false};
@@ -1549,6 +1785,11 @@ struct TextGenerationScheduler::Impl {
   std::deque<PendingClient> queued_clients;
   std::size_t queued_count{0};
   bool stopping{false};
+  std::atomic<bool> device_lost{false};
+  const std::exception_ptr device_lost_failure =
+      std::make_exception_ptr(TextGenerationError(
+          TextGenerationErrorCode::kDeviceLost, kDeviceLostMessage));
+  std::vector<std::shared_ptr<ScheduledRequest>> device_lost_requests;
   std::size_t consecutive_active_prefill_chunks{0};
   std::atomic<std::uint64_t> next_request_id{1};
   std::jthread worker;
@@ -1588,7 +1829,8 @@ TextRequestPhase TextGenerationScheduler::Request::phase() const noexcept {
 }
 
 TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
-    const TokenCallback& on_token, const ProgressCallback& on_progress) {
+    const TokenCallback& on_token, const ProgressCallback& on_progress,
+    const StartCallback& on_start) {
   if (!*this) {
     throw std::logic_error("text scheduler request is empty");
   }
@@ -1598,6 +1840,8 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
   impl_->waited = true;
 
   bool deliver_pieces = true;
+  // Only streams with a start consumer use the queue deadline.
+  bool started = !on_start || !impl_->request->publish_token_pieces;
   bool consumer_cancelled = false;
   std::exception_ptr callback_failure;
   Result result;
@@ -1606,16 +1850,31 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
   while (true) {
     std::string piece;
     std::optional<TextGenerationBackend::PromptProgress> progress;
+    bool start = false;
     bool has_piece = false;
     bool terminal = false;
     {
       std::unique_lock<std::mutex> lock(impl_->request->output_mutex);
-      impl_->request->output_condition.wait(lock, [&] {
+      const auto ready = [&] {
         return impl_->request->terminal ||
+               (!started && impl_->request->admitted) ||
                impl_->request->pending_progress.has_value() ||
                !impl_->request->output_pieces.empty();
-      });
-      if (impl_->request->pending_progress.has_value()) {
+      };
+      if (started) {
+        impl_->request->output_condition.wait(lock, ready);
+      } else {
+        // A request still queued at the deadline also starts, so transport
+        // keepalives can run while it waits.
+        const bool woke = impl_->request->output_condition.wait_until(
+            lock, impl_->request->stream_start_deadline, ready);
+        // Admission precedes this request's progress and output, even when
+        // it also failed before the consumer woke.
+        start = !woke || impl_->request->admitted;
+      }
+      if (start) {
+        // Delivered below, before any progress or output.
+      } else if (impl_->request->pending_progress.has_value()) {
         progress = std::exchange(impl_->request->pending_progress, {});
       } else if (!impl_->request->output_pieces.empty()) {
         has_piece = true;
@@ -1645,6 +1904,12 @@ TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
         Cancel();
       }
     };
+    if (start) {
+      started = true;
+      if (deliver_pieces)
+        deliver([&](bool) { return on_start(); }, true);
+      continue;
+    }
     if (progress.has_value() && deliver_pieces && on_progress) {
       deliver(on_progress, *progress);
     }
@@ -1690,6 +1955,15 @@ const TextModelRunner& TextGenerationScheduler::runner() const noexcept {
 
 std::size_t TextGenerationScheduler::capacity() const noexcept {
   return impl_->runner_pool->capacity();
+}
+
+bool TextGenerationScheduler::device_lost() const noexcept {
+  return impl_->device_lost.load(std::memory_order_acquire);
+}
+
+std::vector<TextGenerationScheduler::SessionState>
+TextGenerationScheduler::SessionStates() const {
+  return impl_->SessionSnapshot();
 }
 
 std::size_t TextGenerationScheduler::buffered_output_bytes() const noexcept {
@@ -1759,6 +2033,8 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->publish_prompt_progress =
       publish_token_pieces && metadata.return_progress;
   request->request_start = metadata.request_start;
+  request->stream_start_deadline =
+      request->request_start + impl_->scheduler_policy.stream_start_delay;
   request->deadline = metadata.deadline;
   if (!request->deadline.has_value() &&
       impl_->scheduler_policy.request_timeout.count() > 0) {
@@ -1770,6 +2046,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->max_buffered_output_bytes =
       impl_->scheduler_policy.max_buffered_output_bytes_per_request;
   request->output_budget = impl_->output_budget;
+  request->sessions = impl_->sessions;
 
   // A refusal is reported and thrown after the lock below is released.
   // Admission-line inputs are snapshotted under the queue mutex and the
@@ -1794,6 +2071,10 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
     if (impl_->stopping) {
       throw TextGenerationError(TextGenerationErrorCode::kSchedulerStopping,
                                 "text generation scheduler is stopping");
+    }
+    if (impl_->device_lost.load(std::memory_order_acquire)) {
+      throw TextGenerationError(TextGenerationErrorCode::kDeviceLost,
+                                kDeviceLostMessage);
     }
     if (impl_->queued_count >= impl_->scheduler_policy.max_pending_requests) {
       refused = true;

@@ -4,6 +4,38 @@ Notable user-facing changes are recorded here. Gufo follows
 [Semantic Versioning](https://semver.org/) under the compatibility policy in
 [the release guide](docs/RELEASING.md).
 
+## [0.7.0](https://github.com/gufo-org/gufo/compare/v0.6.0...v0.7.0) (2026-10-04)
+
+
+### Features
+
+* **serve:** learn shared-prefix boundaries in the RAM cache ([#386](https://github.com/gufo-org/gufo/issues/386)) ([2ba3be2](https://github.com/gufo-org/gufo/commit/2ba3be24039186e00d2cecdb969f99ad695e1161))
+* **serve:** let an explicit RAM cache limit exceed the automatic budget ([#384](https://github.com/gufo-org/gufo/issues/384)) ([53c5906](https://github.com/gufo-org/gufo/commit/53c590649295edf63abcc06117231cdc890b69c7))
+* **serve:** report live sessions and llama.cpp-compatible metrics ([#389](https://github.com/gufo-org/gufo/issues/389)) ([1b4e682](https://github.com/gufo-org/gufo/commit/1b4e6825f2cf6fa2203af3b4b3596bf25e4bfa4e))
+* **server:** export speculative verification round metrics ([#403](https://github.com/gufo-org/gufo/issues/403)) ([8bdde80](https://github.com/gufo-org/gufo/commit/8bdde807e57fadfe57f4a1005707559ae6afc82f))
+
+
+### Bug Fixes
+
+* **server:** detect idle GPU loss and defer streaming success ([#406](https://github.com/gufo-org/gufo/issues/406)) ([6a9ea9f](https://github.com/gufo-org/gufo/commit/6a9ea9f263de4598a4c49954f10c5d285bcf7635))
+* **server:** parse tool output using the admitted request format ([#393](https://github.com/gufo-org/gufo/issues/393)) ([c33e050](https://github.com/gufo-org/gufo/commit/c33e050eced6389852617994fe7349367df4c900))
+* **server:** reuse replayed tool turns with union and typed arguments ([#404](https://github.com/gufo-org/gufo/issues/404)) ([ea06418](https://github.com/gufo-org/gufo/commit/ea064189976242f33f54bac92be6e0cdbd33fc48))
+
+## [0.6.0](https://github.com/gufo-org/gufo/compare/v0.5.0...v0.6.0) (2026-10-03)
+
+
+### Features
+
+* **serve:** share in-flight prefixes between concurrent requests ([#382](https://github.com/gufo-org/gufo/issues/382)) ([c1eba3d](https://github.com/gufo-org/gufo/commit/c1eba3de7ffc1f71c9ad6e395138f9bf89ddcc7b))
+
+
+### Bug Fixes
+
+* **serve:** exit and report device_lost when the GPU context is lost ([#390](https://github.com/gufo-org/gufo/issues/390)) ([ee2bff3](https://github.com/gufo-org/gufo/commit/ee2bff34d8cbb95a29f8abe85e046dd49382b5c9))
+* **server:** improve error messaging on streaming generation failure ([#385](https://github.com/gufo-org/gufo/issues/385)) ([bf60539](https://github.com/gufo-org/gufo/commit/bf605399477b694c19adb6313952ecbf0986d8be))
+* **server:** preserve JSON string ownership during tool recovery ([#396](https://github.com/gufo-org/gufo/issues/396)) ([2c6a106](https://github.com/gufo-org/gufo/commit/2c6a1064f39a4d3ea0b8d92efea0beedf18150f1))
+* **serve:** separate Messages thinking blocks and accept the thinking field ([#380](https://github.com/gufo-org/gufo/issues/380)) ([b27f1ec](https://github.com/gufo-org/gufo/commit/b27f1ec0189e5410028029f249915dfa8813b749))
+
 ## [0.5.0](https://github.com/gufo-org/gufo/compare/v0.4.0...v0.5.0) (2026-10-02)
 
 

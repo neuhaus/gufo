@@ -21,7 +21,17 @@ bool ParseOpenAiResponseMessage(const json::Value& item,
                                 tokenization::ChatMessage* message,
                                 core::ImageReadBudget& budget,
                                 std::string* error);
+/// Shared effort names; each API applies its own thinking and alias rules.
+std::optional<ReasoningEffort> ParseReasoningEffortName(std::string_view value);
 
+/// Reasoning and visible text of a generation without tools or schemas, split
+/// exactly as Chat Completions reports them.
+struct GeneratedText {
+  std::string reasoning;
+  std::string text;
+};
+GeneratedText SplitGeneratedText(
+    std::string_view text, TextGenerationBackend::InitialOutputState initial);
 /// Responses text output uses the same reasoning/UTF-8 filter and scheduler
 /// as Chat Completions, including streaming cancellation and cache retention.
 HttpResponse CreateOpenAiResponse(const HttpRequest& request,

@@ -1,6 +1,7 @@
 """Fast checks for the functional runner's failure reporting and process ownership."""
 
 import contextlib
+from copy import deepcopy
 import base64
 import importlib.util
 import io
@@ -21,7 +22,7 @@ spec.loader.exec_module(functional)
 from metrics import (CaseComplete, Recorder, canonical, compare, join_server_timings,
                      qualify, summarize, validate_tool_events)
 from progress import ProgressTrace
-from tool_reasoning import ARGUMENTS, assert_edit
+from tool_reasoning import ARGUMENTS, assert_edit, assert_terminal_call, assert_no_envelope_framing
 from discovery import assert_model_listing
 from image_inputs import assert_color, image_cases, invalid_image_cases
 from cache_concurrency import check_cache_concurrency
@@ -30,10 +31,63 @@ from cache_disk_spacing import check_disk_spacing
 from cache_growth import check_cache_growth
 from cache_rotation import check_cache_rotation, check_snapshot_budget, host_available_bytes
 from server_metrics import (COUNTERS, TYPES, PROMPT, GENERATED, PROCESSING,
+                            CACHED, MAX_SEQUENCE, DRAFT_ROUNDS, DRAFTS, ACCEPTED, PROMPT_SECONDS,
+                            GENERATED_SECONDS, KV_USAGE, assert_slots,
                             parse_metrics, assert_accounting, validate_metrics_report)
 
 
 class FunctionalRunnerTest(unittest.TestCase):
+    def test_continuation_drop_reasoning_omits_seeded_tool_thought(self):
+        import continuation
+
+        class FirstRequestCaptured(Exception):
+            pass
+
+        control = None
+        for drop_reasoning in (False, True):
+            with self.subTest(drop_reasoning=drop_reasoning), \
+                    tempfile.TemporaryDirectory() as directory:
+                captured = []
+
+                def capture(url, body, stop_field=None):
+                    captured.append((deepcopy(body), stop_field))
+                    raise FirstRequestCaptured
+
+                argv = ["continuation.py", "--url", "http://example.invalid:1",
+                        "--output", str(Path(directory) / "unused.json"), "--tools",
+                        "--case", "reasoning_content-preserve1-sampled0",
+                        "--prefix-repetitions", "1"]
+                if drop_reasoning:
+                    argv.append("--drop-reasoning")
+                with patch.object(sys, "argv", argv), \
+                        patch.object(continuation.TRACE, "path", None), \
+                        patch.object(continuation, "call", side_effect=capture) as request, \
+                        patch("http.client.HTTPConnection.request",
+                              side_effect=AssertionError("HTTP is forbidden")) as http:
+                    with self.assertRaises(FirstRequestCaptured):
+                        continuation.main()
+                    request.assert_called_once()
+                    http.assert_not_called()
+                self.assertEqual(list(Path(directory).iterdir()), [])
+                body, stop_field = captured[0]
+                self.assertEqual(stop_field, "reasoning_content")
+                messages = body["messages"]
+                self.assertEqual([m["role"] for m in messages],
+                                 ["system", "user", "assistant", "tool"])
+                self.assertEqual(messages[2]["tool_calls"], [{
+                    "id": "fixture-call", "type": "function",
+                    "function": {"name": "read_fixture", "arguments": "{}"}}])
+                self.assertEqual(messages[3], {
+                    "role": "tool", "tool_call_id": "fixture-call",
+                    "content": "The fixture is ready. Answer the user's request directly."})
+                if drop_reasoning:
+                    self.assertNotIn("reasoning_content", messages[2])
+                    del control["messages"][2]["reasoning_content"]
+                    self.assertEqual(body, control)
+                else:
+                    self.assertEqual(messages[2]["reasoning_content"], "Read the fixture.")
+                    control = body
+
     def test_pi_proxy_discovery_and_missing_content_type(self):
         import http.client
         import http.server
@@ -125,6 +179,21 @@ class FunctionalRunnerTest(unittest.TestCase):
                        {"tools": [{"function": {"name": "edit", "arguments": "{}"}}]}):
             with self.subTest(change=change), self.assertRaises(AssertionError):
                 assert_edit({**result, **change})
+
+    def test_envelope_workflow_rejects_missing_calls_and_damaged_arguments(self):
+        command = "printf '%s' '</invoke>'"
+        call = {"function": {"name": "terminal", "arguments": json.dumps({"command": command})}}
+        result = {"text": "", "finish": "tool_calls", "tools": [call]}
+        assert_terminal_call(result, command)
+        for change in ({"tools": []}, {"tools": [call, call]}, {"finish": "stop"},
+                       {"tools": [{"function": {"name": "other", "arguments": call["function"]["arguments"]}}]},
+                       {"tools": [{"function": {"name": "terminal", "arguments":
+                                   json.dumps({"command": "echo '</' + 'invoke>'"})}}]}):
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                assert_terminal_call({**result, **change}, command)
+        for text in ("</invoke>", '<invoke name="terminal">', '<parameter name="command">pwd'):
+            with self.subTest(text=text), self.assertRaises(AssertionError):
+                assert_no_envelope_framing({**result, "text": text})
 
     def test_discovery_requires_an_explicit_expectation_before_starting_a_server(self):
         for suite in ("discovery", "all"):
@@ -308,19 +377,41 @@ class FunctionalRunnerTest(unittest.TestCase):
                 cached = 2995 if pinned and "drop_reasoning" in label else last - 5
             previous[label] = total
             return {"text": "BETA", "reasoning": "The code word is BETA."
-                    if body["reasoning_effort"] == "low" and not missing_reasoning else "",
+                    if body.get("reasoning_effort", "low") != "none"
+                    and not missing_reasoning else "",
                     "tools": [], "finish": "stop", "usage": {
                         "prompt_tokens": total, "cached_tokens": cached,
                         "completion_tokens": 8,
                         "gufo": {"prefill_tokens": total - cached}}}
 
+        class MessagesClient:
+            """Messages replay reproduces the previous turn, completion included."""
+            def __init__(self):
+                self.previous = {}
+
+            def post(self, path, body, cast_to):
+                assert path == "/messages" and cast_to is object
+                label = body["system"].splitlines()[0]
+                total = 3000 + (len(body["messages"]) - 1) * 100
+                last = self.previous.get(label, 0)
+                cached = total if total == last else min(total, last + 8) if last else 0
+                self.previous[label] = total
+                thinking = body["thinking"]["type"] == "enabled"
+                blocks = ([{"type": "thinking", "thinking": "The code word is BETA.",
+                            "signature": ""}] if thinking else [])
+                return {"content": blocks + [{"type": "text", "text": "BETA"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": total, "cache_read_input_tokens": cached,
+                                  "output_tokens": 8},
+                        "timings": {"prompt_n": total - cached}}
+
         with contextlib.redirect_stderr(io.StringIO()):
-            check_cache_growth(None, "fixture", checks, chat_result)
+            check_cache_growth(MessagesClient(), "fixture", checks, chat_result)
         return requests, checks
 
     def test_cache_growth_uses_real_replay_shapes_and_delays_cold_controls(self):
         requests, checks = self.run_cache_growth()
-        self.assertEqual(len(checks), 36)
+        self.assertEqual(len(checks), 54)
         for offset, replay in enumerate(("drop_reasoning", "keep_reasoning",
                                         "discard_reasoning", "thinking_off")):
             history = requests[offset * 9:(offset + 1) * 9]
@@ -496,6 +587,8 @@ class FunctionalRunnerTest(unittest.TestCase):
             text.replace(f"{PROCESSING} 0", f"{PROCESSING} 0.5"),
             text.replace(f"{GENERATED} 0", f"{GENERATED} nan"),
             text.replace(f"{GENERATED} 0", f"{GENERATED} inf"),
+            text.replace(f"{DRAFT_ROUNDS} 0", f"{DRAFT_ROUNDS} 0.5"),
+            text.replace(f"{KV_USAGE} 0", f"{KV_USAGE} 1.1"),
         ):
             with self.subTest(text=bad), self.assertRaises(ValueError):
                 parse_metrics(bad)
@@ -505,18 +598,25 @@ class FunctionalRunnerTest(unittest.TestCase):
         rows = [
             {"http_status": 200, "status": "complete", "metrics": {
                 "prompt_tokens": 100, "cached_tokens": 98,
-                "prefill_tokens": 2, "completion_tokens": 7}},
+                "prefill_tokens": 2, "completion_tokens": 7,
+                "draft_rounds": 3, "draft_tokens": 8, "draft_tokens_accepted": 5, "prefill_ms": 100, "decode_ms": 200}},
             {"http_status": 200, "status": "complete", "metrics": {
                 "prompt_tokens": 100, "cached_tokens": 100,
-                "prefill_tokens": 0, "completion_tokens": 3}},
+                "prefill_tokens": 0, "completion_tokens": 3,
+                "draft_rounds": 2, "draft_tokens": 4, "draft_tokens_accepted": 2, "prefill_ms": 0, "decode_ms": 100}},
             {"http_status": 400, "status": "complete", "metrics": {}},
         ]
-        after = {PROMPT: 12, GENERATED: 20}
+        after = {**before, PROMPT: 12, GENERATED: 20, CACHED: 208,
+                 MAX_SEQUENCE: 107, DRAFT_ROUNDS: 15, DRAFTS: 22, ACCEPTED: 17,
+                 PROMPT_SECONDS: 10.1, GENERATED_SECONDS: 10.3}
         assert_accounting(before, after, rows)
         for bad in ({PROMPT: 210, GENERATED: 20}, {PROMPT: 14, GENERATED: 30},
                     {PROMPT: 12, GENERATED: 19}):
             with self.subTest(after=bad), self.assertRaises(AssertionError):
-                assert_accounting(before, bad, rows)
+                assert_accounting(before, {**after, **bad}, rows)
+        for metric in (CACHED, MAX_SEQUENCE, DRAFT_ROUNDS, DRAFTS, ACCEPTED, PROMPT_SECONDS, GENERATED_SECONDS):
+            with self.subTest(metric=metric), self.assertRaises(AssertionError):
+                assert_accounting(before, {**after, metric: after[metric] + 1}, rows)
         rows[0]["status"] = "disconnected"
         with self.assertRaisesRegex(AssertionError, "missing completed"):
             assert_accounting(before, after, rows)
@@ -529,14 +629,15 @@ class FunctionalRunnerTest(unittest.TestCase):
                 {"request_id": "r2", "http_status": 200, "status": "complete"},
                 {"request_id": "r3", "http_status": 400, "status": "complete"}]}))
             (root / "metrics.json").write_text(json.dumps({"checks": {
-                "metrics_chat_cold": {"before": {PROMPT: 100, GENERATED: 200}},
+                "metrics_chat_cold": {"before": {**dict.fromkeys(COUNTERS, 0), PROMPT: 100, GENERATED: 200}},
                 "metrics_live_queue_cancel": {"cancelled": [{"cancelled": True}]},
-                "metrics_after_cancel_cached": {"after": {PROMPT: 112, GENERATED: 207}}}}))
+                "metrics_after_cancel_cached": {"after": {**dict.fromkeys(COUNTERS, 0),
+                    PROMPT: 112, GENERATED: 207, CACHED: 20, MAX_SEQUENCE: 24, DRAFT_ROUNDS: 3, DRAFTS: 8, ACCEPTED: 4}}}}))
             log = (
                 "[http] request=r1 event=completed status=200 prefill_tokens=12 "
-                "generated_tokens=3 finish=cancelled\n"
+                "generated_tokens=3 prompt_tokens=12 cached_tokens=0 draft_rounds=1 draft_proposed=4 draft_accepted=2 finish=cancelled\n"
                 "[http] request=r2 event=completed status=200 prefill_tokens=0 "
-                "generated_tokens=4 finish=length\n"
+                "generated_tokens=4 prompt_tokens=20 cached_tokens=20 draft_rounds=2 draft_proposed=4 draft_accepted=2 finish=length\n"
                 "[http] request=r3 event=completed status=400\n")
             (root / "server.log").write_text(log)
             self.assertEqual(validate_metrics_report(root), {"requests": 2, "cancelled": 1})
@@ -545,6 +646,22 @@ class FunctionalRunnerTest(unittest.TestCase):
             (root / "server.log").write_text(log.replace("generated_tokens=3", "generated_tokens=0"))
             with self.assertRaises(AssertionError):
                 validate_metrics_report(root)
+
+    def test_live_slots_reject_stale_identity_progress_and_prompt_disclosure(self):
+        slot = {"id": 0, "model": "test", "n_ctx": 4096, "speculative": True,
+                "is_processing": True, "id_task": 7, "task_id": 7, "state": 1,
+                "n_prompt_tokens": 20, "n_prompt_tokens_cache": 12,
+                "n_prompt_tokens_processed": 8, "prompt": "",
+                "next_token": [{"has_next_token": True, "has_new_line": False,
+                                "n_remain": 6, "n_decoded": 2}]}
+        assert_slots([slot], 1, "test", 4096, True)
+        for change in ({"prompt": "private"}, {"task_id": 0},
+                       {"n_prompt_tokens_processed": 7}, {"speculative": False},
+                       {"is_processing": False}, {"id": 2}):
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                assert_slots([{**slot, **change}], 1, "test", 4096, True)
+        with self.assertRaises(AssertionError):
+            assert_slots([slot, {**slot, "id": 1}], 2, "test", 4096, True)
 
     def test_fingerprints_preserve_schema_payload_ids(self):
         for key in ("schema", "parameters", "metadata", "arguments"):

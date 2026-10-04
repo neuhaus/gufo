@@ -649,6 +649,15 @@ sampling::JsonConstraint::ToolFormat TpMirroredRunner::ToolFormat() const {
   return inner_->ToolFormat();
 }
 
+// Device probes are local to rank 0's GPU and exchange nothing with rank 1.
+TextModelRunner::DeviceProbeStatus TpMirroredRunner::PollDevice() const {
+  return inner_->PollDevice();
+}
+
+bool TpMirroredRunner::DeviceUsable() const {
+  return inner_->DeviceUsable();
+}
+
 std::vector<TextRunnerToken> TpMirroredRunner::Tokenize(
     std::string_view text) const {
   return inner_->Tokenize(text);
@@ -710,6 +719,8 @@ void TpMirroredRunner::SetPromptContext(
       throw std::runtime_error("TP instruction send failed: " + failure_);
     }
   }
+  // The model reads the request's EOS handling from the state it runs on.
+  mirrored.inner().SetStopAtEos(state.stop_at_eos());
   inner_->SetPromptContext(mirrored.inner(), images);
 }
 
@@ -1273,6 +1284,7 @@ struct TpExecutor::Request {
       : prompt(std::move(tokens)),
         greedy(begin.sampling.can_use_unmodified_argmax() &&
                !begin.constrained),
+        stop_at_eos(begin.stop_at_eos),
         sampler(begin.sampling, prompt),
         own(states) {}
 
@@ -1283,6 +1295,7 @@ struct TpExecutor::Request {
   }
 
   std::vector<TextRunnerToken> prompt;
+  bool stop_at_eos{true};
   /// The request's prompt context (its images), rebuilt from `kSingle`.
   std::shared_ptr<const TextPromptContext> images;
   /// Under greedy decoding the logits are bit-identical on both ranks, so rank
@@ -1504,6 +1517,9 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
   try {
     auto& state = StateFor(instruction.state);
     auto& choice = request.own[instruction.state];
+    // Multi-token cycles stop at EOS unless the request ignores it, on both
+    // ranks alike.
+    state.SetStopAtEos(request.stop_at_eos);
     switch (instruction.op) {
       case TpInstructionOp::kSnapshot: {
         if (instruction.snapshot_id <= last_snapshot_id_)

@@ -312,6 +312,12 @@ if (BUILD_TESTING)
   add_compile_options(-UNDEBUG)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+  # Opt-in live process-failure checks, never preloaded into hosted tests or
+  # production. No HIP headers are needed for these stable C ABI hooks.
+  add_library(device_loss_faults SHARED EXCLUDE_FROM_ALL
+    tests/functional/device_loss_faults.cpp)
+  target_link_libraries(device_loss_faults PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+
   add_subdirectory(tests/models/qwen)
   add_subdirectory(tests/models/qwen27b)
   gufo_qwen3_asr_register_tests()
@@ -406,12 +412,18 @@ if (BUILD_TESTING)
 
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
+    src/cli/serve/logging.cpp
     src/cli/serve/openai_chat.cpp
   )
   target_link_libraries(openai_chat_test PRIVATE gufo_core)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
+
+  add_executable(quote_tracker_test tests/cli/quote_tracker_test.cpp)
+  target_link_libraries(quote_tracker_test PRIVATE gufo_core)
+  add_test(NAME quote_tracker_test COMMAND quote_tracker_test)
+  set_tests_properties(quote_tracker_test PROPERTIES LABELS "cpu;server;api")
 
   add_executable(http_server_test tests/cli/http_server_test.cpp)
   target_link_libraries(http_server_test PRIVATE gufo_http)

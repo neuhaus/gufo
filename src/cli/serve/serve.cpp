@@ -173,6 +173,32 @@ void ReportTerminationReason() {
   });
 }
 
+// Exit status after the GPU context is lost (EX_TEMPFAIL). Only a new process
+// recovers, so a supervisor must restart it.
+constexpr int kDeviceLostExitStatus = 75;
+
+// A lost GPU context cannot recover in-process. Leave through the SIGTERM
+// shutdown path so a supervisor restarts the server, and bound that teardown:
+// joining requests or freeing device memory may block on the dead device.
+void ShutdownAfterDeviceLoss() {
+  constexpr auto kShutdownTimeout = std::chrono::seconds(10);
+  // Arm the watchdog before logging or shutdown: neither a blocked log sink
+  // nor a dead-device join may prevent the forced exit.
+  try {
+    std::thread([kShutdownTimeout] {
+      std::this_thread::sleep_for(kShutdownTimeout);
+      ::_exit(kDeviceLostExitStatus);
+    }).detach();
+  } catch (...) {
+    ::_exit(kDeviceLostExitStatus);
+  }
+  server::Logger::Error(
+      "server", "event=device_lost_shutdown exit_status=" +
+                    std::to_string(kDeviceLostExitStatus) +
+                    " timeout_s=" + std::to_string(kShutdownTimeout.count()));
+  (void)std::raise(SIGTERM);
+}
+
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
   if (value == "minimal") {
     return ReasoningEffort::kMinimal;
@@ -1593,12 +1619,19 @@ int RunServe(std::span<const char* const> args) {
     tp_rank_zero = tp_world_size == 2;
   }
 
+  // run() joins every request thread, so no hook call outlives it.
+  std::atomic<bool> device_lost{false};
   server::HttpServer server(
       host, port, backend, video_jobs, tts, asr,
       server::HttpServerOptions{
           .max_request_body_bytes = max_request_body_bytes,
           .max_connections = max_connections,
           .api_key = std::move(api_key),
+          .on_device_lost =
+              [&device_lost] {
+                device_lost.store(true);
+                ShutdownAfterDeviceLoss();
+              },
       },
       images);
   std::string err;
@@ -1629,11 +1662,29 @@ int RunServe(std::span<const char* const> args) {
       }
     });
   }
-  server.run(/*handle_signals=*/true);
-  serving.store(false, std::memory_order_release);
-  if (pair_watch.joinable()) {
-    pair_watch.join();
+  const auto stop_pair_watch = [&serving, &pair_watch] {
+    serving.store(false, std::memory_order_release);
+    if (pair_watch.joinable()) {
+      pair_watch.join();
+    }
+  };
+  // Releasing model state on a lost device crashes; the kernel reclaims it.
+  // The backend is checked as well: an external SIGTERM can stop the server
+  // after the scheduler records the loss but before a request fires the hook.
+  const auto exit_if_device_lost = [&device_lost, &backend] {
+    if (device_lost.load() || (backend != nullptr && backend->device_lost())) {
+      ::_exit(kDeviceLostExitStatus);
+    }
+  };
+  try {
+    server.run(/*handle_signals=*/true);
+  } catch (...) {
+    stop_pair_watch();
+    exit_if_device_lost();
+    throw;
   }
+  stop_pair_watch();
+  exit_if_device_lost();
   return 0;
 }
 

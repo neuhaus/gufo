@@ -3,6 +3,35 @@
 The runner starts an isolated local server and checks real responses with the
 OpenAI SDK. Use production binaries and local weights; no models are downloaded.
 
+Device-loss process tests use a separate opt-in runner because each lost-device
+case must terminate its server. Build its CMake-owned preload helper, then run
+against a production binary and one explicitly selected model/mode:
+
+```sh
+nix develop -c cmake --preset cpu-test
+nix develop -c cmake --build --preset cpu-test --target device_loss_faults
+python3 tests/functional/device_loss.py \
+  --fault-library build/cpu-test/libdevice_loss_faults.so \
+  --output /tmp/device-loss-check -- \
+  /path/to/production/gufo serve llm --model /path/to/model.gguf \
+  --sessions 2 --context 4096 --think off --speculative off
+```
+
+It checks recoverable HIP errors, a pending probe's five-second timeout,
+buffered/streaming error contracts, idle loss without any HTTP traffic, arrival
+while an idle probe stays pending, cleanup avoidance and exit status 75.
+Buffered failures return JSON 503. Streams commit HTTP 200 at admission, so a
+failure during prefill or after the first token emits a terminal SSE error. A
+blocked SSE writer must still trigger the ten-second forced-exit watchdog,
+without a health request or peer disconnect. Repeat `--case` for focused checks.
+Reports retain commands, loaded mode, actual warm-generation drafts, raw
+responses and logs, including failures. These tests inject errors only inside
+the child process; they do not establish behavior after a physical GPU reset.
+The helper is excluded from normal builds and the runner stays outside hosted
+CI and `--suite all`. The existing scheduler/HTTP CPU tests cover sticky loss,
+queued peers, skipped invalidation and listener observation during a blocked
+write without loading weights.
+
 ```sh
 nix develop -c python3 tests/functional/run.py \
   --record-baseline --output /tmp/api-baseline --sampling-preset qwen38 \
@@ -49,24 +78,25 @@ draft limit for this suite. Audio and image/video generation have separate tests
 | `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery |
 | `tools` | Required/named/auto, schemas, literal arguments and tool history |
 | `auto-tools` | Focused subset for optional tool calls |
-| `tool-edges` | Referenced argument types, literal CR, unusual keys and named Responses metadata |
-| `tool-reasoning` | Quoted tags, literal edits, early stops and disabled tools across Chat/Responses |
+| `tool-edges` | Referenced argument types, literal CR, unusual keys, named Responses metadata, foreign tool markers in prose and parallel calls (no DeepSeek text after the call block) |
+| `tool-reasoning` | Quoted tags, exact literal arguments, early stops, disabled tools, envelope framing, completed tool-result continuations and warm replay of contaminated history; Chat/Responses |
 | `tool-agent` | Ordinary nested agent schemas, edit/read/finish turns, no protocol switch, limits, stops/retry, images and sampled peers |
 | `tool-agent-loop` | Bounded autonomous read/edit/verify loop; each turn checks cache reuse and detects repeated actions |
 | `tool-history` | Legacy names, result pairing, current-tool constraints, images, cached retry, stops/limits and sampled peers |
 | `tool-untyped` | Open/typed tools, refs and finite values: framing, arguments, streaming, turns, limits, stops/retry and sampled peers |
-| `tool-mixed` | JSON-only neighbors, annotated refs, extra keys, URI and nullable arguments across Chat/Responses; images, stops/retry and sampled peers |
+| `tool-mixed` | JSON-only neighbors, annotated refs, extra keys, URI and nullable arguments across Chat/Responses; images, stops/retry and sampled peers; a union neighbor keeps native calls, so a replayed reasoning/call turn is reused in full |
 | `tool-schema-edges` | Wildcard JSON types, conditional fields, impossible schemas, nested metadata and required-call timing; both APIs, cache, stops and sampled peers |
-| `state-edges` | Actual AR/draft execution, tiny thinking budgets, zero-argument tools, schema changes, stops, image retry and failed-request recovery |
+| `state-edges` | Actual AR/draft execution, tiny thinking budgets, zero-argument tools, schema changes, stops (including inside quoted calls), image retry and failed-request recovery |
 | `structured`, `structured-limits` | Request JSON schemas, SDK parsing, limits and stops |
 | `sampling-defaults`, `sampling-ranges` | CLI/request overrides, partial/null settings and range validation |
 | `batch` | Independent requests across Chat, Responses and Completions; sessions 1–8 |
 | `progress` | Opt-in progress on all text endpoints; output/sampling equality, limits, stops, images, batching and cancel/resume |
+| `stream-start` | Plain streams on all text endpoints send headers before a cold prefill completes; a stream queued behind every session sends them after the five-second bound |
 | `long-context` | Longer multi-turn recall, endpoint switching, sampled JSON and cancellation |
-| `metrics` | Live Prometheus counters, uncached work, endpoint totals, queueing and cancellation |
+| `metrics` | Live slots, Prometheus cache/time/draft counters, uncached work, endpoint totals, queueing and cancellation |
 | `cache` | Interrupted text/thinking/tool/image histories, ordinary and legacy tool names, RAM and disk restart; disk checkpoint spacing for a growing conversation and a branch restored after restart |
 | `cache-edits` | Reuse earlier work after editing the latest message, shortening an older tool result, or editing an earlier user message and dropping later turns; compare with uncached responses |
-| `cache-growth` | Keep cache reuse advancing over several turns when the client omits reasoning; check reasoning replay and thinking-off controls, and compare with uncached responses |
+| `cache-growth` | Keep cache reuse advancing over several turns when the client omits reasoning; check reasoning replay and thinking-off controls, including Messages thinking blocks, and compare with uncached responses |
 | `cache-rotation` | Check cache RAM limits and keep history across conversations and small side requests; compare answers with uncached controls |
 | `cache-shared-prefix` | New conversations under one system prompt, one after another, with long and short tasks: from the third on they restore the whole shared prefix; compare answers with uncached controls |
 | `cache-concurrency` | Concurrent identical prompts, shared-system fan-out with short and long tasks, short or no shared prefixes, a retained conversation beside a newcomer, and a cancelled leader; check waits, prefill work and uncached answers |
@@ -85,13 +115,43 @@ the runner removes that disk cache when the run ends, keeping reports and logs.
 For timing controls on revisions predating progress, use `--allow-missing-progress`
 with `--record-baseline`. Candidate qualification always requires progress events.
 Model runs stay outside hosted CI; CI checks the runner and measurement logic.
+The metrics suite reconciles verification-round counts with request timings and
+terminal logs, including cancelled requests; AR must report zero rounds and
+speculative modes must execute actual rounds.
 For metrics changes, run `--suite metrics` with AR and the affected speculative
 mode. It checks all three text endpoints and reconciles cancelled work with the
-terminal logs. Scrapes are not recorded as generation requests.
+terminal logs. It also checks both slot endpoints, active request identities and
+progress, queued-request exclusion, prompt privacy, idle cleanup, and the
+in-flight KV ratio. Concurrent shared-prefix requests also check that parked
+followers reserve slots and keep newer arrivals queued within `--sessions`.
+Scrapes are not recorded as generation requests.
+
+Tool framing is removed when it directly echoes an accepted call or a client
+`<invoke name="X">` envelope names a declared tool. Other raw XML, standalone
+closers and spelled vocabulary tokens are literal content. A full Qwen call naming
+a declared tool inside an unfinished fence or inline backtick span uses the
+legacy fallback only if its arguments satisfy the schema. Completed fences and inline
+spans keep markers literal; inline spans can cross nonblank lines, but a closing
+backtick must arrive before the next blank line. Streaming holds a possible call
+inside an open span until the final parse resolves it. These text-only rules
+cannot distinguish literal XML naming a declared tool from a failed envelope
+attempt, or an unfinished code example from a real call. Actual EOS handling
+uses token IDs in the backend.
+
+Server-authored JSON tool and response-format instructions are template framing;
+client message content remains literal text, including spelled tool delimiters.
+With tools declared, trailing whitespace can be held until the next decoded
+piece, so a streamed delta ending in whitespace may arrive one token later.
+Cancellation fixtures that stop after a fixed number of deltas can therefore
+replay different assistant text from main. Compare those timings using matched
+interrupted histories, not a direct baseline for the divergent session; this
+also applies to later disk-spacing and cancellation requests in that history.
 
 For real coding-agent regressions, run `pi_agent.py` against a local server with
 `--base-url`, `--model`, `--pi /path/to/pi-0.87.0`, `--server-log`, and a fresh
-`--output` directory.
+`--output` directory. Repeat `--case` to select affected tasks;
+`--case literal-protocol --passes 1` exercises a real write/read/verify loop
+containing literal ChatML vocabulary spellings.
 It replays #368's five tasks, verifies the generated code independently, and
 retains Pi sessions, HTTP/SSE and per-request timings. It executes generated
 commands in disposable fixtures using isolated Pi configuration. Use `--passes 1`
