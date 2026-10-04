@@ -654,7 +654,9 @@ TextModelRunner::DeviceProbeStatus TpMirroredRunner::PollDevice() const {
   return inner_->PollDevice();
 }
 
-bool TpMirroredRunner::DeviceUsable() const { return inner_->DeviceUsable(); }
+bool TpMirroredRunner::DeviceUsable() const {
+  return inner_->DeviceUsable();
+}
 
 std::vector<TextRunnerToken> TpMirroredRunner::Tokenize(
     std::string_view text) const {
