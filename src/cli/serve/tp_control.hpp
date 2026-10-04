@@ -161,6 +161,10 @@ struct TpControlCommand {
   /// so rank 1 neither checks rank 0's greedy choices nor runs multi-token
   /// cycles for the request. Set on the wire when `sampling` has a constraint.
   bool constrained{false};
+  /// kSingle only: false when the request decodes past EOS (a raw completion
+  /// with `ignore_eos`). Multi-token cycles stop at EOS on both ranks or on
+  /// neither.
+  bool stop_at_eos{true};
   /// kInstruction only. An instruction belongs to the `kSingle` request named
   /// by `sequence`, or with sequence 0 to none (a reset or drop between
   /// requests) or to the requests its batch names, and carries no request

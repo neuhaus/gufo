@@ -71,9 +71,10 @@ CPU (several cores in kernel workers) and latency per exchange. The links
 must train at 2 × 20 Gb/s; check `rx_speed` and `rx_lanes` in
 `/sys/bus/thunderbolt/devices/*/` after plugging.
 
-Sampling, streaming, stop sequences, tool calls, images (`--mmproj` on both
-ranks), cancellation, `--request-timeout-ms`, history reuse and the disk cache
-(`--cache-disk` on both ranks, each on its own disk) work as on one host.
+Chat and raw completions (including `ignore_eos`), sampling, streaming, stop
+sequences, tool calls, images (`--mmproj` on both ranks), cancellation,
+`--request-timeout-ms`, history reuse and the disk cache (`--cache-disk` on
+both ranks, each on its own disk) work as on one host.
 A RAM cache above the automatic budget needs the same `--cache-ram-bytes` on
 both ranks; the pair uses the smaller of the two ranks' limits.
 Cancellations and timeouts take effect between model calls, so a long prefill

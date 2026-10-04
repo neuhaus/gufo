@@ -3271,7 +3271,8 @@ struct InferenceBackend::Impl {
       InitialOutputState initial, Clock::time_point request_start,
       bool cache_prompt, std::size_t cache_prefix_tokens,
       std::shared_ptr<const TextPromptContext> context, bool return_progress,
-      std::optional<sampling::JsonConstraint::ToolFormat> tool_format) const {
+      std::optional<sampling::JsonConstraint::ToolFormat> tool_format,
+      bool stop_at_eos = true) const {
     if (state->tp_runner == nullptr || state->response_broker == nullptr ||
         state->communicator == nullptr || state->scheduler == nullptr) {
       throw std::logic_error("TP2 rank 0 is not fully configured");
@@ -3307,6 +3308,7 @@ struct InferenceBackend::Impl {
         .cache_prefix_tokens = static_cast<std::uint32_t>(cache_prefix_tokens),
         .client_id = client_id,
         .sampling = sampling,
+        .stop_at_eos = stop_at_eos,
     };
     if (context != nullptr) {
       begin.prompt_context = state->tp_runner->EncodePromptContext(*context);
@@ -3357,6 +3359,7 @@ struct InferenceBackend::Impl {
                   begin.sequence, std::move(context)),
               .cache_prompt = cache_prompt,
               .cache_prefix_tokens = cache_prefix_tokens,
+              .stop_at_eos = stop_at_eos,
               .stop_sequences = std::move(stop_sequences),
               .return_progress = return_progress,
           });
@@ -4332,6 +4335,16 @@ InferenceBackend::start_complete(
         ignore_eos, client_id, stop_sequences, return_progress);
   }
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
+  if (state->control != nullptr) {
+    // Raw completions carry no prompt context; rank 1 still has to execute
+    // every model call of the request.
+    return impl_->StartTpRequest(
+        state, std::move(prompt_tokens), max_tokens, sampling_config,
+        is_cancelled, stream_output,
+        client_id.empty() ? "anonymous" : std::string(client_id),
+        stop_sequences, InitialOutputState::kContent, request_start, true, 0,
+        nullptr, return_progress, std::nullopt, !ignore_eos);
+  }
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt_tokens), max_tokens, sampling_config, is_cancelled,
       stream_output,
