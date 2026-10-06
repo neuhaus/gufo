@@ -94,6 +94,15 @@ Limits:
 - Each session holds a full-context state on each rank. Full Q8 (six `Q8_0`
   shards, which do not fit one host) at 262,144 tokens uses 87 GB of each
   host's 127 GB GPU memory with four sessions and 103 GB with eight.
+- Where TP2 is still behind one host (gaps to close, not design choices):
+  - Requests with tools or a response schema decode one token at a time:
+    their constraint stays on rank 0, so rank 1 could not judge MTP drafts.
+  - No in-pass prompt checkpoint (`PrefillThrough`): the last prefill pass
+    stops at the checkpoint boundary and snapshots there.
+    `tp_executor_test` fails when the TP2 wrapper turns off a runner
+    capability that is not listed there as such a gap.
+  - A paired prefill chunk computes every row of the final layer, where one
+    host skips the rows nothing reads.
 
 ## Design
 
@@ -153,7 +162,9 @@ change the cache's boundaries.
 Rank 0's continuation disk store decides what is saved, restored and evicted,
 as on one host. Its file holds rank 0's half behind a header that names a
 random file key; when it writes the file, rank 1 persists its half under that
-key in the background. Restoring a file restores both halves, rank 1's from
+key in the background. Snapshots taken for the disk cache are complete on
+both ranks, so neither writer reads rows its session still shares.
+Restoring a file restores both halves, rank 1's from
 its own directory, acknowledged before rank 0 continues. Rank 1 bounds its
 directory by least-recent use within its own `--cache-disk-bytes`; a missing,
 corrupt or foreign half fails the restore on rank 1, which rank 0's store
