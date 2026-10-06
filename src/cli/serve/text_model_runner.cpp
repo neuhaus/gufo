@@ -22,6 +22,10 @@ std::optional<ChatRequest> ConstrainChatRequest(
     const ChatRequest& request, const TextModelRunner& runner,
     sampling::SamplingConfig* sampling,
     std::optional<sampling::JsonConstraint::ToolFormat>* tool_format) {
+  // Output parsing needs the model's dialect even without tool constraints
+  // (for example Qwen's whitespace boundary after </think>).
+  if (tool_format)
+    *tool_format = runner.ToolFormat();
   if (!request.response_format &&
       (request.tools.empty() ||
        request.tool_choice == ChatRequest::ToolChoice::kNone))
@@ -33,7 +37,6 @@ std::optional<ChatRequest> ConstrainChatRequest(
   if (!request.tools.empty() &&
       request.tool_choice != ChatRequest::ToolChoice::kNone) {
     std::vector<sampling::JsonConstraint::Tool> tools;
-    std::vector<std::pair<json::Value, bool>> schemas;
     const bool required =
         request.tool_choice == ChatRequest::ToolChoice::kRequired;
     auto format = runner.ToolFormat();
@@ -45,25 +48,13 @@ std::optional<ChatRequest> ConstrainChatRequest(
       const auto* strict = function ? function->find("strict") : nullptr;
       const bool enforce = strict && strict->as_bool();
       auto schema = json::parse(tool.parameters_json);
-      auto native = sampling::JsonConstraint::ToolParameters(schema, enforce,
-                                                             format, required);
+      auto native =
+          sampling::JsonConstraint::ToolParameters(schema, enforce, format);
       tools.emplace_back(tool.name, std::move(native));
-      schemas.emplace_back(std::move(schema), enforce);
-    }
-    if (std::ranges::any_of(
-            tools, [](const auto& tool) { return tool.second == nullptr; })) {
-      format = sampling::JsonConstraint::ToolFormat::kJson;
-      // Compile the fallback only when native parameter tags cannot represent
-      // these values. Normal native requests reuse the cached grammar directly.
-      for (std::size_t i = 0; i < tools.size(); ++i)
-        tools[i].second = sampling::JsonConstraint::ToolParameters(
-            schemas[i].first, schemas[i].second, format);
     }
     grammar = sampling::JsonConstraint::WithTools(
         grammar, std::move(tools), required,
         !request.response_format && request.parallel_tool_calls, format);
-    if (tool_format)
-      *tool_format = format;
     if (format == sampling::JsonConstraint::ToolFormat::kJson)
       instruction +=
           "\nIf a tool is needed, respond using the JSON tool-call form "
