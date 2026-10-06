@@ -214,6 +214,10 @@ public:
   std::size_t SnapshotPayloadBytes(const TextRunnerState& state) const override;
   std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override;
+  /// A complete snapshot on both ranks, which the disk cache writes while the
+  /// session runs on.
+  std::unique_ptr<TextRunnerSnapshot> SnapshotForPersistence(
+      const TextRunnerState& state) const override;
   void RestoreOrFork(TextRunnerState& state,
                      const TextRunnerSnapshot& snapshot) const override;
   [[nodiscard]] bool CanReuse(const TextRunnerState& state) const override;
@@ -250,6 +254,8 @@ private:
   };
 
   void Drop(std::uint64_t id) const noexcept;
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture(
+      const TextRunnerState& state, bool complete) const;
   /// Tells rank 1 to persist its half of `snapshot` and returns the header
   /// of rank 0's half.
   [[nodiscard]] std::vector<std::uint8_t> BeginPersist(

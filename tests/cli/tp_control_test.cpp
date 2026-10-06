@@ -286,6 +286,13 @@ int main() {
          .instruction = {
              .op = op, .index = 14, .snapshot_id = 0xffffffffffffffffULL}});
   }
+  // A snapshot for the disk cache is complete on rank 1 too.
+  round_trip({.sequence = command.sequence,
+              .kind = TpControlCommandKind::kInstruction,
+              .instruction = {.op = TpInstructionOp::kSnapshot,
+                              .index = 14,
+                              .offset = 1,
+                              .snapshot_id = 20}});
   round_trip(
       {.sequence = 0,
        .kind = TpControlCommandKind::kInstruction,
@@ -443,6 +450,11 @@ int main() {
           }));
   refuses("a snapshot with ID zero", with([](auto& bad) {
             bad.instruction = {.op = TpInstructionOp::kSnapshot};
+          }));
+  refuses("an unknown snapshot kind", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kSnapshot,
+                               .offset = 2,
+                               .snapshot_id = 1};
           }));
   refuses("a stray snapshot ID",
           with([](auto& bad) { bad.instruction.snapshot_id = 1; }));

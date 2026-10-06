@@ -111,6 +111,8 @@ struct TpInstruction {
   std::uint64_t index{0};
   std::uint32_t state{0};
   std::int32_t token{0};
+  /// Op-specific; for kSnapshot, 1 when the snapshot must be complete rather
+  /// than share the session's rows (SnapshotForPersistence).
   std::uint32_t offset{0};
   std::uint32_t count{0};
   std::uint32_t prompt_size{0};
