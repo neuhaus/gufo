@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -27,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -119,6 +121,8 @@ struct ToyOptions {
   bool extra_draft_once{false};
   /// Rank-1 fault: refuse to rebuild a request's prompt context.
   bool fail_context_decode{false};
+  /// Reported instead of the capabilities the options above imply.
+  std::optional<TextRunnerCapabilities> capabilities;
 };
 
 /// A toy "image": it shifts every logit of the sequence that sees it, and its
@@ -182,6 +186,7 @@ public:
         .state_abi = "toy-v1",
         .max_context = 256,
         .capabilities =
+            options_.capabilities ? *options_.capabilities :
             TextRunnerCapabilities{
                 .incremental_prefill = true,
                 .snapshot = options_.cache,
@@ -863,6 +868,36 @@ private:
   std::atomic<bool> passed_{false};
 };
 
+/// Every capability by name. A capability added to TextRunnerCapabilities
+/// stops this from compiling until TP2 decides how to carry it: forward it
+/// and mirror on rank 1 every call it enables, or list it in
+/// kTp2CapabilityGaps. Give it its capable value in the check in main too.
+std::vector<std::pair<std::string_view, std::size_t>> CapabilityFields(
+    const TextRunnerCapabilities& capabilities) {
+  const auto& [incremental_prefill, snapshot, fork,
+               final_token_advance_required, incremental_text_is_exact,
+               multi_token_decode, batched_multi_token_decode,
+               batched_multi_token_decode_max_width, prefix_reuse,
+               in_pass_checkpoint] = capabilities;
+  return {{"incremental_prefill", incremental_prefill},
+          {"snapshot", snapshot},
+          {"fork", fork},
+          {"final_token_advance_required", final_token_advance_required},
+          {"incremental_text_is_exact", incremental_text_is_exact},
+          {"multi_token_decode", multi_token_decode},
+          {"batched_multi_token_decode", batched_multi_token_decode},
+          {"batched_multi_token_decode_max_width",
+           batched_multi_token_decode_max_width},
+          {"prefix_reuse", prefix_reuse},
+          {"in_pass_checkpoint", in_pass_checkpoint}};
+}
+
+/// Capabilities TP2 turns off because rank 1 cannot mirror them yet. Each is
+/// a way a TP2 pair falls behind one host; closing one removes it here.
+constexpr std::array<std::string_view, 1> kTp2CapabilityGaps{
+    "in_pass_checkpoint",  // PrefillThrough: an in-pass prompt checkpoint
+};
+
 gufo::sampling::SamplingConfig Sampled() {
   gufo::sampling::SamplingConfig config;
   config.temperature = 0.9F;
@@ -877,6 +912,40 @@ gufo::sampling::SamplingConfig Sampled() {
 
 int main() {
   const std::vector<TextRunnerToken> prompt{5, 9, 13, 17, 21, 3, 8};
+
+  // TP2 keeps up with one host: the wrapper reports every capability of the
+  // runner it wraps, apart from the listed gaps.
+  {
+    const TextRunnerCapabilities every{
+        .incremental_prefill = true,
+        .snapshot = true,
+        .fork = true,
+        .final_token_advance_required = false,
+        .incremental_text_is_exact = true,
+        .multi_token_decode = true,
+        .batched_multi_token_decode = true,
+        .batched_multi_token_decode_max_width = 8,
+        .prefix_reuse = true,
+        .in_pass_checkpoint = true,
+    };
+    auto toy = std::make_shared<ToyRunner>(ToyOptions{.capabilities = every});
+    const TpMirroredRunner runner(toy, std::make_shared<CaptureSink>());
+    const auto inner = CapabilityFields(toy->Descriptor().capabilities);
+    const auto wrapped = CapabilityFields(runner.Descriptor().capabilities);
+    for (std::size_t i = 0; i < inner.size(); ++i) {
+      const std::string name(inner[i].first);
+      if (std::ranges::find(kTp2CapabilityGaps, inner[i].first) !=
+          kTp2CapabilityGaps.end()) {
+        Require(
+            wrapped[i].second != inner[i].second,
+            "TP2 now carries " + name + ": remove it from kTp2CapabilityGaps");
+      } else {
+        Require(wrapped[i].second == inner[i].second,
+                "TP2 drops " + name +
+                    ": mirror it on rank 1 or list it in kTp2CapabilityGaps");
+      }
+    }
+  }
 
   for (const bool mtp : {false, true}) {
     Pair pair({.mtp = mtp, .cache = true}, {.mtp = mtp, .cache = true});

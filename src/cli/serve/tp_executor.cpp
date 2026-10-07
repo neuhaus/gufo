@@ -612,6 +612,9 @@ void TpMirroredRunner::Record(
 
 TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   auto descriptor = inner_->Descriptor();
+  // An in-pass checkpoint would capture inside a call rank 1 cannot mirror
+  // yet; the scheduler then splits the pass at the boundary and snapshots.
+  descriptor.capabilities.in_pass_checkpoint = false;
   if (descriptor.persistence.has_value()) {
     // Rank 0's files hold its half and name rank 1's: neither a one-host
     // server nor a lone rank can restore them.
@@ -1023,6 +1026,13 @@ public:
   std::size_t PayloadBytes() const noexcept override {
     return inner->PayloadBytes();
   }
+  /// Rank 0's hint stands for both ranks: a state reached the same way holds
+  /// the same rows on rank 1.
+  [[nodiscard]] bool PrefersState(
+      const ContinuationState& state) const noexcept override {
+    const auto* mirrored = dynamic_cast<const State*>(&state);
+    return mirrored != nullptr && inner->PrefersState(mirrored->inner());
+  }
   std::shared_ptr<const TpMirroredRunner> owner;
   std::unique_ptr<TextRunnerSnapshot> inner;
   std::uint64_t id;
@@ -1100,6 +1110,16 @@ std::size_t TpMirroredRunner::SnapshotPayloadBytes(
 
 std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::Snapshot(
     const TextRunnerState& state) const {
+  return Capture(state, false);
+}
+
+std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::SnapshotForPersistence(
+    const TextRunnerState& state) const {
+  return Capture(state, true);
+}
+
+std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::Capture(
+    const TextRunnerState& state, bool complete) const {
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   const auto& mirrored = Mirrored(state);
   if (next_snapshot_id_ == std::numeric_limits<std::uint64_t>::max()) {
@@ -1120,9 +1140,11 @@ std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::Snapshot(
         mirrored.id(),
         {.op = TpInstructionOp::kSnapshot,
          .state = mirrored.id(),
+         .offset = complete ? 1U : 0U,
          .snapshot_id = id},
         [&] {
-          snapshot = inner_->Snapshot(mirrored.inner());
+          snapshot = complete ? inner_->SnapshotForPersistence(mirrored.inner())
+                              : inner_->Snapshot(mirrored.inner());
           if (!snapshot)
             throw std::runtime_error("snapshot capture returned null");
         });
@@ -1534,7 +1556,11 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
         const auto estimate = runner_->SnapshotPayloadBytes(state);
         if (estimate > snapshot_budget_ - snapshot_bytes_)
           throw std::runtime_error("worker snapshot budget exhausted");
-        auto snapshot = runner_->Snapshot(state);
+        // A snapshot for the disk cache is complete, as on rank 0: the
+        // writer thread must not read rows the session still shares.
+        auto snapshot = instruction.offset != 0
+                            ? runner_->SnapshotForPersistence(state)
+                            : runner_->Snapshot(state);
         if (!snapshot)
           throw std::runtime_error("snapshot capture returned null");
         const auto bytes = snapshot->PayloadBytes();

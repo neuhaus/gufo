@@ -43,6 +43,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
 #endif
+#include "src/cli/serve/trace.hpp"
 #ifdef GUFO_ENABLE_TP2_RDMA
 #include "src/models/qwen38_flash_next/kernels/rocm/verbs.hpp"
 #endif
@@ -240,6 +241,9 @@ struct ServerLogOptions {
 constexpr std::string_view kLogLevelHelp =
     "Log verbosity: error, warn, info or debug (default: info)";
 constexpr std::string_view kVerboseHelp = "Shorthand for --log-level=debug";
+constexpr std::string_view kTraceHelp =
+    "Append text request bodies, rendered prompts, generated text and replies "
+    "to PATH as JSON Lines; the file holds client content";
 
 void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
                       int* port, std::size_t* session_count,
@@ -621,6 +625,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string tp_bootstrap_host;
     std::string tp_control_token;
     bool log_progress = false;
+    std::string trace_path;
 
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
@@ -758,6 +763,7 @@ void PrintServeHelp(std::string_view program_name,
                    "Log live prefill and decode progress (needs "
                    "--log-level=info or debug)",
                    "Logging", &log_progress);
+    parser.AddOption("", "--trace", "PATH", kTraceHelp, "Logging", &trace_path);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
     parser.PrintHelp();
@@ -1192,6 +1198,7 @@ int RunServe(std::span<const char* const> args) {
     std::string tp_bootstrap_host;
     std::string tp_control_token;
     bool log_progress = false;
+    std::string trace_path;
 
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
@@ -1327,6 +1334,8 @@ int RunServe(std::span<const char* const> args) {
                        "Log live prefill and decode progress (needs "
                        "--log-level=info or debug)",
                        "Logging", &log_progress);
+    llm_parser.AddOption("", "--trace", "PATH", kTraceHelp, "Logging",
+                         &trace_path);
 
     add_server_options(llm_parser);
     if (!llm_parser.Parse(sub_args, &parse_err)) {
@@ -1348,6 +1357,18 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --log-progress needs --log-level=info or "
                    "--log-level=debug\n";
       return 2;
+    }
+    // Opened before the model loads, so an unwritable path fails at once
+    // instead of after the weights are resident.
+    if (!trace_path.empty()) {
+      if (const auto error = server::Trace::Open(trace_path)) {
+        std::cerr << "Error: cannot open --trace file '" << trace_path
+                  << "': " << *error << "\n";
+        return 2;
+      }
+      server::Logger::Warn("trace",
+                           "event=trace_enabled path=" + trace_path +
+                               " content=prompts,generated_text,replies");
     }
     sampling::SamplingConfig validated_sampling;
     const bool sampling_valid = !server::ParseSamplingConfig(

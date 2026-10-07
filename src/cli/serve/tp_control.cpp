@@ -27,7 +27,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 17;         // requests and rank-1 executor
+constexpr std::uint16_t kVersion = 18;         // requests and rank-1 executor
                                                // instructions for concurrent
                                                // requests
 constexpr std::uint16_t kHello = 1;
@@ -238,8 +238,9 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
               instruction.prompt_size <= kMaxPromptTokens;
       break;
     case TpInstructionOp::kSnapshot:
-      // The request's call count and digest so far.
-      valid = only(false, false, true, false, true);
+      // The request's call count and digest so far; offset 1 asks for a
+      // complete snapshot (for the disk cache).
+      valid = only(false, true, true, false, true) && instruction.offset <= 1;
       break;
     case TpInstructionOp::kRestore:
     case TpInstructionOp::kCancelPrepare:
