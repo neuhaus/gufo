@@ -177,9 +177,12 @@ between active decode rounds without changing a lone request's kernel policy.
 
 `--cache-ram-bytes 0` (the default) selects an automatic snapshot budget capped
 at 32 GiB and half the available host RAM after model/state allocation, respecting
-container limits. 27B also checks HIP free memory. A positive value sets a byte
-cap that may exceed the automatic budget, up to the available host RAM minus
-4 GiB; the startup line reports both as `automatic_bytes` and `max_bytes`.
+container limits. Available RAM is `MemAvailable` minus `CmaFree`: free CMA
+pages, such as the kernel's KHO scratch area on Ubuntu 26.04, only hold
+movable pages, not GPU allocations. 27B also checks HIP free memory. A
+positive value sets a byte cap that may exceed the automatic budget, up to the
+available host RAM minus 4 GiB; the startup line reports both as
+`automatic_bytes` and `max_bytes`.
 Disk staging and temporary disk-save buffers are separate from this RAM budget.
 The 128 checkpoint records are independent of `--sessions`; more than one can
 belong to a conversation.
@@ -214,11 +217,11 @@ its changed suffix again.
 
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
 before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
-`--cache-disk-staging-bytes 0` (the default) selects the smallest of 1 GiB,
-one eighth of available host RAM after model/session loading (including cgroup
-limits), and the disk budget. This bounds queued captures/writes and each disk
-read separately; it allocates nothing upfront. Live model state and retained
-RAM snapshots have separate budgets.
+`--cache-disk-staging-bytes 0` (the default) selects the smaller of one eighth
+of available host RAM after model/session loading (including cgroup limits) and
+the disk budget. This bounds queued captures/writes and each disk read
+separately; it allocates nothing upfront. Live model state and retained RAM
+snapshots have separate budgets.
 
 Snapshots that exceed either limit are skipped with their required size and
 available budget logged; live conversation reuse remains available. Existing

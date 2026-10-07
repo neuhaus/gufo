@@ -4079,12 +4079,12 @@ bool InferenceBackend::load(
           SetError(error, "TP worker disk cache needs model fingerprints");
           return false;
         }
+        // The same automatic staging as rank 0's continuation disk store.
         const std::size_t staging =
             disk_cache_config.staging_capacity_bytes != 0
                 ? disk_cache_config.staging_capacity_bytes
-                : std::min(
-                      disk_cache_config.capacity_bytes,
-                      TextRunnerDiskCacheOptions::kAutomaticStagingMaxBytes);
+                : std::min(disk_cache_config.capacity_bytes,
+                           HostSnapshotBudgetBytes() / 4);
         disk = std::make_shared<TpDiskStore>(
             TpDiskStore::Options{
                 .directory = disk_cache_config.directory,
