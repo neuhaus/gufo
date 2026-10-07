@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -140,6 +141,29 @@ enum class TpControlResponseKind : std::uint8_t {
   kInstruction = 2,
 };
 
+/// What rank 1 rebuilds a constrained request's constraint from, with the code
+/// rank 0 used: the tools and response format as the request carried them.
+struct TpConstraintSource {
+  struct Tool {
+    std::string name;
+    std::string description;
+    std::string parameters_json;
+    std::string definition_json;
+    bool operator==(const Tool&) const = default;
+  };
+  /// Empty without a response format.
+  std::string response_format_json;
+  /// The response format is in the Responses form.
+  bool response_format_responses{false};
+  std::vector<Tool> tools;
+  /// ChatRequest::ToolChoice.
+  std::uint8_t tool_choice{0};
+  bool parallel_tool_calls{true};
+  /// The output starts in reasoning (the runner's initial output state).
+  bool reasoning{false};
+  bool operator==(const TpConstraintSource&) const = default;
+};
+
 struct TpControlCommand {
   /// The request: the response correlation key, and the request an
   /// instruction belongs to.
@@ -159,10 +183,13 @@ struct TpControlCommand {
   /// its own choice only when this is greedy.
   sampling::SamplingConfig sampling{};
   /// kSingle only: decoding is constrained (structured output or a tool
-  /// call). The constraint itself stays on rank 0, which selects every token,
-  /// so rank 1 neither checks rank 0's greedy choices nor runs multi-token
-  /// cycles for the request. Set on the wire when `sampling` has a constraint.
+  /// call), so rank 1 does not check rank 0's greedy choices against its own
+  /// unconstrained ones. Set on the wire when `sampling` has a constraint.
   bool constrained{false};
+  /// kSingle only, with `constrained`: what rank 1 rebuilds the constraint
+  /// from, so it makes the same draft and acceptance decisions in multi-token
+  /// cycles. Without it, rank 0 decodes the request one token at a time.
+  std::optional<TpConstraintSource> constraint_source;
   /// kSingle only: false when the request decodes past EOS (a raw completion
   /// with `ignore_eos`). Multi-token cycles stop at EOS on both ranks or on
   /// neither.

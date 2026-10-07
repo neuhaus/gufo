@@ -825,6 +825,7 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     output->chat.response_format =
         ParseResponseFormat(body.find("response_format"));
     if (output->chat.response_format) {
+      output->chat.response_format_json = body.find("response_format")->dump();
       if (const auto* specification =
               body.find("response_format")->find("json_schema"))
         output->chat.response_format_description =
@@ -3192,8 +3193,11 @@ std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
                      "invalid_response_format");
       try {
         chat->response_format = ParseResponseFormat(&value, true);
-        if (chat->response_format)
+        if (chat->response_format) {
           chat->response_format_description = value.member_str("description");
+          chat->response_format_json = value.dump();
+          chat->response_format_responses = true;
+        }
       } catch (const std::exception& error) {
         return Error(400, "Bad Request", error.what(),
                      "invalid_response_format");

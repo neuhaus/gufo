@@ -121,6 +121,11 @@ struct ChatRequest {
   std::vector<std::string> stop_sequences;
   std::shared_ptr<const sampling::JsonConstraint> response_format;
   std::string response_format_description;
+  /// The response_format object as the request carried it (in the Responses
+  /// form when `response_format_responses`), so a TP2 worker can rebuild the
+  /// same constraint.
+  std::string response_format_json;
+  bool response_format_responses{false};
 };
 
 /// Model-agnostic text generation boundary used by the HTTP transport.

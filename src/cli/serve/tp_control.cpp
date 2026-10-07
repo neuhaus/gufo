@@ -27,7 +27,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 18;         // requests and rank-1 executor
+constexpr std::uint16_t kVersion = 19;         // requests and rank-1 executor
                                                // instructions for concurrent
                                                // requests
 constexpr std::uint16_t kHello = 1;
@@ -102,6 +102,28 @@ void AppendU64(std::vector<std::uint8_t>* out, std::uint64_t value) {
   }
 }
 
+void AppendString(std::vector<std::uint8_t>* out, const std::string& value) {
+  AppendU32(out, static_cast<std::uint32_t>(value.size()));
+  out->insert(out->end(), value.begin(), value.end());
+}
+
+bool ReadU32(std::span<const std::uint8_t> data, std::size_t* offset,
+             std::uint32_t* value, std::string* error);
+
+bool ReadString(std::span<const std::uint8_t> data, std::size_t* offset,
+                std::string* value, std::string* error) {
+  std::uint32_t size = 0;
+  if (!ReadU32(data, offset, &size, error))
+    return false;
+  if (data.size() - *offset < size) {
+    SetError(error, "TP control payload is truncated");
+    return false;
+  }
+  value->assign(reinterpret_cast<const char*>(data.data() + *offset), size);
+  *offset += size;
+  return true;
+}
+
 bool ReadU32(std::span<const std::uint8_t> data, std::size_t* offset,
              std::uint32_t* value, std::string* error) {
   if (*offset > data.size() || data.size() - *offset < sizeof(std::uint32_t)) {
@@ -147,7 +169,8 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
          command.cache_prefix_tokens != 0 || !command.prompt_tokens.empty() ||
          !command.client_id.empty() || !command.prompt_context.empty() ||
          !IsDefaultSampling(command.sampling) || command.constrained ||
-         command.sampling.constraint != nullptr || !command.stop_at_eos;
+         command.sampling.constraint != nullptr || !command.stop_at_eos ||
+         command.constraint_source.has_value();
 }
 
 [[nodiscard]] std::uint32_t FloatBits(float value) {
@@ -776,10 +799,28 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU64(&payload, config.repeat_last_n);
     AppendU32(&payload, FloatBits(config.frequency_penalty));
     AppendU32(&payload, FloatBits(config.presence_penalty));
-    // Request flags: bit 0 constrained decoding, bit 1 decoding past EOS.
-    AppendU32(&payload,
-              (command.constrained || config.constraint != nullptr ? 1U : 0U) |
-                  (command.stop_at_eos ? 0U : 2U));
+    // Request flags: bit 0 constrained decoding, bit 1 decoding past EOS,
+    // bit 2 the constraint's source follows.
+    const auto& source = command.constraint_source;
+    AppendU32(
+        &payload,
+        (command.constrained || config.constraint != nullptr || source ? 1U
+                                                                       : 0U) |
+            (command.stop_at_eos ? 0U : 2U) | (source ? 4U : 0U));
+    if (source) {
+      AppendString(&payload, source->response_format_json);
+      AppendU32(&payload, (source->response_format_responses ? 1U : 0U) |
+                              (source->parallel_tool_calls ? 2U : 0U) |
+                              (source->reasoning ? 4U : 0U));
+      AppendU32(&payload, source->tool_choice);
+      AppendU32(&payload, static_cast<std::uint32_t>(source->tools.size()));
+      for (const auto& tool : source->tools) {
+        AppendString(&payload, tool.name);
+        AppendString(&payload, tool.description);
+        AppendString(&payload, tool.parameters_json);
+        AppendString(&payload, tool.definition_json);
+      }
+    }
   } else {
     const auto& instruction = command.instruction;
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.op));
@@ -898,11 +939,44 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &flags, error)) {
       return reject("TP control request sampling is truncated");
     }
-    if (flags > 3) {
+    if (flags > 7 || ((flags & 4U) != 0 && (flags & 1U) == 0)) {
       return reject("TP control request flags are invalid");
     }
     parsed.constrained = (flags & 1U) != 0;
     parsed.stop_at_eos = (flags & 2U) == 0;
+    if ((flags & 4U) != 0) {
+      auto& source = parsed.constraint_source.emplace();
+      std::uint32_t source_flags = 0;
+      std::uint32_t tool_choice = 0;
+      std::uint32_t tool_count = 0;
+      if (!ReadString(command_prompt_, &offset, &source.response_format_json,
+                      error) ||
+          !ReadU32(command_prompt_, &offset, &source_flags, error) ||
+          !ReadU32(command_prompt_, &offset, &tool_choice, error) ||
+          !ReadU32(command_prompt_, &offset, &tool_count, error)) {
+        return reject("TP control request constraint is truncated");
+      }
+      // Each tool takes at least its four string sizes.
+      if (source_flags > 7 || tool_choice > 0xff ||
+          tool_count > (command_prompt_.size() - offset) / 16) {
+        return reject("TP control request constraint is invalid");
+      }
+      source.response_format_responses = (source_flags & 1U) != 0;
+      source.parallel_tool_calls = (source_flags & 2U) != 0;
+      source.reasoning = (source_flags & 4U) != 0;
+      source.tool_choice = static_cast<std::uint8_t>(tool_choice);
+      source.tools.resize(tool_count);
+      for (auto& tool : source.tools) {
+        if (!ReadString(command_prompt_, &offset, &tool.name, error) ||
+            !ReadString(command_prompt_, &offset, &tool.description, error) ||
+            !ReadString(command_prompt_, &offset, &tool.parameters_json,
+                        error) ||
+            !ReadString(command_prompt_, &offset, &tool.definition_json,
+                        error)) {
+          return reject("TP control request constraint is truncated");
+        }
+      }
+    }
     config.temperature = BitsFloat(temperature);
     config.top_k = static_cast<std::int32_t>(top_k);
     config.top_p = BitsFloat(top_p);

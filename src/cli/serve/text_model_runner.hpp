@@ -583,10 +583,14 @@ private:
 
 /// Build output constraints and attach server-authored instructions as framing,
 /// preserving client message content and the model's native prompt layout.
+/// `initial` replaces runner.InitialOutputState(request), for a TP2 worker
+/// that rebuilds rank 0's constraint without the request's messages.
 [[nodiscard]] std::optional<ChatRequest> ConstrainChatRequest(
     const ChatRequest& request, const TextModelRunner& runner,
     sampling::SamplingConfig* sampling,
-    std::optional<sampling::JsonConstraint::ToolFormat>* tool_format = nullptr);
+    std::optional<sampling::JsonConstraint::ToolFormat>* tool_format = nullptr,
+    std::optional<TextGenerationBackend::InitialOutputState> initial =
+        std::nullopt);
 
 }  // namespace gufo::server
 

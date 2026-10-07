@@ -3,7 +3,8 @@
 
 Use an isolated pair with at least two sessions and thinking disabled. Responses,
 stream chunks and per-request timings are retained even when a check fails.
-The unconstrained control must execute actual drafts in MTP mode.
+In MTP mode every request must execute actual drafts, constrained ones too:
+rank 1 rebuilds their constraint and mirrors their multi-token cycles.
 """
 
 import argparse
@@ -110,9 +111,7 @@ def ask(name, body):
             assert type(value['temperature']) is int and type(value['ok']) is bool, record
         else:
             assert message['content'] and not message.get('tool_calls'), record
-        if body.get('tools') or body.get('response_format'):
-            assert usage['draft_tokens'] == 0, record
-        elif args.speculative == 'mtp':
+        if args.speculative == 'mtp':
             assert usage['draft_tokens'] > 0, record
         if args.speculative == 'off':
             assert usage['draft_tokens'] == 0, record

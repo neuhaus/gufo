@@ -10,6 +10,9 @@
 #include <string_view>
 #include <utility>
 
+#include "src/cli/serve/response_format.hpp"
+#include "src/core/json.hpp"
+
 namespace gufo::server {
 namespace {
 
@@ -170,6 +173,37 @@ std::uint64_t RandomNonzero() {
          op == TpInstructionOp::kDecode ||
          op == TpInstructionOp::kAdvanceBatch ||
          op == TpInstructionOp::kDecodeBatch;
+}
+
+/// The constraint rank 0 bound for a request, built again from its source by
+/// the same code (ConstrainChatRequest) on this rank's runner.
+std::shared_ptr<const sampling::TokenConstraint> RebuildConstraint(
+    const TpConstraintSource& source, const TextModelRunner& runner) {
+  if (source.tool_choice >
+      static_cast<std::uint8_t>(ChatRequest::ToolChoice::kRequired))
+    throw std::invalid_argument("unknown tool choice");
+  ChatRequest request;
+  for (const auto& tool : source.tools)
+    request.tools.push_back({.name = tool.name,
+                             .description = tool.description,
+                             .parameters_json = tool.parameters_json,
+                             .definition_json = tool.definition_json});
+  request.tool_choice =
+      static_cast<ChatRequest::ToolChoice>(source.tool_choice);
+  request.parallel_tool_calls = source.parallel_tool_calls;
+  if (!source.response_format_json.empty()) {
+    const auto format = json::parse(source.response_format_json);
+    request.response_format =
+        ParseResponseFormat(&format, source.response_format_responses);
+  }
+  sampling::SamplingConfig config;
+  (void)ConstrainChatRequest(
+      request, runner, &config, nullptr,
+      source.reasoning ? TextGenerationBackend::InitialOutputState::kReasoning
+                       : TextGenerationBackend::InitialOutputState::kContent);
+  if (config.constraint == nullptr)
+    throw std::invalid_argument("the source describes no constraint");
+  return config.constraint;
 }
 
 }  // namespace
@@ -400,14 +434,28 @@ TpMirroredRunner::TpMirroredRunner(std::shared_ptr<TextModelRunner> inner,
   nonce_ = RandomNonzero();
 }
 
-void TpMirroredRunner::BeginRequest(std::uint64_t sequence) {
+void TpMirroredRunner::BeginRequest(std::uint64_t sequence,
+                                    bool constraint_mirrored) {
   const std::lock_guard<std::mutex> lock(mutex_);
   if (sequence == 0 || requests_.contains(sequence) ||
       unsettled_.contains(sequence) || rejected_.contains(sequence)) {
     throw std::logic_error("TP request is unnamed or already open");
   }
-  requests_.emplace(sequence, Request{});
+  requests_.emplace(sequence,
+                    Request{.constraint_mirrored = constraint_mirrored});
   unsettled_.insert(sequence);
+}
+
+bool TpMirroredRunner::CyclesMirrored(
+    const TextRunnerState& state, const sampling::SamplerState& sampler) const {
+  if (sampler.config().constraint == nullptr)
+    return true;
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto lease = leases_.find(Mirrored(state).id());
+  if (lease == leases_.end())
+    return false;
+  const auto request = requests_.find(lease->second);
+  return request != requests_.end() && request->second.constraint_mirrored;
 }
 
 bool TpMirroredRunner::EndRequest(std::uint64_t sequence, std::string* error) {
@@ -850,11 +898,11 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
   // through the base implementation instead, which selects here, on rank 0
   // only, and mirrors the `Advance`; forwarding it to the wrapped runner would
   // let that `Advance` bypass this wrapper.
-  // A constrained request (structured output, tool calls) also runs one
-  // token at a time: its constraint stays on rank 0, so rank 1 could not make
-  // a cycle's draft and acceptance decisions.
+  // A constrained request (structured output, tool calls) whose constraint
+  // rank 1 could not rebuild also runs one token at a time: rank 1 could not
+  // make a cycle's draft and acceptance decisions.
   if (max_tokens < 2 || !multi_token_decode_ ||
-      sampler.config().constraint != nullptr) {
+      !CyclesMirrored(state, sampler)) {
     return TextModelRunner::DecodeStep(state, max_tokens, sampler);
   }
   auto& mirrored = Mirrored(state);
@@ -883,11 +931,11 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
 std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
     std::span<const TextRunnerDecode> decodes) const {
   if (decodes.size() < 2 || !multi_token_decode_ ||
-      std::ranges::any_of(decodes, [](const TextRunnerDecode& decode) {
-        return decode.sampler.get().config().constraint != nullptr;
+      std::ranges::any_of(decodes, [this](const TextRunnerDecode& decode) {
+        return !CyclesMirrored(decode.state.get(), decode.sampler.get());
       })) {
-    // The base batch runs each member's DecodeStep, which takes constrained
-    // members one token at a time.
+    // The base batch runs each member's DecodeStep, which takes members with
+    // an unmirrored constraint one token at a time.
     return TextModelRunner::DecodeBatch(decodes);
   }
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
@@ -1301,13 +1349,15 @@ void TpMirroredRunner::RestorePersistentSnapshot(
 /// One open request on rank 1: what it needs to execute rank 0's calls for it
 /// and to judge them.
 struct TpExecutor::Request {
-  Request(const TpControlCommand& begin, std::vector<TextRunnerToken> tokens,
-          std::size_t states)
+  /// `sampling` is the request's, with its constraint when rank 1 rebuilt it.
+  Request(const TpControlCommand& begin,
+          const sampling::SamplingConfig& sampling,
+          std::vector<TextRunnerToken> tokens, std::size_t states)
       : prompt(std::move(tokens)),
         greedy(begin.sampling.can_use_unmodified_argmax() &&
                !begin.constrained),
         stop_at_eos(begin.stop_at_eos),
-        sampler(begin.sampling, prompt),
+        sampler(sampling, prompt),
         own(states) {}
 
   void Note(std::string message) {
@@ -1473,8 +1523,23 @@ bool TpExecutor::Open(const TpControlCommand& begin, std::string* error) {
     }
     prompt.push_back(static_cast<TextRunnerToken>(token));
   }
-  auto request =
-      std::make_unique<Request>(begin, std::move(prompt), states_.size());
+  // A constraint rank 1 cannot rebuild fails the request, not the pair.
+  auto sampling = begin.sampling;
+  std::string constraint_error;
+  if (begin.constraint_source) {
+    try {
+      sampling.constraint =
+          RebuildConstraint(*begin.constraint_source, *runner_);
+    } catch (const std::exception& exception) {
+      constraint_error = exception.what();
+    }
+  }
+  auto request = std::make_unique<Request>(begin, sampling, std::move(prompt),
+                                           states_.size());
+  if (!constraint_error.empty()) {
+    request->Note("rank 1 could not rebuild the request's constraint: " +
+                  constraint_error);
+  }
   if (!begin.prompt_context.empty()) {
     // A context rank 1 cannot rebuild fails the request, not the pair: its
     // calls still run, and the digest reports the difference.
