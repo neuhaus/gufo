@@ -54,12 +54,9 @@ struct TextRunnerRamCacheOptions {
 struct TextRunnerDiskCacheOptions {
   static constexpr std::size_t kDefaultCapacityBytes =
       std::size_t{8} * 1024U * 1024U * 1024U;
-  static constexpr std::size_t kAutomaticStagingMaxBytes =
-      std::size_t{1} * 1024U * 1024U * 1024U;
   std::filesystem::path directory;
   std::size_t capacity_bytes{kDefaultCapacityBytes};
-  /// Zero selects 1/8 of available host RAM, capped at 1 GiB and
-  /// capacity_bytes.
+  /// Zero selects 1/8 of available host RAM, capped at capacity_bytes.
   std::size_t staging_capacity_bytes{0};
   /// Shared prefixes shorter than this are cheaper to prefill than to restore.
   std::size_t shared_prefix_min_tokens{128};
@@ -74,8 +71,14 @@ struct TextRunnerDiskCacheOptions {
   std::size_t min_checkpoint_step_tokens{2048};
 };
 
-/// Automatic snapshot budget: half the host RAM available after loading,
-/// after cgroup limits.
+/// MemAvailable from /proc/meminfo text minus CmaFree, in bytes. Free CMA
+/// pages count as available but only hold movable pages, not GPU
+/// allocations; the kernel's KHO scratch area can make that several GiB.
+/// Nullopt when MemAvailable is missing.
+[[nodiscard]] std::optional<std::uint64_t> MeminfoAvailableBytes(
+    std::string_view meminfo);
+/// Automatic snapshot budget: half the host RAM available after loading
+/// (excluding free CMA pages), after cgroup limits.
 [[nodiscard]] std::size_t HostSnapshotBudgetBytes();
 /// RAM always left to the OS and other processes by an explicit cache limit.
 inline constexpr std::uint64_t kHostSnapshotHeadroomBytes = std::uint64_t{4}
