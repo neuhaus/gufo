@@ -6,6 +6,9 @@
 // token and the final logits: a prefill must not depend on its steps.
 // --decode-tail K instead feeds the last K tokens one at a time, as decoding
 // does: a token must compute the same whether prefilled or decoded.
+// --top N prints the prompt's N highest next-token logits before decoding,
+// to compare a close choice between TP2 and one host (--prompt-file reads a
+// rendered prompt, special tokens included).
 
 #include <hip/hip_runtime.h>
 
@@ -103,8 +106,10 @@ int main(int argc, char** argv) {
   float temperature = 0.0F;
   std::int64_t seed = 7;
   std::string bootstrap_host;
+  std::string rdma_device;
   std::uint32_t split = 0;
   std::uint32_t decode_tail = 0;
+  std::uint32_t top = 0;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -148,6 +153,25 @@ int main(int argc, char** argv) {
         Fail("--context requires an unsigned integer");
         return 2;
       }
+    } else if (arg == "--tp-rdma-device") {
+      rdma_device = next();
+    } else if (arg == "--top") {
+      if (!ParseUint(next(), &top)) {
+        Fail("--top requires an unsigned integer");
+        return 2;
+      }
+    } else if (arg == "--prompt-file") {
+      std::FILE* file = std::fopen(next().c_str(), "rb");
+      if (file == nullptr) {
+        Fail("--prompt-file cannot be read");
+        return 2;
+      }
+      prompt.clear();
+      char buffer[4096];
+      for (std::size_t n;
+           (n = std::fread(buffer, 1, sizeof(buffer), file)) > 0;)
+        prompt.append(buffer, n);
+      std::fclose(file);
     } else if (arg == "--tokens") {
       if (!ParseUint(next(), &tokens)) {
         Fail("--tokens requires an unsigned integer");
@@ -213,6 +237,7 @@ int main(int argc, char** argv) {
         .bootstrap_host = bootstrap_host,
         .bootstrap_port = port,
         .device_index = device,
+        .rdma_device = rdma_device,
         .gid_index = gid,
     };
     communicator = q::rocm::CreateIbrverbsCommunicator(config, &error);
@@ -371,6 +396,21 @@ int main(int argc, char** argv) {
   if (!session || !session->Sync(prompt_tokens, &error)) {
     Fail("prompt sync failed: " + error);
     return 1;
+  }
+  if (top > 0) {
+    const auto logits = session->Logits();
+    std::vector<std::int32_t> order(logits.size());
+    for (std::size_t i = 0; i < order.size(); ++i)
+      order[i] = static_cast<std::int32_t>(i);
+    const auto count = std::min<std::size_t>(top, order.size());
+    std::partial_sort(
+        order.begin(), order.begin() + count, order.end(),
+        [&](std::int32_t a, std::int32_t b) { return logits[a] > logits[b]; });
+    std::printf("rank=%u prompt=%zu top=%zu\n", rank, prompt_tokens.size(),
+                count);
+    for (std::size_t i = 0; i < count; ++i)
+      std::printf("  %d %.6f %s\n", order[i], logits[order[i]],
+                  model->TokenText(order[i]).c_str());
   }
 
   const gufo::sampling::SamplingConfig sampling{
