@@ -94,6 +94,13 @@ Limits:
 - Each session holds a full-context state on each rank. Full Q8 (six `Q8_0`
   shards, which do not fit one host) at 262,144 tokens uses 87 GB of each
   host's 127 GB GPU memory with four sessions and 103 GB with eight.
+- Logits differ slightly from one host's (reduction order; see the
+  measurements in EXPERIMENTS.md), so a close choice can go the other way. In
+  the `tool-reasoning` suite's case with `<|im_end|>` inside a tool argument,
+  one host writes a native `<tool_call>` (logit 18.83 against 17.19 for the
+  client markup `<`) and TP2 the client markup (17.68 against 18.49);
+  `qwen38_flash_next_tp_probe --top N --prompt-file FILE` shows such a choice
+  on either.
 - Where TP2 is still behind one host (gaps to close, not design choices):
   - Requests with tools or a response schema decode one token at a time:
     their constraint stays on rank 0, so rank 1 could not judge MTP drafts.
