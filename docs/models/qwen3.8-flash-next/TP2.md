@@ -95,8 +95,6 @@ Limits:
   shards, which do not fit one host) at 262,144 tokens uses 87 GB of each
   host's 127 GB GPU memory with four sessions and 103 GB with eight.
 - Where TP2 is still behind one host (gaps to close, not design choices):
-  - Requests with tools or a response schema decode one token at a time:
-    their constraint stays on rank 0, so rank 1 could not judge MTP drafts.
   - No in-pass prompt checkpoint (`PrefillThrough`): the last prefill pass
     stops at the checkpoint boundary and snapshots there.
     `tp_executor_test` fails when the TP2 wrapper turns off a runner
@@ -144,7 +142,11 @@ configuration and prepared images) and closes with `kEnd`. Mirrored calls:
 - prefill chunks, single and batched advances, and single and batched
   multi-token MTP cycles. A cycle carries rank 0's sampler draw state so both
   ranks draw alike; a batch also carries the draft count rank 0 chose from its
-  own cycle timings;
+  own cycle timings. A request with tools or a response format sends rank 1
+  what its constraint was built from (tools, response format, tool choice),
+  and rank 1 builds the same constraint with the same code, so it judges
+  drafts as rank 0 does; a constraint without that source decodes one token
+  at a time;
 - state resets, and binding a state to its request's prompt context (images
   can reset the state);
 - snapshot, restore, prefix reuse and cancellation preparation, each

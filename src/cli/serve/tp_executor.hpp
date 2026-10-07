@@ -149,7 +149,9 @@ public:
   /// Opens `sequence`, the request rank 1 was just told about. Its model calls
   /// are those on the state the pool leases to it, which `SetPromptContext`
   /// binds to the request through its `TpRequestContext`.
-  void BeginRequest(std::uint64_t sequence);
+  /// `constraint_mirrored`: rank 1 rebuilt the request's constraint, so its
+  /// multi-token cycles can be mirrored like an unconstrained request's.
+  void BeginRequest(std::uint64_t sequence, bool constraint_mirrored = false);
   /// Sends `kEnd` with the request's instruction count and digest and
   /// releases its state. Returns false when the send failed.
   [[nodiscard]] bool EndRequest(std::uint64_t sequence, std::string* error);
@@ -246,6 +248,7 @@ private:
   struct Request {
     std::uint64_t count{0};
     TpExecutionDigest digest;
+    bool constraint_mirrored{false};
   };
   /// Where an instruction went: its request and channel-wide index.
   struct Sent {
@@ -254,6 +257,11 @@ private:
   };
 
   void Drop(std::uint64_t id) const noexcept;
+  /// Whether rank 1 can mirror the multi-token cycles of the request `state`
+  /// is leased to: always without a constraint, else when rank 1 rebuilt it.
+  [[nodiscard]] bool CyclesMirrored(
+      const TextRunnerState& state,
+      const sampling::SamplerState& sampler) const;
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture(
       const TextRunnerState& state, bool complete) const;
   /// Tells rank 1 to persist its half of `snapshot` and returns the header

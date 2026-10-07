@@ -3348,7 +3348,9 @@ struct InferenceBackend::Impl {
       bool cache_prompt, std::size_t cache_prefix_tokens,
       std::shared_ptr<const TextPromptContext> context, bool return_progress,
       std::optional<sampling::JsonConstraint::ToolFormat> tool_format,
-      bool stop_at_eos = true) const {
+      bool stop_at_eos = true,
+      std::optional<TpConstraintSource> constraint_source =
+          std::nullopt) const {
     if (state->tp_runner == nullptr || state->response_broker == nullptr ||
         state->communicator == nullptr || state->scheduler == nullptr) {
       throw std::logic_error("TP2 rank 0 is not fully configured");
@@ -3384,6 +3386,7 @@ struct InferenceBackend::Impl {
         .cache_prefix_tokens = static_cast<std::uint32_t>(cache_prefix_tokens),
         .client_id = client_id,
         .sampling = sampling,
+        .constraint_source = std::move(constraint_source),
         .stop_at_eos = stop_at_eos,
     };
     if (context != nullptr) {
@@ -3422,7 +3425,8 @@ struct InferenceBackend::Impl {
       tp_open->fetch_sub(1);
       throw std::runtime_error("TP worker command failed: " + error);
     }
-    state->tp_runner->BeginRequest(begin.sequence);
+    state->tp_runner->BeginRequest(begin.sequence,
+                                   begin.constraint_source.has_value());
     auto tp = std::make_unique<TpRequest>(state, tp_open, begin.sequence);
     try {
       auto scheduled = state->scheduler->Submit(
@@ -4471,12 +4475,35 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
   if (state->control != nullptr) {
+    // Rank 1 rebuilds a constraint from what ConstrainChatRequest built it
+    // from, so its multi-token cycles decide what rank 0's do.
+    std::optional<TpConstraintSource> constraint_source;
+    if (effective_sampling.constraint != nullptr &&
+        (request.response_format == nullptr ||
+         !request.response_format_json.empty())) {
+      auto& source = constraint_source.emplace();
+      if (request.response_format != nullptr) {
+        source.response_format_json = request.response_format_json;
+        source.response_format_responses = request.response_format_responses;
+      }
+      for (const auto& tool : request.tools)
+        source.tools.push_back({.name = tool.name,
+                                .description = tool.description,
+                                .parameters_json = tool.parameters_json,
+                                .definition_json = tool.definition_json});
+      source.tool_choice = static_cast<std::uint8_t>(request.tool_choice);
+      source.parallel_tool_calls = request.parallel_tool_calls;
+      source.reasoning =
+          state->scheduler->runner().InitialOutputState(request) ==
+          TextGenerationBackend::InitialOutputState::kReasoning;
+    }
     return impl_->StartTpRequest(
         state, std::move(prompt->tokens), max_tokens, effective_sampling,
         is_cancelled, stream_output, client_id, request.stop_sequences,
         state->scheduler->runner().InitialOutputState(effective_request),
         request_start, request.cache_prompt, prompt->cache_prefix_tokens,
-        std::move(prompt->context), request.return_progress, tool_format);
+        std::move(prompt->context), request.return_progress, tool_format, true,
+        std::move(constraint_source));
   }
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt->tokens), max_tokens, effective_sampling, is_cancelled,

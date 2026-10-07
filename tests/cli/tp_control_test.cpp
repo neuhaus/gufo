@@ -226,6 +226,31 @@ int main() {
     Require(client->ReceiveCommand(&got_past_eos, &client_error), client_error);
     Require(!got_past_eos.stop_at_eos && got_past_eos.constrained,
             "TP C1 command carries EOS handling beside the constraint flag");
+    Require(!got_past_eos.constraint_source,
+            "TP C1 command carries no constraint source unless given one");
+
+    // Rank 1 rebuilds a constraint from its source: every field survives.
+    TpControlCommand sourced = command;
+    sourced.sequence = 11;
+    sourced.constrained = true;
+    sourced.constraint_source = gufo::server::TpConstraintSource{
+        .response_format_json = R"({"type":"json_object"})",
+        .response_format_responses = true,
+        .tools = {{.name = "lookup",
+                   .description = "Look up a city.",
+                   .parameters_json = R"({"type":"object"})",
+                   .definition_json = R"({"type":"function"})"},
+                  {.name = "empty"}},
+        .tool_choice = 2,
+        .parallel_tool_calls = false,
+        .reasoning = true,
+    };
+    Require(server->SendCommand(sourced, &server_error), server_error);
+    TpControlCommand got_sourced;
+    Require(client->ReceiveCommand(&got_sourced, &client_error), client_error);
+    Require(got_sourced.constrained &&
+                got_sourced.constraint_source == sourced.constraint_source,
+            "TP C1 command carries the constraint source exactly");
   }
 
   // An instruction is one model call for rank 1 to execute within the request
