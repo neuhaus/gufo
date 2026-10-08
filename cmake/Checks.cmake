@@ -25,7 +25,8 @@ list(APPEND gufo_pr_tests
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"
   "qwen38_flash_next\\.tp_partition" "qwen38_flash_next\\.rdma_gid"
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
-  gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test)
+  gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test
+  kernel_resources_parser_test)
 list(JOIN gufo_pr_tests "|" gufo_pr_pattern)
 add_custom_target(check-pr
   COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure --no-tests=error

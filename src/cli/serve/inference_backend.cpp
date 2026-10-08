@@ -33,6 +33,7 @@
 #include "src/core/json.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
+#include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -2741,16 +2742,17 @@ public:
                                    : model_->PrefillCapacity()});
     const std::size_t next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
-    // The next step's tokens, so their n-gram rows load during this one. It
-    // takes the rest as one pass when the rest fits, like this step.
-    const std::size_t rest = prompt.size() - next_position;
-    qfn.session().SetPrefillLookahead(QwenFlashNextEngineTokens(prompt.subspan(
+    // The next step most likely takes the same budget; its n-gram rows are
+    // read during this one and used only if it does.
+    const std::size_t after = prompt.size() - next_position;
+    const auto next = QwenFlashNextEngineTokens(prompt.subspan(
         next_position,
-        rest <= model_->PrefillThroughCapacity()
-            ? rest
-            : std::min<std::size_t>(rest, model_->PrefillCapacity()))));
+        std::min<std::size_t>({max_input_tokens, after,
+                               after <= model_->PrefillThroughCapacity()
+                                   ? model_->PrefillThroughCapacity()
+                                   : model_->PrefillCapacity()})));
     std::string error;
-    if (!qfn.session().Sync(prefix, &error)) {
+    if (!qfn.session().Sync(prefix, &error, next)) {
       qfn.set_position(0);
       throw std::runtime_error("Qwen3.8-Flash-Next prefill failed: " + error);
     }
