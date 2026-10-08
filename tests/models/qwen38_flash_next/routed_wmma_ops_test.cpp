@@ -364,13 +364,19 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   }
 
   if (tile_rows == 48 &&
-      (type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K)) {
+      (type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K ||
+       (type == q::WeightType::kQ8_0 && used > 1))) {
     // Different gate/up weights, with the up scale small enough that these
     // deliberately large synthetic weights do not overflow the F16 output.
     auto up = w.packed;
-    const std::size_t block_bytes = type == q::WeightType::kQ4_K ? 144 : 176;
+    const bool q8 = type == q::WeightType::kQ8_0;
+    const std::size_t block_bytes = q8                             ? 34
+                                    : type == q::WeightType::kQ4_K ? 144
+                                                                   : 176;
+    const std::vector<std::size_t> scales =
+        q8 ? std::vector<std::size_t>{0} : std::vector<std::size_t>{0, 2};
     for (std::size_t b = 0; b < up.size(); b += block_bytes) {
-      for (std::size_t offset : {0U, 2U}) {
+      for (std::size_t offset : scales) {
         __half scale;
         std::memcpy(&scale, up.data() + b + offset, sizeof(scale));
         scale = __float2half(__half2float(scale) / 1024.0F);
@@ -727,6 +733,9 @@ int main() {
     // Q5_K gate/up view (one layer).
     ok = Ok(Run(q::WeightType::kQ5_K, 300, 10, 64, 640, 2560, 0x5A5A0001U)) &&
          ok;
+    // Q8_0 gate/up view (the full Q8 model), separate and paired.
+    ok = Ok(Run(q::WeightType::kQ8_0, 300, 10, 64, 640, 2560, 0x08080001U)) &&
+         ok;
     // Q8_0 down view (five layers keep Q8_0 down projections).
     ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U,
                 64)) &&
@@ -753,6 +762,9 @@ int main() {
                   tile)) &&
            ok;
       ok = Ok(Run(q::WeightType::kQ5_K, 300, 10, 64, 320, 2560, 0x32000002U,
+                  tile)) &&
+           ok;
+      ok = Ok(Run(q::WeightType::kQ8_0, 300, 10, 64, 320, 2560, 0x32000005U,
                   tile)) &&
            ok;
     }

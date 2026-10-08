@@ -4890,7 +4890,9 @@ bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
                           const std::int32_t* rows_in,
                           const std::int32_t* rows_out, __half* out,
                           std::size_t m, std::size_t k, hipStream_t stream) {
-  if (m == 0 || k == 0 || k % 256 != 0 || n_tiles == 0 || out == nullptr) {
+  const std::size_t block_elems = type == WeightType::kQ8_0 ? 64 : 256;
+  if (m == 0 || k == 0 || k % block_elems != 0 || n_tiles == 0 ||
+      out == nullptr) {
     return false;
   }
   const dim3 grid(static_cast<unsigned int>((m + 63) / 64), n_tiles);
@@ -4904,6 +4906,12 @@ bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
     case WeightType::kQ5_K:
       hipLaunchKernelGGL(
           (RoutedF16GEMMKernel<WeightType::kQ5_K, 128, BN, 2, true>), grid,
+          dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
+          rows_out, nullptr, nullptr, out, m, k, up);
+      return true;
+    case WeightType::kQ8_0:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ8_0, 128, BN, 2, true>), grid,
           dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
           rows_out, nullptr, nullptr, out, m, k, up);
       return true;

@@ -46,7 +46,7 @@ TP2.
 
 | Perplexity | Q4 | Q8 |
 | --- | --- | --- |
-| Gufo, TP2 | 2.1093 | 2.0957 |
+| Gufo, TP2 | 2.1093 | 2.1053 |
 | Gufo, one host | 2.1168 | does not fit |
 | llama.cpp | 2.1311 | 2.1218 |
 
@@ -54,9 +54,14 @@ TP2.
 | --- | --- | --- |
 | Gufo Q4 one host, Gufo Q4 TP2 | 0.019 | 97.1% |
 | llama.cpp Q8, llama.cpp Q4 | 0.060 | 94.4% |
-| Gufo Q8, Gufo Q4 | 0.070 | 94.0% |
+| Gufo Q8, Gufo Q4 | 0.067 | 93.4% |
 | llama.cpp Q4, Gufo Q4 | 0.090 | 93.0% |
-| llama.cpp Q8, Gufo Q8 | 0.093 | 93.1% |
+| llama.cpp Q8, Gufo Q8 | 0.087 | 93.4% |
+
+Q8 rows were remeasured on October 9 after the routed Q8_0 experts moved to
+the F16 WMMA route (2.0957, 0.093/93.1% and 0.070/94.0% before). The Q8 run
+saved for the Q4 pair is that revision's; on it, Gufo Q4 TP2 scores 2.1182,
+unchanged by the expert route.
 
 Q4 to Q8 moves Gufo about as much as it
 moves llama.cpp, but the two implementations differ by more than that on both

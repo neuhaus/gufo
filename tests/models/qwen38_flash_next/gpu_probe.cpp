@@ -6,6 +6,7 @@
 // TP=2 probe: --tp-rank 0|1 --tp-world-size 2
 //              --tp-bootstrap-host HOST --tp-bootstrap-port PORT
 //              --tp-operation-id N (same on both ranks)
+//              [--tp-rdma-device NAME] (required with several devices)
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
 //                      [--depth N] (default: 0, 4096, 32768)
@@ -305,6 +306,7 @@ int main(int argc, char** argv) {
   std::uint32_t tp_rank = 0;
   std::uint32_t tp_world_size = 1;
   std::string tp_bootstrap_host;
+  std::string tp_rdma_device;
   std::uint16_t tp_bootstrap_port = 18515;
   std::uint32_t tp_device = 0;
   std::uint32_t tp_gid = 0;
@@ -387,6 +389,8 @@ int main(int argc, char** argv) {
       }
     } else if (arg == "--tp-bootstrap-host") {
       tp_bootstrap_host = next();
+    } else if (arg == "--tp-rdma-device") {
+      tp_rdma_device = next();
     } else if (arg == "--prompt") {
       prompt = next();
     } else if (arg == "--prompt-file" || arg == "--decode-file") {
@@ -516,6 +520,7 @@ int main(int argc, char** argv) {
         .bootstrap_host = tp_bootstrap_host,
         .bootstrap_port = tp_bootstrap_port,
         .device_index = tp_device,
+        .rdma_device = tp_rdma_device,
         .gid_index = tp_gid,
     };
     communicator = q::rocm::CreateIbrverbsCommunicator(config, &error);

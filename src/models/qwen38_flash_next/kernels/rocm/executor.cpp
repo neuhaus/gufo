@@ -2461,15 +2461,43 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       l.ffn_down_exps.type == GgmlType::kQ8_0) {
     // Catch-up retains only the final predictor residual. Keep the router
     // and shared-expert shapes, then run its routed experts with the same
-    // tiled quantization and accumulation as the complete prompt batch.
+    // tiled F16 route and accumulation as the complete prompt batch.
     const auto base = s_;
     UseScratch(RowScratch(base, n_tokens - 1));
     PrefillPhase phase(true);
     try {
       const std::size_t offset =
           static_cast<std::size_t>(n_tokens - 1) * c.hidden_size;
+      // The routed tiles cover this row's slots alone, so count them alone.
+      ExpertCounts(s_.ids, s_.expert_counts, 1, c.num_experts, used, stream_);
+      if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
+                                c.num_experts * sizeof(std::uint32_t),
+                                hipMemcpyDeviceToHost, stream_),
+                 "expert counts download", error_msg) ||
+          !Check(hipEventRecord(counts_ready_, stream_), "expert counts event",
+                 error_msg)) {
+        UseScratch(base);
+        return false;
+      }
       const bool ok = MoeExperts(l, x + offset, out + offset, 1, error_msg);
+      // A deferred epilogue runs in the combine over all rows, which reads
+      // F16 expert rows at their F16 offsets; the row scratch placed this
+      // row at its F32 offset.
+      const bool pending = ok && moe_pending_;
       UseScratch(base);
+      if (pending) {
+        const std::size_t row = static_cast<std::size_t>(used) * c.hidden_size;
+        auto* down = reinterpret_cast<__half*>(base.down_e);
+        if (n_tokens > 1 &&
+            !Check(hipMemcpyAsync(down + (n_tokens - 1) * row,
+                                  down + 2 * (n_tokens - 1) * row,
+                                  row * sizeof(__half), hipMemcpyDeviceToDevice,
+                                  stream_),
+                   "final expert row", error_msg)) {
+          return false;
+        }
+        moe_pending_ = true;
+      }
       return ok && AllReduce(out + offset, 1, error_msg);
     } catch (...) {
       UseScratch(base);
@@ -2499,7 +2527,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   // F16 matrix-core GEMM per (expert, row tile).
   const bool wmma_experts = ExpertMatrixRows(n_tokens) &&
                             (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
-                             l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
+                             l.ffn_gate_exps.type == GgmlType::kQ5_K ||
+                             l.ffn_gate_exps.type == GgmlType::kQ8_0) &&
                             l.ffn_up_exps.type == l.ffn_gate_exps.type &&
                             (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
                              l.ffn_down_exps.type == GgmlType::kQ8_0) &&
@@ -2524,9 +2553,10 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // Large batches pair the gate/up projections and apply SwiGLU without
     // materializing the gate. Smaller buckets favor separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
-    const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
-                                     ? WeightType::kQ5_K
-                                     : WeightType::kQ4_K;
+    const WeightType gate_type =
+        l.ffn_gate_exps.type == GgmlType::kQ5_K   ? WeightType::kQ5_K
+        : l.ffn_gate_exps.type == GgmlType::kQ8_0 ? WeightType::kQ8_0
+                                                  : WeightType::kQ4_K;
     const bool gated_ok =
         n_tokens >= 1024 && routed_tile_rows_ == 48
             ? RoutedGatedF16Gemm(
