@@ -20,7 +20,8 @@ from .render import TODO, _depth_label, _fmt, _fmt_stat, _number, _serving_rate,
 TP2 = "gufo-tp2"
 TP2_Q8 = "gufo-tp2-q8"
 ONE_HOST = "gufo-onehost"
-TABLES = ("single-ar-tp2", "single-mtp-tp2", "multi-ar-tp2", "multi-mtp-tp2", "tp2-q8")
+TABLES = ("single-ar-tp2", "single-mtp-tp2", "multi-ar-tp2", "multi-mtp-tp2", "tp2-q8",
+          "tp2-q8-multi")
 # Readers know the link, not the parallelism scheme: tables and charts say RDMA.
 RDMA = "Gufo RDMA"
 Q8_LABEL = "Flash-Next Q8 RDMA"
@@ -136,6 +137,18 @@ def render_table(config: BenchConfig, table_id: str) -> str:
             cells += [_stat(report, depth, "tg") for report in mtp_reports]
             rows.append([_depth_label(depth), *(cell or TODO for cell in cells)])
         return _table(header, rows)
+    if table_id == "tp2-q8-multi":
+        ar = config.table("multi-ar")
+        workloads = config.table("multi-mtp").workload_tables()
+        mode = config.speculative["mode"]
+        reports = [load_artifact(artifact_path(config, ar, TP2_Q8, "ar"))]
+        reports += [load_artifact(artifact_path(config, w, TP2_Q8, mode)) for w in workloads]
+        spec = config.speculative["label"]
+        header = [f"{Q8_LABEL}<br>Users", "AR (tok/s)"]
+        header += [f"{spec} {w.spec['label']} (tok/s)" for w in workloads]
+        rows = [[str(users), *(_rate(report, users) or TODO for report in reports)]
+                for users in ar.spec["concurrency"]]
+        return _table(header, rows)
     raise SystemExit(f"no TP2 renderer for table {table_id}")
 
 
@@ -150,6 +163,8 @@ def chart_rdma(config: BenchConfig, table_id: str, rows: dict[str, dict[str, str
     Returns the chart's title, or None when there is nothing to draw."""
     if table_id == "tp2-q8":
         return Q8_LABEL if chart_q8(config, rows, path) else None
+    if table_id == "tp2-q8-multi":
+        return f"{Q8_LABEL}, multiple users" if chart_q8_multi(rows, path) else None
     from .charts import COLORS, TEXT, _bars, _depth_ticks, _has_data, _lines, _plt, _series
 
     base = config.table(BASE_TABLES[table_id])
@@ -229,6 +244,30 @@ def chart_q8(config: BenchConfig, rows: dict[str, dict[str, str]], path: Path) -
     names = [n for ax in (left, right) for n in ax.get_legend_handles_labels()[1]]
     left.legend(handles, names, loc="lower left", ncol=2)
     fig.suptitle(f"{Q8_LABEL} · single user", x=0.01, ha="left", fontsize=10, color=TEXT)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, format="svg", metadata={"Date": None, "Creator": None})
+    plt.close(fig)
+    path.write_text("\n".join(line.rstrip() for line in path.read_text().splitlines()) + "\n")
+    return True
+
+
+def chart_q8_multi(rows: dict[str, dict[str, str]], path: Path) -> bool:
+    """Summed decode rates by concurrent users, one bar per mode."""
+    from .charts import COLORS, TEXT, _bars, _has_data, _plt, _series
+
+    labels = list(rows)
+    headers = list(next(iter(rows.values()), {}))
+    colors = [COLORS["gufo"], COLORS["spec"], COLORS["ref_spec"]]
+    series = [(h, _series(rows, labels, h), color) for h, color in zip(headers, colors)]
+    if not _has_data(*(values for _, values, _ in series)):
+        return False
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(8, 3.4))
+    _bars(ax, labels, series, "sum of request decode tok/s")
+    ax.set_xlabel("concurrent users")
+    ax.legend(loc="upper left")
+    fig.suptitle(f"{Q8_LABEL} · multiple users", x=0.01, ha="left", fontsize=10, color=TEXT)
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, format="svg", metadata={"Date": None, "Creator": None})

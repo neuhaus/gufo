@@ -736,7 +736,7 @@ for artifact in tp2_config.artifacts_dir.glob("*.json"):
         (published_only / artifact.name).write_bytes(artifact.read_bytes())
 tp2_config.artifacts_override = published_only
 deep = {table_id: parse_table(render_tp2(tp2_config, table_id))
-        for table_id in ("single-ar-tp2", "single-mtp-tp2", "tp2-q8")}
+        for table_id in ("single-ar-tp2", "single-mtp-tp2", "tp2-q8", "tp2-q8-multi")}
 check(deep["single-ar-tp2"]["258,048"]["Gufo pp"] == "—"
       and deep["single-ar-tp2"]["258,048"]["Gain"] == "—"
       and deep["single-ar-tp2"]["131,072"]["Gufo pp"] != "—"
@@ -744,6 +744,9 @@ check(deep["single-ar-tp2"]["258,048"]["Gufo pp"] == "—"
       and "8,192" not in deep["single-ar-tp2"]
       and "258,048" in deep["tp2-q8"],
       "rows past one host's depths show no one-host value or gain")
+check(list(deep["tp2-q8-multi"]) == ["1", "2", "4", "6", "8"]
+      and list(deep["tp2-q8-multi"]["1"]) == ["AR", "MTP mixed", "MTP repetitive"],
+      "the Q8 RDMA users table has AR and both MTP workloads")
 check(deep["single-ar-tp2"]["0"]["Gufo pp"] == "TODO"
       and deep["single-ar-tp2"]["0"]["Gain"] == "TODO",
       "RDMA tables never compare with the published one-host build")
@@ -751,6 +754,13 @@ from gufo.model_bench.tp2 import chart_rdma
 
 check(chart_rdma(tp2_config, "single-ar-tp2", deep["single-ar-tp2"], published_only / "chart.svg") is None,
       "an RDMA table without measurements draws no chart")
+q8_users = {users: {header: "TODO" for header in cells} for users, cells in deep["tp2-q8-multi"].items()}
+check(chart_rdma(tp2_config, "tp2-q8-multi", q8_users, published_only / "q8.svg") is None,
+      "the Q8 RDMA users table draws no chart before it is measured")
+q8_users["2"] = {"AR": "40.00", "MTP mixed": "60.00", "MTP repetitive": "90.00"}
+check(chart_rdma(tp2_config, "tp2-q8-multi", q8_users, published_only / "q8.svg")
+      == "Flash-Next Q8 RDMA, multiple users" and (published_only / "q8.svg").exists(),
+      "the Q8 RDMA users table draws one bar per mode")
 tp2_config.artifacts_override = None
 check(public_command(local_tp2).count("<redacted>") == 1,
       "TP2 token is redacted from the combined command")

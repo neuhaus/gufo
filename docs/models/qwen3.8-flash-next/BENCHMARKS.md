@@ -216,3 +216,8 @@ as above; prefill on the left axis, generation on the right.
 <!-- /bench -->
 
 ![Flash-Next Q8 RDMA](artifacts/charts/tp2-q8.svg)
+
+Multiple users with the configuration and preparation of the Q4 tables:
+
+<!-- bench:tp2-q8-multi -->
+<!-- /bench -->
