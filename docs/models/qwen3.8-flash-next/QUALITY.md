@@ -123,26 +123,18 @@ identities remain in [artifacts](artifacts/bench.json) and the
 [benchmark workflow](../../../.agents/skills/benchmark-model/SKILL.md).
 
 
-RDMA concurrency refreshed October 2, 2026 (`c19211e`), Q4 on one host
-versus two hosts over USB4 RoCE v2 with native write striping. Both hosts use
-balanced power mode (85 W sustained); fan1/2/3 use ramp-up
-50,60,70,80,85, ramp-down 45,55,65,75,80 and curve mode. The identical CMake
-release binary (SHA-256 prefix `c4a97b7d8d7cf2c1`) was built in the existing
-ROCm 7.2.3 container with RDMA enabled. Both ranks' target shards and MTP
-sidecar match the retained model hashes. JSON HTTP, greedy seed 1, thinking
-off, matched pp2048 prompts, tg128, context 4096 per user, C1/2/4/6/8.
-A fresh server starts for each point, and every session completes one-token
-preparation before measured decode. No measured prompt-tail tokens were
-reprocessed; all 129 prepared completions match independent fresh AR controls
-from the same topology. C1 MTP outputs and proposed/accepted draft counts
-match fresh MTP controls on each topology. These checks do not establish
-unquantized-model accuracy or require one-host and TP2 prose to be identical.
-
-One warmed cohort per point except RDMA repetitive C1, where a slower first
-timing prompted three prepared and three fresh controls. All four valid
-prepared timings contribute to its mean and sample standard deviation;
-the timing variability limits a precise C1 gain claim. Exact commands per
-concurrency, preparation records, hashes, samples and draft counts remain
-in the serving artifacts; [validation](artifacts/rdma-concurrency-validation.json)
-retains the focused repeat evidence. The earlier single-user, loading,
-memory and Q8 measurements retain their original provenance.
+RDMA tables refreshed October 9, 2026 (`c85349b5`): Q4 on one host against
+two hosts over USB4 RoCE v2 (`usb4_rdma0`), and the full Q8 model on two
+hosts. Both hosts use balanced power mode (85 W sustained). One CMake `gpu-tp2` binary (SHA-256 prefix `8ce3aabafa3cc807`,
+identical on both hosts) was built in the ROCm 7.2.3 container with RDMA
+enabled and served every table, the one-host runs included: the Nix build's
+rdma-core has no USB4 RDMA provider. HTTP, greedy seed 1, thinking off; the
+single-user depth sweep and the pp2048/tg128 users tables follow the one-host
+method. One warmed sample or cohort per point. Three single-user rows whose
+prefill was far below their neighbours' (Q4 MTP mixed at 65,536 and 258,048,
+Q8 MTP repetitive at 131,072) were measured again with both workloads; the
+tables show the repeat. Each users table starts a fresh server per point and
+prepares every session with one output token before the measured cohort; all
+51 measured completion sets match their fresh one-user AR controls. These
+checks do not establish unquantized-model accuracy. Commands, preparation
+records, hashes, samples and draft counts remain in the artifacts.

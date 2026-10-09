@@ -11,18 +11,18 @@
       "gpuArchitecture": "gfx1151",
       "gpuComputeUnits": 20,
       "gpuDriver": "amdgpu",
-      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuName": "Radeon 8060S Graphics",
       "gpuPciId": "1002:1586",
-      "kernelRelease": "7.2.5-100.fc43.x86_64",
-      "memoryTotalBytes": 134144249856,
+      "kernelRelease": "7.2.8-100.fc43.x86_64",
+      "memoryTotalBytes": 134144495616,
       "memoryType": "LPDDR5X (Unified)",
       "rocmVersion": "7.2.3",
       "schemaVersion": "1.0.0"
     },
-    "fingerprintId": "bc357da81ad8d00f1a76dde8465e8296f41d96696ebe44a2b9cbc5d33ce3c0b3",
+    "fingerprintId": "6b2efb13d43e544522f065c7e6d5e66db58338741359b5761ef22c8c5f1dd6bf",
     "schemaVersion": "1.0.0"
   },
-  "measuredOn": "2026-09-29",
+  "measuredOn": "2026-10-09",
   "mode": null,
   "model": {
     "id": "Qwen3.8-Flash-Next",
@@ -32,10 +32,11 @@
     "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
     "synthetic text: 1.159 tokens/word, template overhead 12 tokens"
   ],
+  "powerMode": "balanced",
   "referenceName": "llama.cpp",
   "rows": {
     "0": {
-      "command": "gufo serve --port 60071 --sessions 1 llm --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 53101 --sessions 1 llm --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 0,
@@ -46,86 +47,86 @@
           "prompt_n": 2040
         }
       ],
-      "pp": 1203.95,
+      "pp": 1492.22,
       "pp_sd": null,
       "samples": 1,
-      "tg": 26.21,
+      "tg": 26.71,
       "tg_sd": null,
       "workload": "prose"
     },
     "131072": {
-      "command": "gufo serve --port 60071 --sessions 1 llm --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 53101 --sessions 1 llm --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 131123,
-          "completion_sha256": "fbca93bbb8a97a37db0626cac0fae056c8815b1e142d9b077510bf9f33c05c10",
+          "completion_sha256": "ed04c561bf3f71718c9d5a7999c6005810be5d379ef4b26c8bddd8838ff560f3",
           "draft_n": 0,
           "draft_n_accepted": 0,
           "predicted_n": 128,
           "prompt_n": 2049
         }
       ],
-      "pp": 979.47,
+      "pp": 1216.31,
       "pp_sd": null,
       "samples": 1,
-      "tg": 25.27,
+      "tg": 25.71,
       "tg_sd": null,
       "workload": "prose"
     },
     "32768": {
-      "command": "gufo serve --port 60071 --sessions 1 llm --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 53101 --sessions 1 llm --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 32764,
-          "completion_sha256": "5a399c05cffc0dc90b17c9da75eb4ac12931f0e7d38023993de3c1121369d5b3",
+          "completion_sha256": "3cd83363b334b0de8631b42ec65925291f7e76fbaf4b63b167ef099660a1b4ec",
           "draft_n": 0,
           "draft_n_accepted": 0,
           "predicted_n": 128,
           "prompt_n": 2060
         }
       ],
-      "pp": 1134.13,
+      "pp": 1270.29,
       "pp_sd": null,
       "samples": 1,
-      "tg": 25.79,
+      "tg": 26.08,
       "tg_sd": null,
       "workload": "prose"
     },
     "4096": {
-      "command": "gufo serve --port 60071 --sessions 1 llm --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 53101 --sessions 1 llm --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 4095,
-          "completion_sha256": "64a87f8589ee6f40e05f6130cb7e76963c5c4c44e05e1ef44a2900473d264216",
+          "completion_sha256": "eb200472459cc84364f98335fb0a5d9d870a490c380ed12187ec7ee255926bb4",
           "draft_n": 0,
           "draft_n_accepted": 0,
           "predicted_n": 128,
           "prompt_n": 2043
         }
       ],
-      "pp": 1243.96,
+      "pp": 1342.09,
       "pp_sd": null,
       "samples": 1,
-      "tg": 25.81,
+      "tg": 26.69,
       "tg_sd": null,
       "workload": "prose"
     },
     "65536": {
-      "command": "gufo serve --port 60071 --sessions 1 llm --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "gufo serve --port 53101 --sessions 1 llm --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
         {
           "cache_n": 65538,
-          "completion_sha256": "dba044b3b11dbe90b085d38e576f7b1632b8e12bf7a1265e87547bff257c0cea",
+          "completion_sha256": "cfa87dce59bd361c61255d3e13efb5bfe06e67219839f97b74e6b2b67ddc4d6b",
           "draft_n": 0,
           "draft_n_accepted": 0,
           "predicted_n": 128,
           "prompt_n": 2061
         }
       ],
-      "pp": 1060.0,
+      "pp": 1255.97,
       "pp_sd": null,
       "samples": 1,
-      "tg": 25.37,
+      "tg": 26.23,
       "tg_sd": null,
       "workload": "prose"
     }
@@ -136,7 +137,7 @@
       "gufo",
       "serve",
       "--port",
-      "60071",
+      "53101",
       "--sessions",
       "1",
       "llm",
@@ -154,8 +155,8 @@
   },
   "source": {
     "buildMode": "nix-release",
-    "dirty": false,
-    "revision": "795407e30460aeb730aaff2316739baa3a1348e2"
+    "dirty": true,
+    "revision": "c85349b51c739657ccce9684d5b7eb06aef79774"
   },
   "table": "single-ar",
   "target": "gufo"

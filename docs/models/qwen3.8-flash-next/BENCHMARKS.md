@@ -123,22 +123,24 @@ Gufo RDMA runs one model on two such hosts: every layer is split between them,
 and they exchange partial sums over RDMA ([how it works](TP2.md)).
 The workloads are those of the one-host tables; "Gufo" is the same build on
 one host, and gain is Gufo RDMA over it. With twice the memory, single users
-also reach depths one host cannot (context capacity 262144). The Q4 single-user
-comparisons were measured on September 29, 2026 (`ea76571`) in the balanced power mode (85 W sustained),
-so prefill is lower than in the one-host tables above; decode is not
-power-bound.
+also reach depths one host cannot (context capacity 262144). Every RDMA table
+was measured on October 9, 2026 (`c85349b5`) over USB4 RoCE v2, with the
+same-build one-host runs beside them, in the balanced power mode (85 W
+sustained), so prefill is lower than in the one-host tables above; decode is
+not power-bound. Over USB4 a fresh 2K prompt prefills more slowly than on one
+host; with a cached prefix, prefill gains 3–15%.
 
 ### Single user, autoregressive
 
 <!-- bench:single-ar-tp2 -->
 | Flash-Next Q4 AR<br>Depth (tokens) | Gufo pp (tok/s) | Gufo RDMA pp (tok/s) | Gain | Gufo tg (tok/s) | Gufo RDMA tg (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1203.95 | 1541.16 | +28.0% | 26.21 | 34.19 | +30.4% |
-| 4,096 | 1243.96 | 1480.06 | +19.0% | 25.81 | 34.54 | +33.8% |
-| 32,768 | 1134.13 | 1479.06 | +30.4% | 25.79 | 33.92 | +31.5% |
-| 65,536 | 1060.00 | 1431.50 | +35.0% | 25.37 | 33.78 | +33.1% |
-| 131,072 | 979.47 | 1320.03 | +34.8% | 25.27 | 32.83 | +29.9% |
-| 258,048 | — | 1167.63 | — | — | 31.72 | — |
+| 0 | 1492.22 | 1299.73 | -12.9% | 26.71 | 32.91 | +23.2% |
+| 4,096 | 1342.09 | 1412.63 | +5.3% | 26.69 | 32.81 | +22.9% |
+| 32,768 | 1270.29 | 1456.89 | +14.7% | 26.08 | 32.53 | +24.7% |
+| 65,536 | 1255.97 | 1431.71 | +14.0% | 26.23 | 32.23 | +22.9% |
+| 131,072 | 1216.31 | 1317.83 | +8.3% | 25.71 | 31.31 | +21.8% |
+| 258,048 | — | 1221.33 | — | — | 30.10 | — |
 <!-- /bench -->
 
 ![Single user, autoregressive, one host and RDMA](artifacts/charts/single-ar-tp2.svg)
@@ -148,31 +150,29 @@ power-bound.
 <!-- bench:single-mtp-tp2 -->
 | Flash-Next Q4 MTP<br>Depth (tokens) | Gufo pp (tok/s) | Gufo RDMA pp (tok/s) | Gain pp | Gufo tg mixed (tok/s) | Gufo RDMA tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | Gufo RDMA tg repetitive (tok/s) | Gain repetitive |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1334.06 | 1505.96 | +12.9% | 33.00 | 41.20 | +24.8% | 56.25 | 75.58 | +34.4% |
-| 4,096 | 1282.50 | 1457.15 | +13.6% | 31.51 | 46.44 | +47.4% | 54.69 | 58.86 | +7.6% |
-| 32,768 | 1121.21 | 1432.81 | +27.8% | 33.03 | 45.44 | +37.6% | 39.11 | 53.66 | +37.2% |
-| 65,536 | 1089.34 | 1395.77 | +28.1% | 32.51 | 45.05 | +38.6% | 39.45 | 56.53 | +43.3% |
-| 131,072 | 1070.54 | 1292.44 | +20.7% | 33.12 | 42.65 | +28.8% | 44.97 | 59.36 | +32.0% |
-| 258,048 | — | 1129.95 | — | — | 23.22 | — | — | 50.16 | — |
+| 0 | 1420.72 | 1346.32 | -5.2% | 32.03 | 37.88 | +18.3% | 60.11 | 79.33 | +32.0% |
+| 4,096 | 1301.51 | 1333.77 | +2.5% | 33.25 | 47.46 | +42.7% | 56.03 | 60.82 | +8.5% |
+| 32,768 | 1231.99 | 1389.59 | +12.8% | 33.11 | 38.62 | +16.6% | 40.61 | 65.63 | +61.6% |
+| 65,536 | 1216.20 | 1314.17 | +8.1% | 33.78 | 47.55 | +40.8% | 43.33 | 57.69 | +33.1% |
+| 131,072 | 1208.61 | 1275.75 | +5.6% | 34.21 | 41.46 | +21.2% | 39.90 | 55.62 | +39.4% |
+| 258,048 | — | 1169.31 | — | — | 38.02 | — | — | 57.38 | — |
 <!-- /bench -->
 
 ![Single user, MTP, one host and RDMA](artifacts/charts/single-mtp-tp2.svg)
 
 ### Multiple users, autoregressive
 
-October 2, 2026 (`c19211e`), same production build on one host and two hosts
-over USB4 RoCE v2 with write striping. Both hosts use balanced mode and the
-recorded fan curves. Same pp2048 prose prompt, tg128, context 4096 per user;
-every session prefills before timed decoding. Rates sum individual decode rates.
+Same pp2048 prose prompt, tg128, context 4096 per user; every session
+prefills before timed decoding. Rates sum individual decode rates.
 
 <!-- bench:multi-ar-tp2 -->
 | Flash-Next Q4 AR<br>Users | Gufo AR (tok/s) | Gufo RDMA AR (tok/s) | Gain |
 | ---: | ---: | ---: | ---: |
-| 1 | 26.59 | 32.93 | +23.8% |
-| 2 | 47.17 | 46.66 | -1.1% |
-| 4 | 75.60 | 91.60 | +21.2% |
-| 6 | 93.61 | 107.83 | +15.2% |
-| 8 | 105.12 | 129.10 | +22.8% |
+| 1 | 25.09 | 32.89 | +31.1% |
+| 2 | 46.95 | 56.77 | +20.9% |
+| 4 | 77.27 | 92.79 | +20.1% |
+| 6 | 96.79 | 115.69 | +19.5% |
+| 8 | 109.03 | 137.86 | +26.4% |
 <!-- /bench -->
 
 ![Multiple users, autoregressive, one host and RDMA](artifacts/charts/multi-ar-tp2.svg)
@@ -180,22 +180,18 @@ every session prefills before timed decoding. Rates sum individual decode rates.
 ### Multiple users, MTP
 
 Same configuration and preparation as the AR table, with mixed/repetitive
-prompts. All 129 prepared completions across both topologies and all modes
-match fresh AR controls; C1 MTP output and draft counts match fresh MTP controls.
+prompts. Every prepared completion, on both topologies and in all modes, matches
+its fresh one-user AR control.
 
 <!-- bench:multi-mtp-tp2 -->
 | Flash-Next Q4 MTP<br>Users | Gufo mixed (tok/s) | Gufo RDMA mixed (tok/s) | Gain | Gufo repetitive (tok/s) | Gufo RDMA repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 31.99 | 36.34 | +13.6% | 60.62 | 69.70 | +15.0% |
-| 2 | 49.66 | 67.00 | +34.9% | 91.28 | 104.74 | +14.7% |
-| 4 | 75.41 | 89.64 | +18.9% | 120.15 | 150.81 | +25.5% |
-| 6 | 90.30 | 97.63 | +8.1% | 134.06 | 164.76 | +22.9% |
-| 8 | 102.63 | 118.40 | +15.4% | 143.90 | 183.70 | +27.7% |
+| 1 | 32.04 | 37.75 | +17.8% | 60.16 | 74.16 | +23.3% |
+| 2 | 53.57 | 66.98 | +25.0% | 84.28 | 113.63 | +34.8% |
+| 4 | 77.13 | 92.34 | +19.7% | 124.27 | 160.23 | +28.9% |
+| 6 | 96.19 | 108.78 | +13.1% | 134.85 | 176.43 | +30.8% |
+| 8 | 106.50 | 127.06 | +19.3% | 149.87 | 191.36 | +27.7% |
 <!-- /bench -->
-
-C1 repetitive RDMA is **69.70 ± 3.57 tok/s** (mean ± sample standard
-deviation, four warmed cohorts); all valid samples are retained. Its timing
-variability limits a precise gain claim. Other cells use one warmed cohort.
 
 ![Multiple users, MTP, one host and RDMA](artifacts/charts/multi-mtp-tp2.svg)
 
@@ -207,12 +203,12 @@ as above; prefill on the left axis, generation on the right.
 <!-- bench:tp2-q8 -->
 | Flash-Next Q8 RDMA<br>Depth (tokens) | pp (tok/s) | tg AR (tok/s) | tg MTP mixed (tok/s) | tg MTP repetitive (tok/s) |
 | ---: | ---: | ---: | ---: | ---: |
-| 0 | 916.15 | 31.13 | 41.97 | 68.12 |
-| 4,096 | 907.62 | 31.14 | 40.09 | 58.64 |
-| 32,768 | 871.49 | 30.77 | 41.06 | 48.29 |
-| 65,536 | 690.42 | 30.53 | 41.39 | 51.99 |
-| 131,072 | 823.21 | 30.03 | 37.45 | 53.61 |
-| 258,048 | 774.02 | 28.77 | 38.04 | 53.21 |
+| 0 | 1193.06 | 29.80 | 41.15 | 65.99 |
+| 4,096 | 1169.94 | 29.52 | 37.83 | 55.31 |
+| 32,768 | 1176.27 | 29.64 | 42.44 | 60.15 |
+| 65,536 | 1140.63 | 28.91 | 44.19 | 52.40 |
+| 131,072 | 1120.59 | 28.50 | 36.88 | 56.22 |
+| 258,048 | 1041.67 | 27.60 | 39.34 | 50.64 |
 <!-- /bench -->
 
 ![Flash-Next Q8 RDMA](artifacts/charts/tp2-q8.svg)
@@ -220,4 +216,18 @@ as above; prefill on the left axis, generation on the right.
 Multiple users with the configuration and preparation of the Q4 tables:
 
 <!-- bench:tp2-q8-multi -->
+| Flash-Next Q8 RDMA<br>Users | AR (tok/s) | MTP mixed (tok/s) | MTP repetitive (tok/s) |
+| ---: | ---: | ---: | ---: |
+| 1 | 29.97 | 41.33 | 65.99 |
+| 2 | 52.82 | 66.48 | 80.25 |
+| 4 | 87.52 | 105.45 | 115.17 |
+| 6 | 110.17 | 92.40 | 124.27 |
+| 8 | 131.79 | 117.69 | 146.72 |
 <!-- /bench -->
+
+![Flash-Next Q8 RDMA, multiple users](artifacts/charts/tp2-q8-multi.svg)
+
+Q8 MTP rates vary more between server starts than between cohorts of one
+start: a second start with three cohorts per point gave mixed 90.06 (C4) and
+105.40 (C6), repetitive 115.74 (C4) and 118.65 (C6) tok/s, each cohort within
+3% of its point's rate.

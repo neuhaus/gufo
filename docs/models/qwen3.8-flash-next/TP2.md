@@ -212,7 +212,8 @@ request's states and snapshots are not reused.
   times the exchange.
 - `tools/bench/model-bench.py` launches both ranks through a `gufo.tp2`
   overlay in `bench.json` (`remote_host`, `bootstrap_host`, ports, token,
-  container and binary); it runs single-user tables only.
+  container and binary); it runs the single-user and users tables, with the
+  container `gpu-tp2` build over USB4 (the Nix build lacks its RDMA provider).
 
 ## Qualifying a change
 
