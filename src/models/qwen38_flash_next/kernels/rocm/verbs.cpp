@@ -42,7 +42,7 @@ namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 
 constexpr std::uint32_t kWireMagic = 0x47554654U;  // "GUFT"
-constexpr std::uint32_t kWireVersion = 6;
+constexpr std::uint32_t kWireVersion = 7;
 constexpr std::uint32_t kCollectiveMagic = 0x47554348U;  // "GUCH"
 constexpr std::uint32_t kCollectiveVersion = 5;
 constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
@@ -50,8 +50,9 @@ constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
 // reading an overlapped exchange's partial may still be queued when the
 // exchange after the next one lands (see Communicator), and a queued
 // exchange's partial is staged while the previous one is in flight. A window
-// starts with the writer's header; the partial follows at kDataOffset.
-constexpr std::size_t kWindowBytes = 32U << 20;
+// starts with the writer's header; the partial follows at kDataOffset. A
+// window holds one prefill batch's partial: 4,224 rows of 2,560 floats.
+constexpr std::size_t kWindowBytes = 48U << 20;
 constexpr std::size_t kWindows = 3;
 constexpr std::size_t kBufferBytes = kWindows * kWindowBytes;
 constexpr std::size_t kDataOffset = 64;
@@ -634,6 +635,9 @@ public:
   [[nodiscard]] int device_index() const noexcept override {
     return static_cast<int>(config_.device_index);
   }
+  [[nodiscard]] std::size_t MaxPartialBytes() const noexcept override {
+    return kWindowBytes - kDataOffset;
+  }
   [[nodiscard]] std::string Describe() const override {
     return "rdma_device=" + device_name_ +
            " port=" + std::to_string(config_.rdma_port) + " link=" +
@@ -998,7 +1002,9 @@ private:
       return false;
     }
     if (bytes > kWindowBytes - kDataOffset) {
-      Poison(error, "all-reduce payload exceeds the receive window");
+      Poison(error, "all-reduce payload of " + std::to_string(bytes) +
+                        " bytes exceeds the receive window of " +
+                        std::to_string(kWindowBytes - kDataOffset));
       return false;
     }
     return true;

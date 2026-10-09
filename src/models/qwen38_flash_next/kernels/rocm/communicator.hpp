@@ -28,6 +28,10 @@ public:
   [[nodiscard]] virtual int device_index() const noexcept { return 0; }
   /// The transport's settings, for the log; empty when there is none.
   [[nodiscard]] virtual std::string Describe() const { return {}; }
+  /// The largest partial one exchange carries.
+  [[nodiscard]] virtual std::size_t MaxPartialBytes() const noexcept {
+    return static_cast<std::size_t>(-1);
+  }
   [[nodiscard]] virtual bool BeginOperation(std::uint64_t scope_id,
                                             std::string* error) = 0;
   [[nodiscard]] virtual bool EndOperation(std::uint64_t scope_id,

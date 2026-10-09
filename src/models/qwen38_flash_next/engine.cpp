@@ -192,6 +192,12 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
           : 1;
   exec.max_speculative = exec.max_logit_rows;
   if (options.communicator) {
+    // One exchange carries a whole prefill batch's partial sums.
+    if (std::size_t{exec.max_batch} * c.hidden_size * sizeof(float) >
+        options.communicator->MaxPartialBytes()) {
+      AssignError(error_msg, "a prefill batch exceeds the TP exchange window");
+      return nullptr;
+    }
     exec.all_reduce =
         rocm::Executor::TwoRankAllReduce(options.communicator, c.hidden_size);
     exec.reduce_status =

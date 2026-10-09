@@ -130,12 +130,14 @@ receive windows with an RDMA write with immediate data, whose arrival is the
 readiness signal; a one-wave kernel holds the stream until it arrives, and the
 GPU adds the peer's partial straight from the window. The host queues a whole
 forward without waiting. The rotating windows need no acknowledgement provided
-the add of exchange k is queued before exchange k+2 starts. Each exchange
+the add of exchange k is queued before exchange k+2 starts. A window holds one
+prefill batch's partial (48 MiB for 4,224 rows); loading refuses a batch that
+would not fit. Each exchange
 header carries the call's scope, an ordinal and the byte count; a mismatch
 poisons the communicator. A sum of two operands keeps both ranks bit-identical;
 TP2 and one host differ by reduction order. HIP graphs are off under TP2.
 
-**Prefill overlap.** A prefill step of up to 4096 tokens runs as two trunk
+**Prefill overlap.** A prefill step of up to 8,448 tokens runs as two trunk
 batches a layer apart (one batch under 384 tokens), so each batch's exchange
 crosses the link while the other computes; the results equal two steps of
 those sizes bit for bit.
