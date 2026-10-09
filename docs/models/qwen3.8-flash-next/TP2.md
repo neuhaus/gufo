@@ -119,7 +119,9 @@ on its half. Each GDN layer's 16 key heads and the 48 value heads that read them
 (value head h reads key head h % 16) and each attention layer's two KV heads
 with their query heads are split, and each rank keeps only its heads' KV cache
 and recurrent state. The indexer, draft block, HC, embedding, PLE, LM head and
-vision encoder are replicated.
+vision encoder are replicated. A greedy draft scores only its rank's half of
+the Q8_0 LM head; the two halves' argmax candidates cross in one all-reduce
+row. Target rows, sampled drafts and logprobs keep the full head.
 
 **Exchange.** Each mixer block and each MoE ends in one exchange of partial
 sums, 10 KiB per decode row. A stage kernel copies the partial to host memory

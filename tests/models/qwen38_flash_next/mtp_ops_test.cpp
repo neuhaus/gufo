@@ -373,6 +373,99 @@ void CheckCandidates(std::uint32_t vocab) {
             << ": exact ordering, ties, guards and graph replay passed\n";
 }
 
+// Each rank's half of a split vocabulary and the summed exchange rows must
+// select what the full argmax selects, including ties across the halves and
+// NaN or infinite logits.
+void CheckSplitArgmax(std::uint32_t vocab) {
+  constexpr std::uint32_t width = 2560;
+  const std::uint32_t half = vocab / 2;
+  const float inf = std::numeric_limits<float>::infinity();
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  auto device_logits = Allocate<float>(vocab);
+  auto scratch = Allocate<q::ArgmaxCandidate>(q::kArgmaxParts);
+  auto exchange = Allocate<float>(width);
+  auto output = Allocate<std::int32_t>(1);
+  for (std::uint32_t t = 0; t < 10; ++t) {
+    std::vector<float> row(vocab);
+    for (std::uint32_t i = 0; i < vocab; ++i)
+      row[i] = -static_cast<float>((i * 7919U + t * 31U) % 65521U);
+    switch (t) {
+      case 0:
+        row[half] = row[vocab - 1] = 10.0F;  // Tie inside the second half.
+        break;
+      case 1:
+        row[half - 1] = row[half] = 10.0F;  // Tie across the halves.
+        break;
+      case 2:
+        row[half] = inf;
+        break;
+      case 3:
+        std::fill(row.begin(), row.end(), -inf);
+        break;
+      case 4:
+        row[0] = nan;
+        row[half] = inf;
+        break;
+      case 5:
+        std::fill(row.begin(), row.begin() + half, nan);
+        row[vocab - 1] = 10.0F;
+        row[0] = 1.0F;
+        break;
+      case 6:
+        std::fill(row.begin(), row.end(), nan);
+        break;
+      case 7:
+        for (std::uint32_t i = 0; i < vocab; ++i)
+          row[i] = i % 2 ? 0.0F : -0.0F;
+        break;
+      case 8:
+        std::fill(row.begin() + half, row.end(), -inf);
+        break;
+      default:
+        break;
+    }
+    CheckHip(hipMemcpy(device_logits.get(), row.data(), vocab * sizeof(float),
+                       hipMemcpyHostToDevice),
+             "upload split logits");
+    std::vector<float> sum(width, 0.0F);
+    for (std::uint32_t part = 0; part < 2; ++part) {
+      std::vector<float> rank(width, 1234.0F);
+      CheckHip(hipMemcpy(exchange.get(), rank.data(), width * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "poison exchange");
+      q::SplitArgmaxPart(device_logits.get() + part * half, scratch.get(),
+                         exchange.get(), width, half, part * half, part,
+                         nullptr);
+      CheckHip(hipMemcpy(rank.data(), exchange.get(), width * sizeof(float),
+                         hipMemcpyDeviceToHost),
+               "download exchange");
+      for (std::uint32_t i = 0; i < width; ++i) {
+        if (i / 2 != part && rank[i] != 0.0F)
+          throw std::runtime_error("split argmax left a foreign slot set");
+        sum[i] += rank[i];
+      }
+    }
+    CheckHip(hipMemcpy(exchange.get(), sum.data(), width * sizeof(float),
+                       hipMemcpyHostToDevice),
+             "upload exchange sum");
+    q::SplitArgmaxFinish(exchange.get(), output.get(), nullptr);
+    std::int32_t actual = -1;
+    CheckHip(
+        hipMemcpy(&actual, output.get(), sizeof(actual), hipMemcpyDeviceToHost),
+        "download split argmax");
+    const auto expected = static_cast<std::int32_t>(
+        std::max_element(row.begin(), row.end()) - row.begin());
+    if (actual != expected) {
+      throw std::runtime_error(
+          "split argmax mismatch: vocab=" + std::to_string(vocab) + " row=" +
+          std::to_string(t) + " expected=" + std::to_string(expected) +
+          " actual=" + std::to_string(actual));
+    }
+  }
+  std::cout << "split argmax vocab=" << vocab
+            << ": ties, infinities and NaN match the full argmax\n";
+}
+
 }  // namespace
 
 int main() {
@@ -382,6 +475,9 @@ int main() {
     CheckArgmax(1);
     CheckArgmax(257);
     CheckArgmax(248320);
+    CheckSplitArgmax(2);
+    CheckSplitArgmax(256);
+    CheckSplitArgmax(248320);
     for (const unsigned vocab :
          {1, 63, 64, 65, 255, 256, 257, 1024, 1025, 16385, 248320}) {
       CheckCandidates(vocab);

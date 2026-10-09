@@ -2652,8 +2652,39 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        bool candidates, std::string* error_msg) const {
   const DeviceTensor& output = model_->output();
-  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
-      !Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
+  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg)) {
+    return false;
+  }
+  // A greedy draft needs only the argmax. Under TP each rank scores half of
+  // the vocabulary and the two candidates cross in one all-reduce row, held
+  // in the logits buffer's unused second half.
+  const std::uint32_t half = output.rows / 2;
+  const std::size_t width = config().hidden_size;
+  if (token && !candidates && model_->tp_world_size() == 2 &&
+      output.type == GgmlType::kQ8_0 && output.cols % 32 == 0 &&
+      output.rows % 2 == 0 && half >= width) {
+    const std::uint32_t rank = model_->tp_rank();
+    DeviceTensor part = output;
+    part.rows = half;
+    part.data = static_cast<std::uint8_t*>(output.data) +
+                static_cast<std::size_t>(rank) * half * (output.cols / 32) * 34;
+    float* exchange = s_.logits + half;
+    if (!Dense(part, s_.mixed, s_.logits, 1, error_msg)) {
+      return false;
+    }
+    SplitArgmaxPart(s_.logits, s_.mtp_argmax, exchange,
+                    static_cast<std::uint32_t>(width), half, rank * half, rank,
+                    stream_);
+    if (!AllReduce(exchange, 1, error_msg)) {
+      return false;
+    }
+    SplitArgmaxFinish(exchange, s_.mtp_token, stream_);
+    return Check(
+        hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
+                       hipMemcpyDeviceToHost, stream_),
+        "draft token download", error_msg);
+  }
+  if (!Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
     return false;
   }
   if (candidates)

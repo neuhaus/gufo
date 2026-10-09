@@ -515,6 +515,19 @@ struct ArgmaxCandidate {
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
             std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream);
 
+/// One rank's part of a vocabulary split across two ranks: the argmax of its
+/// `count` logits, whose first entry is vocabulary index `first`, written as
+/// (value, index) floats to slot `part` of `exchange`, whose other `width`
+/// floats are cleared, so a summing all-reduce delivers both candidates.
+/// Part 0 reports index 0 at +infinity when that logit is NaN, as Argmax.
+void SplitArgmaxPart(const float* logits, ArgmaxCandidate* scratch,
+                     float* exchange, std::uint32_t width, std::uint32_t count,
+                     std::uint32_t first, std::uint32_t part,
+                     hipStream_t stream);
+/// The full-vocabulary argmax from both exchanged candidates, as Argmax.
+void SplitArgmaxFinish(const float* exchange, std::int32_t* out,
+                       hipStream_t stream);
+
 /// Gather selected IDs and their original logits from independent rows.
 /// The caller checks finite values only for the verification prefix it visits.
 // Sorted sparse histories, one per verification row. Penalty arithmetic is

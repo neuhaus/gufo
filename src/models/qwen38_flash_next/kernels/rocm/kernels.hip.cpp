@@ -2706,6 +2706,41 @@ __global__ void ArgmaxFinishKernel(const float* logits,
   }
 }
 
+__global__ void SplitArgmaxPartKernel(const float* logits,
+                                      const ArgmaxCandidate* partial,
+                                      float* exchange, std::uint32_t width,
+                                      std::uint32_t first, std::uint32_t part) {
+  __shared__ ArgmaxCandidate shared[kThreads / 32];
+  ArgmaxCandidate best{-INFINITY, INT32_MAX};
+  if (threadIdx.x < kArgmaxParts) {
+    best = partial[threadIdx.x];
+  }
+  best = ArgmaxBlock(best, shared);
+  for (std::uint32_t i = threadIdx.x; i < width; i += kThreads) {
+    exchange[i] = 0.0F;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (part == 0 && isnan(logits[0])) {
+      best = {INFINITY, 0};
+    } else if (best.index != INT32_MAX) {
+      best.index += static_cast<std::int32_t>(first);
+    } else {
+      best.index = (1 << 24) - 1;  // No candidate; above every vocab index.
+    }
+    // Vocabulary indices are below 2^24, so the float carries them exactly.
+    exchange[2 * part] = best.value;
+    exchange[2 * part + 1] = static_cast<float>(best.index);
+  }
+}
+
+__global__ void SplitArgmaxFinishKernel(const float* exchange,
+                                        std::int32_t* out) {
+  const ArgmaxCandidate a{exchange[0], static_cast<std::int32_t>(exchange[1])};
+  const ArgmaxCandidate b{exchange[2], static_cast<std::int32_t>(exchange[3])};
+  out[0] = BetterCandidate(a, b).index;
+}
+
 __device__ __forceinline__ PenaltyArgmaxCandidate
 BetterPenaltyCandidate(PenaltyArgmaxCandidate a, PenaltyArgmaxCandidate b) {
   return b.value > a.value || (b.value == a.value && b.index < a.index) ? b : a;
@@ -6273,6 +6308,22 @@ void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
                      dim3(kThreads), 0, stream, logits, scratch, vocab);
   hipLaunchKernelGGL(ArgmaxFinishKernel, dim3(n_tokens), dim3(kThreads), 0,
                      stream, logits, scratch, out, vocab);
+}
+
+void SplitArgmaxPart(const float* logits, ArgmaxCandidate* scratch,
+                     float* exchange, std::uint32_t width, std::uint32_t count,
+                     std::uint32_t first, std::uint32_t part,
+                     hipStream_t stream) {
+  hipLaunchKernelGGL(ArgmaxPartialKernel, dim3(kArgmaxParts, 1), dim3(kThreads),
+                     0, stream, logits, scratch, count);
+  hipLaunchKernelGGL(SplitArgmaxPartKernel, dim3(1), dim3(kThreads), 0, stream,
+                     logits, scratch, exchange, width, first, part);
+}
+
+void SplitArgmaxFinish(const float* exchange, std::int32_t* out,
+                       hipStream_t stream) {
+  hipLaunchKernelGGL(SplitArgmaxFinishKernel, dim3(1), dim3(1), 0, stream,
+                     exchange, out);
 }
 
 void PenalizedArgmax(const float* logits, GreedyPenaltyRows penalties,
