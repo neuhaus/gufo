@@ -24,6 +24,10 @@ Start rank 0 first, and rank 1 within 30 s. `RANK0_ADDRESS` is where rank 1
 reaches rank 0's TCP bootstrap. Both ranks need the same model files and the
 same `--tp-control-token`, `--context`, `--prefill-chunk`, `--sessions`, MTP
 settings and `--mmproj` use; the handshake names any setting that differs.
+The ranks prove the token to each other by HMAC-SHA256 over fresh nonces, so
+it never crosses the network, and rank 0 answers only a peer that proved it.
+The channel is not encrypted (prompts cross it in the clear): keep the control
+port on a trusted link.
 
 ```sh
 # rank 0: public HTTP server

@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -684,6 +685,49 @@ int main() {
                    [](TpControlConfig& config) { config.disk_cache = true; });
   refuses_mismatch("context",
                    [](TpControlConfig& config) { config.max_context = 8192; });
+  refuses_mismatch("control token", [](TpControlConfig& config) {
+    config.auth_token = "other-token";
+  });
+
+  // Rank 0 accepts whoever connects first, so its hello must not carry the
+  // token: a stranger reads the hello, sends nothing and learns nothing.
+  {
+    const auto stranger_port = FreePort();
+    std::thread stranger([&] {
+      const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+      sockaddr_in address{};
+      address.sin_family = AF_INET;
+      address.sin_port = htons(stranger_port);
+      address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      for (int attempt = 0; attempt < 200; ++attempt) {
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&address),
+                      sizeof(address)) == 0) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      std::string received;
+      char buffer[4096];
+      // The hello is one frame: header and payload well under one buffer.
+      timeval timeout{.tv_sec = 2, .tv_usec = 0};
+      (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                         sizeof(timeout));
+      const auto bytes = ::recv(fd, buffer, sizeof(buffer), 0);
+      if (bytes > 0) {
+        received.assign(buffer, static_cast<std::size_t>(bytes));
+      }
+      ::close(fd);
+      Require(!received.empty(), "TP control stranger reads rank 0's hello");
+      Require(received.find(rank0.auth_token) == std::string::npos,
+              "TP control hello does not carry the control token");
+    });
+    auto stranger_server =
+        TpControlChannel::Listen(stranger_port, &server_error);
+    Require(stranger_server != nullptr, "TP control accepts the stranger");
+    Require(!stranger_server->Handshake(rank0, &server_error),
+            "TP control refuses a peer that never proves the token");
+    stranger.join();
+  }
 
   const auto broker_port = FreePort();
   std::shared_ptr<TpControlChannel> broker_client;

@@ -229,6 +229,7 @@ add_library(gufo_tp_control STATIC src/cli/serve/tp_control.cpp)
 target_include_directories(gufo_tp_control PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_tp_control PUBLIC cxx_std_20)
 target_link_libraries(gufo_tp_control PUBLIC gufo_core Threads::Threads)
+target_link_libraries(gufo_tp_control PRIVATE OpenSSL::Crypto)
 
 # The imported DeepSeek V4 Flash runtime routes its informational messages
 # through the shared logger instead of writing to stderr directly, so it needs

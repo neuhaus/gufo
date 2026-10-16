@@ -290,7 +290,6 @@ private:
   std::uint32_t max_context_{0};
   bool handshaken_{false};
   std::uint64_t snapshot_budget_bytes_{0};
-  std::string auth_token_;
   std::mutex send_mutex_;
   std::mutex receive_mutex_;
   std::atomic<bool> interrupted_{false};
