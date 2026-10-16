@@ -254,6 +254,9 @@ separately on `codex/wip-tp2-transport-experiments`; neither is part of this mer
 - `tp_control_test`, `tp_executor_test` (label `tp2`, in the CPU suite): the
   protocol, and the real scheduler and pool on rank 0 against an executor on
   rank 1 with a toy model, for every request kind, divergence and reuse rule.
+- `tp_disk_store_test` (labels `tp2`, `disk`, in the CPU suite): rank 1's
+  disk cache on its own: restart, rejected writes, foreign or corrupt files,
+  eviction by least-recent use and rewriting a key.
 - `qwen38_flash_next.tp_partition` and the attention, projection and routed
   operator tests: the split against the full kernels.
 - `qwen38_flash_next_tp_probe` (`gpu-tp2`): prompt, decode and logit

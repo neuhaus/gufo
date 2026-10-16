@@ -419,6 +419,19 @@ if (BUILD_TESTING)
   add_test(NAME tp_control_test COMMAND tp_control_test)
   set_tests_properties(tp_control_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 10)
 
+  add_executable(tp_disk_store_test
+    tests/cli/tp_disk_store_test.cpp
+    src/cli/serve/text_model_runner.cpp
+    src/cli/serve/continuation_cache.cpp
+    src/cli/serve/continuation_disk_store.cpp
+    src/cli/serve/component_text_cache.cpp
+    src/cli/serve/tp_disk_store.cpp)
+  target_link_libraries(tp_disk_store_test PRIVATE
+    gufo_logging gufo_core gufo_cache)
+  add_test(NAME tp_disk_store_test COMMAND tp_disk_store_test)
+  set_tests_properties(tp_disk_store_test PROPERTIES
+    LABELS "cpu;tp2;cache;disk" TIMEOUT 10)
+
   # A measurement, not a gate: it asserts no threshold and never fails on a
   # slow result, so it is labelled `perf` and kept out of the correctness run.
   add_executable(tp_instruction_latency_test

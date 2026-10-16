@@ -201,7 +201,11 @@ struct TpDiskStore::Impl {
       writing = false;
       queued -= job.bytes;
       if (written) {
-        Remove(job.key);
+        // The rename replaced any earlier file under this key: forget its
+        // bytes without unlinking the new one.
+        if (const auto previous = entries.find(job.key);
+            previous != entries.end())
+          retained -= previous->second.bytes;
         entries[job.key] = {.bytes = kHeaderBytes + job.bytes, .used = ++clock};
         retained += kHeaderBytes + job.bytes;
         Evict();
