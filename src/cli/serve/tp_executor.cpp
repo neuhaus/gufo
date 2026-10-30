@@ -927,6 +927,8 @@ void TpMirroredRunner::Advance(TextRunnerState& state,
 TextDecodeStep TpMirroredRunner::DecodeStep(
     TextRunnerState& state, std::size_t max_tokens,
     sampling::SamplerState& sampler) const {
+  if (multi_token_decode_ && max_tokens >= 2)
+    snapshot_gate_.Wait();
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   // A multi-token cycle is one instruction. It carries the sampler's draw
   // state, so rank 1, whose sampler otherwise matches, draws what rank 0 draws
@@ -983,6 +985,7 @@ std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
     // an unmirrored constraint one token at a time.
     return TextModelRunner::DecodeBatch(decodes);
   }
+  snapshot_gate_.Wait();
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   // One instruction carries every member's budget and draw state, like the
   // decode each replaces, and the batch's draft count: rank 0 chooses it from
@@ -1227,7 +1230,9 @@ std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::SnapshotForPersistence(
 
 std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::Capture(
     const TextRunnerState& state, bool complete) const {
+  TpSnapshotGate::Pending pending(snapshot_gate_);
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
+  pending.Acquired();
   const auto& mirrored = Mirrored(state);
   if (next_snapshot_id_ == std::numeric_limits<std::uint64_t>::max()) {
     throw std::overflow_error("TP snapshot ID exhausted");
