@@ -18,6 +18,7 @@
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/cli/serve/tp_control.hpp"
 #include "src/cli/serve/tp_disk_store.hpp"
+#include "src/cli/serve/tp_snapshot_gate.hpp"
 
 namespace gufo::server {
 
@@ -306,6 +307,7 @@ private:
   std::shared_ptr<TpCallScope> scope_;
   mutable std::uint64_t next_snapshot_id_{1};
   mutable std::recursive_mutex call_mutex_;
+  mutable TpSnapshotGate snapshot_gate_;
   bool multi_token_decode_{false};
   mutable std::mutex mutex_;
   mutable std::uint32_t next_state_id_{0};
