@@ -1,0 +1,118 @@
+{
+  "ar": {
+    "analysis": {
+      "functional_records": 11,
+      "client_HTTP_requests": 23,
+      "server_confirmed_cancellations": 6,
+      "cancellation_orders": [
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          0
+        ]
+      ],
+      "survivor_and_replay_hashes_match": true,
+      "actual_two_row_survivors": true,
+      "deep_cases": [
+        {
+          "case": "content-preserve0-sampled1",
+          "cached": 18461,
+          "prefill": 34,
+          "accepted": 0,
+          "proposed": 0,
+          "exact": true,
+          "discard_assistant": false
+        },
+        {
+          "case": "content-preserve1-sampled1",
+          "cached": 18461,
+          "prefill": 13,
+          "accepted": 0,
+          "proposed": 0,
+          "exact": true,
+          "discard_assistant": true
+        }
+      ],
+      "checked_transport_errors_zero": true,
+      "scope": "Candidate-only AR functional coverage; two concurrent disconnect orders plus two deep seeded cached/replay histories. No timing-control, confidence, process-loss, cable-loss, persistence or universal deadlock qualification."
+    },
+    "validation": {
+      "greedy_survivor_replay_and_seeded_continuation_exact": true,
+      "frozen_harness_hashes_unchanged": true,
+      "rank_binary_and_serving_settings_match": true,
+      "2_transport_windows_zero_checked_errors": true,
+      "all_recorded_server_PIDs_exited": true,
+      "both_approved_drivers_restored_idle_four_rails": true,
+      "boot_flags_and_topology_unchanged": true,
+      "checked_kernel_fault_patterns_absent": true,
+      "server_confirmed_cancellations": 6,
+      "deep_cached_tokens": [
+        18461,
+        18461
+      ],
+      "candidate_only_no_timing_control": true,
+      "scope": "Candidate-only actual AR cancellation and deep cached continuation qualification; earlier timing flags remain open. No timing significance, process/cable-loss, persistence or default adoption inferred."
+    }
+  },
+  "mtp": {
+    "analysis": {
+      "functional_records": 11,
+      "client_HTTP_requests": 23,
+      "server_confirmed_cancellations": 6,
+      "cancellation_orders": [
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          0
+        ]
+      ],
+      "survivor_and_replay_hashes_match": true,
+      "actual_two_row_survivors": true,
+      "deep_cases": [
+        {
+          "case": "content-preserve0-sampled1",
+          "cached": 18461,
+          "prefill": 34,
+          "accepted": 0,
+          "proposed": 1,
+          "exact": true,
+          "discard_assistant": false
+        },
+        {
+          "case": "content-preserve1-sampled1",
+          "cached": 18461,
+          "prefill": 13,
+          "accepted": 9,
+          "proposed": 9,
+          "exact": true,
+          "discard_assistant": true
+        }
+      ],
+      "checked_transport_errors_zero": true,
+      "scope": "Candidate-only MTP functional coverage; two concurrent disconnect orders plus two deep seeded cached/replay histories. No timing-control, confidence, process-loss, cable-loss, persistence or universal deadlock qualification."
+    },
+    "validation": {
+      "greedy_survivor_replay_and_seeded_continuation_exact": true,
+      "frozen_harness_hashes_unchanged": true,
+      "rank_binary_and_serving_settings_match": true,
+      "2_transport_windows_zero_checked_errors": true,
+      "all_recorded_server_PIDs_exited": true,
+      "both_approved_drivers_restored_idle_four_rails": true,
+      "boot_flags_and_topology_unchanged": true,
+      "checked_kernel_fault_patterns_absent": true,
+      "server_confirmed_cancellations": 6,
+      "deep_cached_tokens": [
+        18461,
+        18461
+      ],
+      "candidate_only_no_timing_control": true,
+      "scope": "Candidate-only actual MTP cancellation and deep cached continuation qualification; earlier timing flags remain open. No timing significance, process/cable-loss, persistence or default adoption inferred."
+    }
+  }
+}

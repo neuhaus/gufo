@@ -1140,3 +1140,39 @@ prepares every session with one output token before the measured cohort; all
 51 measured completion sets match their fresh one-user AR controls. These
 checks do not establish unquantized-model accuracy. Commands, preparation
 records, hashes, samples and draft counts remain in the artifacts.
+
+## Draft TP recursive snapshot turns (October 31, 2026)
+
+This host scheduling change preserves model arithmetic and collective order.
+The integration-stack AR/MTP pilots match48canonical outputs; a supported
+fixed-depth1 diagnostic matches12more with identical recorded draft work.
+Candidate functional checks cover23HTTPrequests with six request-ID-matched
+server cancellations, exact two-row survivors/post-cancel replay and two seeded
+continuation histories reusing18,461tokens while retaining/discarding interrupted
+assistant output. Actual MTP proposals are checked. Per-request timing remains
+unqualified:22AR and25adaptive-MTP phase flags are retained, with changed
+batching/draft work. The standalone published base has five passing CPU suites, a separate production
+build and subsequently passing bounded AR/MTP hardware/functional checks; timing
+flags remain open.
+[Evidence and limits](../../patches/ar-snapshot-turn/README.md).
+
+The follow-up [eight-pair adaptive-MTP study](../../patches/ar-snapshot-turn/README.md)
+completes 16 starts/80 exact outputs: concurrent geometric change +1.302%,
+95% interval [−1.053,+3.511]%, balanced-order p=0.371429. No aggregate direction
+or equivalence established. All 14 new phase flags and 30 changed-work
+comparisons remain; earlier pilot flags are separate. The separate AR confidence study is complete (below); standalone timing follow-up remains open.
+
+The AR confidence comparison completes80exact outputs with16retainedphase flags;
+its primary C2endpoint supports+5.415%throughput (95%CI[0.886,12.644]%) with a
+first-request batching tradeoff. Standalone published AR/MTP each separately pass
+23HTTPrequests, six confirmed cancellations, exact width-two survivors/replay and
+two seeded18,461token continuations. Standalone timing retains24flags/six changed-
+work comparisons; no blanket performance or error-path qualification is claimed.
+
+The standalone published-base MTPfollow-up completes16starts/80exact outputs and
+32clean host windows. Point C2change+18.365%,bootstrap95%[0.670,49.116]%,but exact
+balanced p=.142857 (5/8positive): no established direction/equivalence. All55new
+phase flags/30work changes remain. Equal-work repeated C1ranges1.991–2.556s.
+A separate diagnostic finds198actualslowCorsairNVMecommands in three cohorts,
+with IRQ→CQ≤6.75µs and observed reader runnable delay≤33.179µs. It does not explain the old long
+plateau; collector failure/partialEVOcoverage limits remain. [Evidence](../../patches/ar-snapshot-turn/README.md).

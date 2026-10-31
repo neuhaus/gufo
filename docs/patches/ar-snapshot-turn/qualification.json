@@ -1,0 +1,432 @@
+{
+  "publication_base": "b6d4cbaacb609424a52ca70dd60e97fc4d8ca57e",
+  "publication_code_commit": "92bf7cb65e9e86b8e6408e39ca0498e8b52b31f8",
+  "hardware_integration_code_commit": "e62c887e",
+  "runtime_parent_SHA256": "ccdb9495527b0d69190e4303cebf30e2cd4142e9d8baaf94c5763b7f7e6adcd5",
+  "runtime_fix_SHA256": "d41a20216e0a4d7da8df30285c3c9ee89bab197b7965f62f1e6c4b8557a54162",
+  "hardware_scope": "Two Ryzen AI Max+395/gfx1151 128GB nodes, Linux7.3.0-strix-test, privateROCm7.14.1, UD-Q4_K_XL FlashNext/sharedQ8_0MTP,65Kcontext/twosessions,CLI2K/backend4K,1GiBcache,124GiBHIPheaps,crossed40+20Gbps/common844Edriver. Published older base does NOT include the other HC/cooperative/cache integration work used for hardware runs; Standalone bounded hardware and functional checks now reported separately; timing flags remain open.",
+  "observed_starvation": {
+    "mutex_wait_ms": 601.137875,
+    "Advance_acquisitions_after_capture_wait_begins": 22,
+    "capture_after_acquisition_ms": 3.874954
+  },
+  "AR_pilot": {
+    "requests": 24,
+    "rates": {
+      "before-baseline": {
+        "first_2K_ms": 1097.994703,
+        "repeat_2K_ms": 1086.925635,
+        "pp32768_ms": 15376.228482999999,
+        "pp32768_tps": 2131.081756246559,
+        "C1_tps": 37.52348257311957,
+        "C1_repeat_tps": 37.47916204195642,
+        "C2_wave_tps": 36.74956898862988,
+        "C2_TTFT_ms": [
+          275.061794,
+          334.690326
+        ],
+        "C2_max_gap_ms": [
+          97.097129,
+          3342.218603
+        ],
+        "C2_draft_rounds": [
+          0,
+          0
+        ]
+      },
+      "first-candidate": {
+        "first_2K_ms": 1076.892775,
+        "repeat_2K_ms": 1094.470739,
+        "pp32768_ms": 15420.213387000002,
+        "pp32768_tps": 2125.0030189352005,
+        "C1_tps": 37.64559679005069,
+        "C1_repeat_tps": 37.535195540438195,
+        "C2_wave_tps": 56.41009617596594,
+        "C2_TTFT_ms": [
+          276.923168,
+          339.298568
+        ],
+        "C2_max_gap_ms": [
+          99.522077,
+          83.385151
+        ],
+        "C2_draft_rounds": [
+          0,
+          0
+        ]
+      },
+      "second-candidate": {
+        "first_2K_ms": 1111.341493,
+        "repeat_2K_ms": 1091.144818,
+        "pp32768_ms": 15408.159379,
+        "pp32768_tps": 2126.6654370579768,
+        "C1_tps": 37.55817892787901,
+        "C1_repeat_tps": 37.517138447211444,
+        "C2_wave_tps": 56.52290644846816,
+        "C2_TTFT_ms": [
+          277.837781,
+          341.875351
+        ],
+        "C2_max_gap_ms": [
+          101.435479,
+          84.086009
+        ],
+        "C2_draft_rounds": [
+          0,
+          0
+        ]
+      },
+      "after-baseline": {
+        "first_2K_ms": 1079.123239,
+        "repeat_2K_ms": 1092.5684959999999,
+        "pp32768_ms": 15457.495418000002,
+        "pp32768_tps": 2119.8777107086958,
+        "C1_tps": 37.58395135529262,
+        "C1_repeat_tps": 37.4008338074369,
+        "C2_wave_tps": 53.118000627704596,
+        "C2_TTFT_ms": [
+          279.20396,
+          341.748405
+        ],
+        "C2_max_gap_ms": [
+          100.300803,
+          423.62555
+        ],
+        "C2_draft_rounds": [
+          0,
+          0
+        ]
+      }
+    },
+    "strict_phase_flags": 22,
+    "adaptive_work_comparisons": 4
+  },
+  "adaptive_MTP_pilot": {
+    "requests": 24,
+    "rates": {
+      "before-baseline": {
+        "first_2K_ms": 1111.6025849999999,
+        "repeat_2K_ms": 1132.183528,
+        "pp32768_ms": 16069.410493000001,
+        "pp32768_tps": 2039.153832947019,
+        "C1_tps": 56.54103759817082,
+        "C1_repeat_tps": 56.58065348660936,
+        "C2_wave_tps": 64.87970127438845,
+        "C2_TTFT_ms": [
+          277.065684,
+          336.876341
+        ],
+        "C2_max_gap_ms": [
+          136.473668,
+          136.472828
+        ],
+        "C2_draft_rounds": [
+          48,
+          47
+        ]
+      },
+      "first-candidate": {
+        "first_2K_ms": 1117.390542,
+        "repeat_2K_ms": 1130.697873,
+        "pp32768_ms": 16071.687195,
+        "pp32768_tps": 2038.8649680908625,
+        "C1_tps": 56.68451720135543,
+        "C1_repeat_tps": 56.33744537172927,
+        "C2_wave_tps": 57.27131151715378,
+        "C2_TTFT_ms": [
+          278.974267,
+          338.948769
+        ],
+        "C2_max_gap_ms": [
+          133.832078,
+          133.832168
+        ],
+        "C2_draft_rounds": [
+          51,
+          47
+        ]
+      },
+      "second-candidate": {
+        "first_2K_ms": 1121.393022,
+        "repeat_2K_ms": 1132.755521,
+        "pp32768_ms": 16116.526701,
+        "pp32768_tps": 2033.1924246411484,
+        "C1_tps": 56.576695283260946,
+        "C1_repeat_tps": 56.576648034285846,
+        "C2_wave_tps": 68.98661052943444,
+        "C2_TTFT_ms": [
+          281.603088,
+          341.952438
+        ],
+        "C2_max_gap_ms": [
+          135.676822,
+          135.675582
+        ],
+        "C2_draft_rounds": [
+          63,
+          62
+        ]
+      },
+      "after-baseline": {
+        "first_2K_ms": 1116.381382,
+        "repeat_2K_ms": 1130.0911409999999,
+        "pp32768_ms": 16108.676839999998,
+        "pp32768_tps": 2034.1832122817607,
+        "C1_tps": 56.333885005917715,
+        "C1_repeat_tps": 56.391663268894305,
+        "C2_wave_tps": 63.30593824000278,
+        "C2_TTFT_ms": [
+          280.348405,
+          340.762644
+        ],
+        "C2_max_gap_ms": [
+          121.188836,
+          133.037072
+        ],
+        "C2_draft_rounds": [
+          54,
+          53
+        ]
+      }
+    },
+    "strict_phase_flags": 25,
+    "adaptive_work_comparisons": 23
+  },
+  "fixed1_diagnostic": {
+    "requests": 12,
+    "rates": {
+      "before-baseline": {
+        "first_2K_ms": 1119.161542,
+        "repeat_2K_ms": 1131.7090950000002,
+        "pp32768_ms": 16090.352346,
+        "pp32768_tps": 2036.4998413565506,
+        "C1_tps": 53.72532139247971,
+        "C1_repeat_tps": 53.45001384953714,
+        "C2_wave_tps": 70.99918360005724,
+        "C2_TTFT_ms": [
+          275.520868,
+          335.601119
+        ],
+        "C2_max_gap_ms": [
+          105.052794,
+          104.645346
+        ],
+        "C2_draft_rounds": [
+          69,
+          68
+        ]
+      },
+      "first-candidate": {
+        "first_2K_ms": 1118.955379,
+        "repeat_2K_ms": 1134.5554399999999,
+        "pp32768_ms": 16113.521972,
+        "pp32768_tps": 2033.571559150135,
+        "C1_tps": 53.758802635231774,
+        "C1_repeat_tps": 53.48991160291289,
+        "C2_wave_tps": 71.04432072696633,
+        "C2_TTFT_ms": [
+          277.685383,
+          337.206361
+        ],
+        "C2_max_gap_ms": [
+          104.154411,
+          102.908078
+        ],
+        "C2_draft_rounds": [
+          69,
+          68
+        ]
+      }
+    },
+    "strict_phase_flags": 0,
+    "adaptive_work_comparisons": 0,
+    "scope": "Supported min=max1 diagnostic only; not a default recommendation or clearance of adaptive flags."
+  },
+  "functional": {
+    "functional_records": 11,
+    "client_HTTP_requests": 23,
+    "server_confirmed_cancellations": 6,
+    "cancellation_orders": [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ]
+    ],
+    "survivor_and_replay_hashes_match": true,
+    "actual_two_row_survivors": true,
+    "deep_cases": [
+      {
+        "case": "content-preserve0-sampled1",
+        "cached": 18461,
+        "prefill": 34,
+        "accepted": 0,
+        "proposed": 1,
+        "exact": true,
+        "discard_assistant": false
+      },
+      {
+        "case": "content-preserve1-sampled1",
+        "cached": 18461,
+        "prefill": 13,
+        "accepted": 9,
+        "proposed": 9,
+        "exact": true,
+        "discard_assistant": true
+      }
+    ],
+    "checked_transport_errors_zero": true,
+    "scope": "Candidate-only MTP functional coverage; two concurrent disconnect orders plus two deep seeded cached/replay histories. No timing-control, confidence, process-loss, cable-loss, persistence or universal deadlock qualification."
+  },
+  "all_checked_transport_windows_clean": true,
+  "approved_drivers_restored": true,
+  "remaining": [
+    "AR randomized confidence remains pending.",
+    "Per-request adaptive-MTP flags remain inconclusive; work differences do not prove their cause.",
+    "AR first-request batching tradeoff retained.",
+    "Published older tree has CPU/build coverage, not standalone live hardware coverage.",
+    "No default promotion or universal deadlock/process-loss/cable-loss/overnight qualification."
+  ],
+  "publication_validation": {
+    "CPU_suites": "5/5 passed on published base",
+    "format": "692C++files checked",
+    "production_build": "295targets passed; standalone published-base binary never deployed",
+    "production_binary_SHA256": "0ced6bf2afe5cb5d313c48cc965beeaead5ca0a2f631f5e0088417ba18df6e7a"
+  },
+  "adaptive_MTP_confidence": {
+    "pairs": 8,
+    "starts": 16,
+    "requests": 80,
+    "primary": {
+      "paired_log_ratios": [
+        0.044471154428549986,
+        0.04329802918017666,
+        -0.0029976795605152306,
+        -0.046436341747687446,
+        0.006448721611845344,
+        -0.0003996297868693108,
+        0.05881913068642667,
+        0.00024941504967189833
+      ],
+      "mean_log_ratio": 0.012931599982699821,
+      "wave_latency_reduction_pct": 1.2848346098680352,
+      "paired_geometric_throughput_increase_pct": 1.3015574707191533,
+      "bootstrap95_latency_reduction_pct": [
+        -1.0642317372953292,
+        3.392136798187062
+      ],
+      "bootstrap95_throughput_increase_pct": [
+        -1.053025109874366,
+        3.5112429628020254
+      ],
+      "predeclared_two_sided_signflip_p": 0.3125,
+      "signflip_assumption": "Pairwise sign symmetry;256signpatterns, not the constrained assignment distribution.",
+      "balanced_assignment_sensitivity_p": 0.37142857142857144,
+      "balanced_assignments": 70,
+      "positive_pairs": 5,
+      "negative_pairs": 3
+    },
+    "strict_flags": 14,
+    "work_comparisons": 30,
+    "C2_flagged_pairs": [
+      1,
+      2,
+      4,
+      7
+    ],
+    "all_flagged_C2_pairs_have_changed_work": true,
+    "repeated_outside_entire_control_range": 0,
+    "scope": "No established aggregate direction or equivalence. Earlier pilot flags retained separately. Standalone published tree not hardware qualified."
+  },
+  "AR_confidence": {
+    "requests": 80,
+    "pairs": 8,
+    "primary": {
+      "paired_log_ratios": [
+        0.07283225340918734,
+        0.012687167184206516,
+        0.0008331774905709426,
+        0.061955702094270156,
+        0.26699352595743897,
+        -0.0012063134059212236,
+        0.006226241022866625,
+        0.0015772130092200057
+      ],
+      "mean_log_ratio": 0.05273737084522991,
+      "wave_latency_reduction_pct": 5.137088256694322,
+      "paired_geometric_throughput_increase_pct": 5.415275751386409,
+      "bootstrap95_latency_reduction_pct": [
+        0.8784947022840495,
+        11.224748461525746
+      ],
+      "bootstrap95_throughput_increase_pct": [
+        0.8862806306718661,
+        12.644006372272642
+      ],
+      "predeclared_two_sided_signflip_p": 0.0234375,
+      "signflip_assumption": "Pairwise sign symmetry;256signpatterns, not the constrained assignment distribution.",
+      "balanced_assignment_sensitivity_p": 0.02857142857142857,
+      "balanced_assignments": 70,
+      "positive_pairs": 7,
+      "negative_pairs": 1
+    },
+    "strict_phase_flags": 16,
+    "adaptive_work_comparisons": 0,
+    "first_request_tradeoff_ms": 463.5172149974096,
+    "scope": "Integration stack only; first-request batching tradeoff and every flag retained. C1secondary exploratory, standalone published-base and MTP conclusions separate."
+  },
+  "standalone_published_base": {
+    "parent_binary_SHA256": "ac0f26eb78f815d3acfaed770bb982996290177b6db481380dccedd6e80a0fc4",
+    "candidate_binary_SHA256": "0ced6bf2afe5cb5d313c48cc965beeaead5ca0a2f631f5e0088417ba18df6e7a",
+    "mode_requests": 24,
+    "strict_phase_flags": 24,
+    "work_comparisons": 6,
+    "functional": {
+      "AR_HTTP_requests": 23,
+      "MTP_HTTP_requests": 23,
+      "server_cancellations_per_mode": 6,
+      "cached_tokens_per_deep_case": 18461
+    },
+    "scope": "Bounded mode/functional checks pass. Separate eight-pair MTPconfidence complete/inconclusive; all timing flags retained. No integration performance transfer or default promotion."
+  },
+  "standalone_adaptive_MTP_confidence": {
+    "pairs": 8,
+    "requests": 80,
+    "primary": {
+      "paired_log_ratios": [
+        0.01490189077725202,
+        0.3137606597144458,
+        -0.0571139282757867,
+        -0.004784545635439341,
+        0.8989570278668737,
+        0.11322398584396587,
+        -0.01800185336464093,
+        0.08785144990520202
+      ],
+      "mean_log_ratio": 0.16859933585398404,
+      "wave_latency_reduction_pct": 15.515266438108434,
+      "paired_geometric_throughput_increase_pct": 18.364579947147845,
+      "bootstrap95_latency_reduction_pct": [
+        0.6656497886195378,
+        32.93826001072977
+      ],
+      "bootstrap95_throughput_increase_pct": [
+        0.6701103769270703,
+        49.116321789443326
+      ],
+      "predeclared_two_sided_signflip_p": 0.109375,
+      "signflip_assumption": "Pairwise sign symmetry;256signpatterns, not the constrained assignment distribution.",
+      "balanced_assignment_sensitivity_p": 0.14285714285714285,
+      "balanced_assignments": 70,
+      "positive_pairs": 5,
+      "negative_pairs": 3
+    },
+    "strict_phase_flags": 55,
+    "work_comparisons": 30,
+    "scope": "Inconclusive exact tests despite approximate bootstrap interval; no standalone gain/equivalence or clearance of earlier flags. Equal-work C1tails remain."
+  },
+  "standalone_IO_diagnostic": "See standalone-io-cohorts.json;198actualslowCorsaircommands, no longC1plateau, controllerfailure/oneEVOsetupmiss/missingtransportaftergate retained."
+}

@@ -1,0 +1,17 @@
+case,repetition,index,metric,baseline_range_ms,candidate_range_ms,flagged_pairs,candidates_over_entire_baseline_range,classification
+pp2048-tg128,1,0,first_followup_content_gap_ms,"[30.158007, 31.298233]","[30.201645, 33.582684]",[6],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,wall_ms,"[4061.7953920009313, 4542.632135999156]","[4483.973785001581, 4525.312606998341]",[5],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,client_event_inter_token_ms,"[29.805433574824924, 33.39200114173513]","[33.13624195274544, 33.31946067716106]",[5],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,decode_ms,"[3688.578219, 4145.507900999998]","[4112.8367800000005, 4138.123372000002]",[5],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,server_inter_token_ms,"[29.80657606299212, 33.38911020472441]","[33.13740963779527, 33.320145220472455]",[5],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,server_max_inter_token_ms,"[96.716623, 122.309584]","[93.637016, 122.816071]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,first_followup_content_gap_ms,"[96.604517, 122.192697]","[93.522919, 122.703594]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,raw.decode_ms,"[3688.578219, 4145.507900999998]","[4112.8367800000005, 4138.123372000002]",[5],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,raw.mean_inter_token_ms,"[29.80657606299212, 33.38911020472441]","[33.13740963779527, 33.320145220472455]",[5],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,raw.max_inter_token_ms,"[96.716623, 122.309584]","[93.637016, 122.816071]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,decode_ms,"[3680.3139739999992, 4139.004495000004]","[4103.333453999997, 4132.427252000002]",[5],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,server_max_inter_token_ms,"[57.484447, 1908.522542]","[58.031132, 85.858357]",[8],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,first_followup_content_gap_ms,"[57.508856, 1908.56982]","[58.117049, 86.006922]",[8],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,raw.cache_snapshot_ms,"[100.411001, 1951.819884]","[102.112851, 129.725392]",[8],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,raw.decode_ms,"[3680.3139739999992, 4139.004495000004]","[4103.333453999997, 4132.427252000002]",[5],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,raw.max_inter_token_ms,"[57.484447, 1908.522542]","[58.031132, 85.858357]",[8],0,Variable/overlapping or sparse; unresolved

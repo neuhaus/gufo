@@ -1,0 +1,37 @@
+case,repetition,index,metric,baseline_range_ms,candidate_range_ms,flagged_pairs,candidates_over_entire_baseline_range,classification
+pp2048-tg128,1,0,client_ttft_ms,"[1123.3197820001806, 1273.3891159987252]","[1117.1467369968013, 1272.602338998695]",[1],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,1,0,prefill_ms,"[1117.907895, 1267.911109]","[1111.848176, 1267.0680940000002]",[1],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,1,0,server_ttft_ms,"[1122.604084, 1272.618049]","[1116.41166, 1271.945609]",[1],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,1,0,server_max_inter_token_ms,"[64.113179, 143.51434]","[64.323463, 132.678215]",[7],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,1,0,first_followup_content_gap_ms,"[50.916844, 143.980836]","[50.258234, 132.768992]",[7],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,1,0,raw.prefill_ms,"[1117.907895, 1267.911109]","[1111.848176, 1267.0680940000002]",[1],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,1,0,raw.ttft_ms,"[1122.604084, 1272.618049]","[1116.41166, 1271.945609]",[1],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,1,0,raw.max_inter_token_ms,"[64.113179, 143.51434]","[64.323463, 132.678215]",[7],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,2,0,wall_ms,"[3147.3483169975225, 3690.7848740011104]","[3151.6618069981632, 3711.333426999772]","[3, 4]",0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,2,0,client_event_inter_token_ms,"[17.864912839286262, 22.694723303564906]","[17.798399026787592, 22.837694562505412]",[4],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,2,0,decode_ms,"[1998.9385740000007, 2539.7467509999997]","[1991.11851, 2555.5324490000007]","[3, 4, 5]",0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,2,0,server_inter_token_ms,"[17.866908401785714, 22.696028714285717]","[17.796993535714297, 22.836956187499997]",[4],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,2,0,server_max_inter_token_ms,"[63.513207, 140.744233]","[64.165778, 142.128121]","[3, 4, 5]",0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,2,0,raw.decode_ms,"[1998.9385740000007, 2539.7467509999997]","[1991.11851, 2555.5324490000007]","[3, 4, 5]",0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,2,0,raw.mean_inter_token_ms,"[17.866908401785714, 22.696028714285717]","[17.796993535714297, 22.836956187499997]",[4],0,Variable/overlapping or sparse; unresolved
+pp2048-tg128,2,0,raw.max_inter_token_ms,"[63.513207, 140.744233]","[64.165778, 142.128121]","[3, 4, 5]",0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,wall_ms,"[3654.81268199801, 16554.41861300278]","[3596.6587940019963, 6849.418331999914]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,client_ttft_ms,"[285.89282300163177, 367.47454999931506]","[282.5004660007835, 368.48645899954136]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,prefill_ms,"[171.782123, 257.830705]","[172.975177, 258.52511300000003]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,server_ttft_ms,"[285.103017, 366.7799]","[281.729819, 367.542498]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,server_max_inter_token_ms,"[122.902567, 714.392705]","[118.757542, 221.348587]","[3, 8]",0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,first_followup_content_gap_ms,"[52.445739, 201.702206]","[118.758012, 201.458343]","[2, 3, 4]",0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,raw.cache_snapshot_ms,"[114.596645, 221.490184]","[175.76620400000002, 216.243461]",[2],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,raw.prefill_ms,"[171.782123, 257.830705]","[172.975177, 258.52511300000003]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,raw.ttft_ms,"[285.103017, 366.7799]","[281.729819, 367.542498]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,raw.max_inter_token_ms,"[122.902567, 714.392705]","[118.757542, 221.348587]","[3, 8]",0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,wall_ms,"[3644.550639000954, 15724.54369800107]","[3586.008872000093, 6839.325673998246]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,client_ttft_ms,"[345.64763299931656, 427.83511100060423]","[342.3825410027348, 429.2265089970897]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,queue_ms,"[100.630695, 186.021056]","[101.45565, 187.309388]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,server_ttft_ms,"[345.009503, 427.251068]","[341.875996, 428.800002]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,server_max_inter_token_ms,"[137.229698, 714.393595]","[135.290086, 333.161437]","[3, 4]",0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,first_followup_content_gap_ms,"[97.100211, 329.676183]","[134.803241, 333.325832]","[2, 3, 4]",0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,raw.cache_snapshot_ms,"[123.261537, 294.41154900000004]","[159.76601399999998, 296.53342399999997]","[2, 3, 4]",0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,raw.queue_ms,"[100.630695, 186.021056]","[101.45565, 187.309388]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,raw.ttft_ms,"[345.009503, 427.251068]","[341.875996, 428.800002]",[3],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,raw.max_inter_token_ms,"[137.229698, 714.393595]","[135.290086, 333.161437]","[3, 4]",0,Variable/overlapping or sparse; unresolved

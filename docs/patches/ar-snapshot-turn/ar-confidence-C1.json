@@ -1,0 +1,22 @@
+{
+  "C1_first": {
+    "latency_reduction_pct": 0.41388978159848655,
+    "bootstrap95_latency_reduction_pct": [
+      0.16232866215349917,
+      0.6517622592482453
+    ],
+    "signflip_p": 0.03125,
+    "balanced_p": 0.02857142857142857,
+    "scope": "Declared secondary C1 endpoint; exploratory inference, not a new primary or equivalence claim."
+  },
+  "C1_repeat": {
+    "latency_reduction_pct": 0.12368874780889216,
+    "bootstrap95_latency_reduction_pct": [
+      -0.21522998744023525,
+      0.4261888574310535
+    ],
+    "signflip_p": 0.53125,
+    "balanced_p": 0.5714285714285714,
+    "scope": "Declared secondary C1 endpoint; exploratory inference, not a new primary or equivalence claim."
+  }
+}

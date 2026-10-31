@@ -223,3 +223,35 @@ Q8 MTP rates vary more between server starts than between cohorts of one
 start: a second start with three cohorts per point gave mixed 90.06 (C4) and
 105.40 (C6), repetitive 115.74 (C4) and 118.65 (C6) tok/s, each cohort within
 3% of its point's rate.
+
+## Draft TP snapshot-turn measurements (October 31, 2026)
+
+A separate integration-stack pilot uses two Strix Halo nodes, matching private
+ROCm7.14.1 builds, UD-Q4_K_XL/sharedQ8_0MTP, 65K capacity, two sessions and crossed
+40+20Gb/s. AR concurrent waves measure parent36.75/53.12 versus fix56.41/56.52
+tok/s; C1 remains about37.5–37.6tok/s. This fixes a measured admission mechanism
+but includes a first-request batching tradeoff, 22 phase flags and variable
+controls; no statistical gain is established. Adaptive MTP remains unqualified.
+The published older base has separate bounded hardware/functional checks, with timing flags still open. [Full scope and per-request flags](../../patches/ar-snapshot-turn/README.md).
+
+The follow-up [eight-pair adaptive-MTP study](../../patches/ar-snapshot-turn/README.md)
+completes 16 starts/80 exact outputs: concurrent geometric change +1.302%,
+95% interval [−1.053,+3.511]%, balanced-order p=0.371429. No aggregate direction
+or equivalence established. All 14 new phase flags and 30 changed-work
+comparisons remain; earlier pilot flags are separate. The separate AR confidence study is complete (below); standalone timing follow-up remains open.
+
+The predeclared AR eight-pair integration study completes16starts/80exact outputs:
+C2geometric throughput +5.415%,95%CI[0.886,12.644]%,balanced p=.028571. All16phase
+flags remain; one first request takes464ms longer while the pair finishes sooner.
+This does not establish the same gain on the older published base. Its standalone
+24-output AR/MTP check retains24flags, including~0.77sMTP-C2wall slowdowns with
+changed draft work; standalone confidence follow-up is complete but inconclusive. Independent
+candidate AR/MTP cancellation and seeded18Kcache checks pass. Keep draft.
+
+The standalone published-base MTPfollow-up completes16starts/80exact outputs and
+32clean host windows. Point C2change+18.365%,bootstrap95%[0.670,49.116]%,but exact
+balanced p=.142857 (5/8positive): no established direction/equivalence. All55new
+phase flags/30work changes remain. Equal-work repeated C1ranges1.991–2.556s.
+A separate diagnostic finds198actualslowCorsairNVMecommands in three cohorts,
+with IRQ→CQ≤6.75µs and observed reader runnable delay≤33.179µs. It does not explain the old long
+plateau; collector failure/partialEVOcoverage limits remain. [Evidence](../../patches/ar-snapshot-turn/README.md).

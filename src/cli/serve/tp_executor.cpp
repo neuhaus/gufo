@@ -906,6 +906,7 @@ TextDecodeSelection TpMirroredRunner::SelectNext(
 
 void TpMirroredRunner::Advance(TextRunnerState& state,
                                TextRunnerToken token) const {
+  const TpSnapshotGate::Turn turn(snapshot_gate_);
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   auto& mirrored = Mirrored(state);
   const auto sent = Send(mirrored.id(), {.op = TpInstructionOp::kAdvance,
@@ -927,6 +928,7 @@ void TpMirroredRunner::Advance(TextRunnerState& state,
 TextDecodeStep TpMirroredRunner::DecodeStep(
     TextRunnerState& state, std::size_t max_tokens,
     sampling::SamplerState& sampler) const {
+  const TpSnapshotGate::Turn turn(snapshot_gate_);
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   // A multi-token cycle is one instruction. It carries the sampler's draw
   // state, so rank 1, whose sampler otherwise matches, draws what rank 0 draws
@@ -975,6 +977,7 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
 
 std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
     std::span<const TextRunnerDecode> decodes) const {
+  const TpSnapshotGate::Turn turn(snapshot_gate_);
   if (decodes.size() < 2 || !multi_token_decode_ ||
       std::ranges::any_of(decodes, [this](const TextRunnerDecode& decode) {
         return !CyclesMirrored(decode.state.get(), decode.sampler.get());
@@ -1053,6 +1056,7 @@ std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
 
 void TpMirroredRunner::AdvanceBatch(
     std::span<const TextRunnerAdvance> advances) const {
+  const TpSnapshotGate::Turn turn(snapshot_gate_);
   if (advances.size() < 2) {
     TextModelRunner::AdvanceBatch(advances);
     return;
@@ -1227,7 +1231,9 @@ std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::SnapshotForPersistence(
 
 std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::Capture(
     const TextRunnerState& state, bool complete) const {
+  TpSnapshotGate::Pending pending(snapshot_gate_);
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
+  pending.Acquired();
   const auto& mirrored = Mirrored(state);
   if (next_snapshot_id_ == std::numeric_limits<std::uint64_t>::max()) {
     throw std::overflow_error("TP snapshot ID exhausted");

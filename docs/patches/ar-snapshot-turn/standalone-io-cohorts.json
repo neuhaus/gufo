@@ -1,0 +1,189 @@
+{
+  "ranks": {
+    "0": {
+      "table_reads": 9030,
+      "fully_linked_native_commands": 9029,
+      "commands_over10ms": 0,
+      "missing_native_setup_read_ms": [
+        0.239183
+      ],
+      "cohorts": []
+    },
+    "1": {
+      "table_reads": 9030,
+      "fully_linked_native_commands": 9030,
+      "commands_over10ms": 198,
+      "missing_native_setup_read_ms": [],
+      "cohorts": [
+        {
+          "wait_index": 116,
+          "WaitRead_ms": 62.285008,
+          "commands_in_wait": 96,
+          "slow_commands": 96,
+          "setup_span_ms": 0.356417,
+          "distinct_QIDs": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            7,
+            8,
+            9,
+            11,
+            12,
+            16,
+            18,
+            24,
+            26,
+            28,
+            29,
+            30,
+            31,
+            32
+          ],
+          "max_setup_to_CQ_ms": 62.133844,
+          "max_IRQ_entry_to_CQ_us": 6.75,
+          "completion_bursts": [
+            {
+              "count": 55,
+              "offset_from_first_setup_ms": 10.554408,
+              "span_us": 630.419
+            },
+            {
+              "count": 34,
+              "offset_from_first_setup_ms": 36.316447,
+              "span_us": 235.202
+            },
+            {
+              "count": 7,
+              "offset_from_first_setup_ms": 62.345536,
+              "span_us": 2.45
+            }
+          ],
+          "max_observed_reader_runnable_ms": 0.033179,
+          "max_block_completion_to_read_return_ms": 0.092537
+        },
+        {
+          "wait_index": 117,
+          "WaitRead_ms": 76.995384,
+          "commands_in_wait": 96,
+          "slow_commands": 96,
+          "setup_span_ms": 0.256822,
+          "distinct_QIDs": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            28,
+            29,
+            30,
+            31,
+            32
+          ],
+          "max_setup_to_CQ_ms": 76.801031,
+          "max_IRQ_entry_to_CQ_us": 3.29,
+          "completion_bursts": [
+            {
+              "count": 59,
+              "offset_from_first_setup_ms": 21.288282,
+              "span_us": 287.41
+            },
+            {
+              "count": 32,
+              "offset_from_first_setup_ms": 49.142198,
+              "span_us": 222.203
+            },
+            {
+              "count": 5,
+              "offset_from_first_setup_ms": 76.967726,
+              "span_us": 18.379
+            }
+          ],
+          "max_observed_reader_runnable_ms": 0.01794,
+          "max_block_completion_to_read_return_ms": 0.069388
+        },
+        {
+          "wait_index": 118,
+          "WaitRead_ms": 32.377372,
+          "commands_in_wait": 64,
+          "slow_commands": 6,
+          "setup_span_ms": 0.234232,
+          "distinct_QIDs": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            18,
+            19,
+            21,
+            24,
+            28,
+            29,
+            30,
+            31,
+            32
+          ],
+          "max_setup_to_CQ_ms": 32.142649,
+          "max_IRQ_entry_to_CQ_us": 3.68,
+          "completion_bursts": [
+            {
+              "count": 58,
+              "offset_from_first_setup_ms": 4.594063,
+              "span_us": 294.75
+            },
+            {
+              "count": 6,
+              "offset_from_first_setup_ms": 32.100542,
+              "span_us": 209.552
+            }
+          ],
+          "max_observed_reader_runnable_ms": 0.016069,
+          "max_block_completion_to_read_return_ms": 0.064548
+        }
+      ]
+    }
+  },
+  "conditional_fixed_work_impact": {
+    "C2_wave_seconds": 3.8347186249993683,
+    "peer_three_waits_sum_ms": 171.657764,
+    "ordered_engine_batch_comparison": [
+      {
+        "one_based_engine_batch_ordinal": 8,
+        "EVO_engine_batch_ms": 116.782502,
+        "Corsair_engine_batch_ms": 116.747794,
+        "Corsair_WaitRead_ms": 62.285008
+      },
+      {
+        "one_based_engine_batch_ordinal": 9,
+        "EVO_engine_batch_ms": 130.457753,
+        "Corsair_engine_batch_ms": 130.378547,
+        "Corsair_WaitRead_ms": 76.995384
+      },
+      {
+        "one_based_engine_batch_ordinal": 10,
+        "EVO_engine_batch_ms": 75.049902,
+        "Corsair_engine_batch_ms": 74.996243,
+        "Corsair_WaitRead_ms": 32.377372
+      }
+    ],
+    "conditional_latency_saving_upper_pct": 4.476410938756381,
+    "conditional_throughput_increase_upper_pct": 4.686183782192677,
+    "scope": "Conditional fixed-work estimate assuming every selected CPU wait removable and critical, no compensating work/policy changes. GPU overlap not measured; actual benefit may be lower. Mirrored ordered call durations, not aligned cross-host clocks. Not attribution of earlier16.5soutlier."
+  },
+  "scope": "Separate diagnostic: long C1 slowdown not reproduced; three actual Corsair I/O tail cohorts identified. Controller fails shutdown-status guard, original failure retained; independent artifacts analyzed. One EVO native setup miss and missing post-run transport-counter snapshot retained. No independent perf-link missed counters. Source/module identities guarded; command request/CID, IRQ-derivedQID and active table FD/TID/bytes joined, no cross-host time alignment. Setup\u2192CQ is software completion-path interval, not pure device service or attribution of old unprofiled plateau."
+}

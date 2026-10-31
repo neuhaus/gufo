@@ -1,0 +1,19 @@
+{
+  "parent_source_commit": "b6d4cbaacb609424a52ca70dd60e97fc4d8ca57e",
+  "candidate_code_commit": "92bf7cb6",
+  "published_head": "05675f6cfa1d6f8ec1ca927402d3a31c70fcf2bc",
+  "normalized_compile_commands_equal": true,
+  "compile_command_count": 290,
+  "only_task_CPP_files_change": [
+    "src/cli/serve/tp_executor.cpp",
+    "src/cli/serve/tp_snapshot_gate.hpp",
+    "tests/cli/tp_snapshot_gate_test.cpp"
+  ],
+  "model_source_unchanged": true,
+  "task_source_sha256": {
+    "src/cli/serve/tp_executor.cpp": "74a70f198d1f4df6c2de7434e9f0b0e00f4fd9ec5f85e135284039cb9fe87f15",
+    "src/cli/serve/tp_snapshot_gate.hpp": "9469d252dcca939cbd42c0df1f27521c858a6db9df8bf382dafd0d927eafaeac",
+    "tests/cli/tp_snapshot_gate_test.cpp": "190599738e152086b4c7fcfc480435ff6fb35ccd8abb0c981c7daef95fe1833e"
+  },
+  "scope": "Standalone published base; source/binary/control/build guards only, not a model qualification or performance result."
+}
