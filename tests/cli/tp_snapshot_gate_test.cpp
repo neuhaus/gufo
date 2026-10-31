@@ -7,6 +7,7 @@
 #include <iostream>
 #include <latch>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -45,6 +46,7 @@ int main() {
     std::recursive_mutex calls;
     std::latch registered(1);
     std::vector<int> order;
+    TpSnapshotGate::Turn active_turn(gate);
     std::unique_lock active(calls);
     auto capture = std::async(std::launch::async, [&] {
       TpSnapshotGate::Pending pending(gate);
@@ -55,11 +57,12 @@ int main() {
     });
     registered.wait();
     {
+      TpSnapshotGate::Turn nested_turn(gate);
       std::lock_guard nested(calls);
       order.push_back(1);
     }
     auto next = std::async(std::launch::async, [&] {
-      gate.Wait();
+      TpSnapshotGate::Turn next_turn(gate);
       std::lock_guard lock(calls);
       order.push_back(3);
     });
@@ -69,6 +72,43 @@ int main() {
     capture.get();
     next.get();
     assert((order == std::vector<int>{1, 2, 3}));
+  }
+  // An outer turn on another runner must not hide an earlier recursive owner.
+  // Pending captures cannot finish while these existing owners hold their
+  // call mutexes, so neither nested turn may wait for them.
+  {
+    TpSnapshotGate first, second;
+    TpSnapshotGate::Turn outer(first);
+    TpSnapshotGate::Pending pending_first(first);
+    TpSnapshotGate::Turn other(second);
+    TpSnapshotGate::Pending pending_second(second);
+    TpSnapshotGate::Turn nested_first(first);
+    TpSnapshotGate::Turn nested_second(second);
+  }
+  // Exceptions must restore the per-thread chain. A later independent turn
+  // on that same thread still waits for a pending capture.
+  {
+    TpSnapshotGate gate;
+    try {
+      TpSnapshotGate::Turn turn(gate);
+      throw std::runtime_error("unwind turn");
+    } catch (const std::runtime_error&) {
+    }
+    TpSnapshotGate::Pending pending(gate);
+    std::atomic<bool> released{false};
+    std::latch entered(1);
+    auto waiter = std::async(std::launch::async, [&] {
+      entered.count_down();
+      std::this_thread::sleep_for(20ms);
+      released.store(true);
+      pending.Acquired();
+    });
+    entered.wait();
+    {
+      TpSnapshotGate::Turn next(gate);
+    }
+    assert(released.load());
+    waiter.get();
   }
   // Concurrent reservations and decodes finish without losing registrations.
   TpSnapshotGate gate;
@@ -84,7 +124,7 @@ int main() {
           pending.Acquired();
           ++snapshots;
         } else {
-          gate.Wait();
+          TpSnapshotGate::Turn turn(gate);
           std::lock_guard lock(calls);
           ++decodes;
         }
@@ -96,5 +136,6 @@ int main() {
   assert(snapshots == 6000 && decodes == 6000);
   gate.Wait();
   std::cout << "PASS: multiple reservations, abandonment, idempotence, "
-               "recursive lock handoff, concurrent completion\n";
+               "recursive AR/decode turns, cross-runner nesting, exception "
+               "unwind, lock handoff, concurrent completion\n";
 }

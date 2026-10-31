@@ -8,10 +8,38 @@
 namespace gufo::server {
 
 // Decode waits outside the existing recursive call mutex, allowing an already
-// waiting snapshot to acquire it before another multi-token decode cycle.
+// waiting snapshot to acquire it before another decode or advance call.
 // This does not preempt an active call or impose ordering on prefill.
 class TpSnapshotGate {
 public:
+  // A fallback DecodeStep may hold the call mutex while calling Advance.
+  // Only the outer turn waits: waiting again from that nested Advance would
+  // prevent the pending capture from ever acquiring the same mutex.
+  class Turn {
+  public:
+    explicit Turn(const TpSnapshotGate& gate) noexcept
+        : gate_(&gate), previous_(current_) {
+      bool nested = false;
+      for (auto* turn = current_; turn; turn = turn->previous_) {
+        if (turn->gate_ == gate_) {
+          nested = true;
+          break;
+        }
+      }
+      if (!nested)
+        gate.Wait();
+      current_ = this;
+    }
+    Turn(const Turn&) = delete;
+    Turn& operator=(const Turn&) = delete;
+    ~Turn() { current_ = previous_; }
+
+  private:
+    const TpSnapshotGate* gate_;
+    Turn* previous_;
+    inline static thread_local Turn* current_{nullptr};
+  };
+
   class Pending {
   public:
     explicit Pending(TpSnapshotGate& gate) noexcept : gate_(&gate) {
