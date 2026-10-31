@@ -284,16 +284,61 @@
   "all_checked_transport_windows_clean": true,
   "approved_drivers_restored": true,
   "remaining": [
-    "Adaptive-MTP timing flags unresolved; fixed1 is a different workload.",
-    "Randomized confidence and stall frequency not established.",
+    "AR randomized confidence remains pending.",
+    "Per-request adaptive-MTP flags remain inconclusive; work differences do not prove their cause.",
     "AR first-request batching tradeoff retained.",
     "Published older tree has CPU/build coverage, not standalone live hardware coverage.",
-    "No default promotion; no universal deadlock/process-loss/cable-loss/overnight qualification."
+    "No default promotion or universal deadlock/process-loss/cable-loss/overnight qualification."
   ],
   "publication_validation": {
     "CPU_suites": "5/5 passed on published base",
     "format": "692C++files checked",
     "production_build": "295targets passed; standalone published-base binary never deployed",
     "production_binary_SHA256": "0ced6bf2afe5cb5d313c48cc965beeaead5ca0a2f631f5e0088417ba18df6e7a"
+  },
+  "adaptive_MTP_confidence": {
+    "pairs": 8,
+    "starts": 16,
+    "requests": 80,
+    "primary": {
+      "paired_log_ratios": [
+        0.044471154428549986,
+        0.04329802918017666,
+        -0.0029976795605152306,
+        -0.046436341747687446,
+        0.006448721611845344,
+        -0.0003996297868693108,
+        0.05881913068642667,
+        0.00024941504967189833
+      ],
+      "mean_log_ratio": 0.012931599982699821,
+      "wave_latency_reduction_pct": 1.2848346098680352,
+      "paired_geometric_throughput_increase_pct": 1.3015574707191533,
+      "bootstrap95_latency_reduction_pct": [
+        -1.0642317372953292,
+        3.392136798187062
+      ],
+      "bootstrap95_throughput_increase_pct": [
+        -1.053025109874366,
+        3.5112429628020254
+      ],
+      "predeclared_two_sided_signflip_p": 0.3125,
+      "signflip_assumption": "Pairwise sign symmetry;256signpatterns, not the constrained assignment distribution.",
+      "balanced_assignment_sensitivity_p": 0.37142857142857144,
+      "balanced_assignments": 70,
+      "positive_pairs": 5,
+      "negative_pairs": 3
+    },
+    "strict_flags": 14,
+    "work_comparisons": 30,
+    "C2_flagged_pairs": [
+      1,
+      2,
+      4,
+      7
+    ],
+    "all_flagged_C2_pairs_have_changed_work": true,
+    "repeated_outside_entire_control_range": 0,
+    "scope": "No established aggregate direction or equivalence. Earlier pilot flags retained separately. Standalone published tree not hardware qualified."
   }
 }

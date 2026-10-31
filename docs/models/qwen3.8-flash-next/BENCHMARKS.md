@@ -234,3 +234,10 @@ but includes a first-request batching tradeoff, 22 phase flags and variable
 controls; no statistical gain is established. Adaptive MTP remains unqualified.
 The published older base has separate CPU/build coverage, not standalone live
 hardware coverage. [Full scope and per-request flags](../../patches/ar-snapshot-turn/README.md).
+
+The follow-up [eight-pair adaptive-MTP study](../../patches/ar-snapshot-turn/README.md)
+completes 16 starts/80 exact outputs: concurrent geometric change +1.302%,
+95% interval [−1.053,+3.511]%, balanced-order p=0.371429. No aggregate direction
+or equivalence established. All 14 new phase flags and 30 changed-work
+comparisons remain; earlier pilot flags are separate. Actual AR confidence
+and standalone published-base hardware qualification remain pending.

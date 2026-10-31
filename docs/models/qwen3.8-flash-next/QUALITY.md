@@ -1154,3 +1154,10 @@ unqualified:22AR and25adaptive-MTP phase flags are retained, with changed
 batching/draft work. The standalone published base has five passing CPU suites
 and a separate production build, not live hardware coverage.
 [Evidence and limits](../../patches/ar-snapshot-turn/README.md).
+
+The follow-up [eight-pair adaptive-MTP study](../../patches/ar-snapshot-turn/README.md)
+completes 16 starts/80 exact outputs: concurrent geometric change +1.302%,
+95% interval [−1.053,+3.511]%, balanced-order p=0.371429. No aggregate direction
+or equivalence established. All 14 new phase flags and 30 changed-work
+comparisons remain; earlier pilot flags are separate. Actual AR confidence
+and standalone published-base hardware qualification remain pending.

@@ -72,6 +72,35 @@ not clear adaptive-mode flags or recommend a new default. The attempted floor
 of two was rejected by Flash Next before model loading completed; it is not a
 benchmark result.
 
+The subsequent predeclared eight-pair normal-adaptive comparison completes all
+16 starts and 80 matching canonical outputs, without exclusions or added
+starts. Paired geometric concurrent throughput change is +1.302%, with 95%
+paired-bootstrap interval [−1.053,+3.511]%; the predeclared sign-symmetry p is
+0.3125 and exact balanced-order sensitivity p is 0.371429. Five pairs favor the
+fix, three favor the parent. This establishes neither a gain nor a slowdown,
+and is not equivalence. The bootstrap assumes exchangeable pairs; the two
+p-values have different symmetry/randomization assumptions, both retained.
+
+All 14 new timing flags remain: eight public/raw decode comparisons across
+four C2 requests and six warmup metrics. Thirty draft-work comparisons differ.
+Every flagged C2 comparison has changed draft work, without establishing that
+as the entire cause. No metric has two candidates outside every observed
+baseline by the unchanged margin. No C1 strict flags; exploratory C1 first/
+repeat latency changes −0.065/−0.175% have intervals spanning zero. Earlier
+pilot flags remain separate. This narrows the concern to variable adaptive
+work/overlapping timings; it does not give a blanket per-request pass.
+
+[All pair rates](mtp-confidence-rates.csv), [flags](mtp-confidence-flags.csv),
+[changed work](mtp-confidence-work.csv), [ranges](mtp-confidence-ranges.csv),
+[numerical results](mtp-confidence.json) and the
+[statistical calculation](mtp-confidence-statistics.py) are retained. The
+same warmup/first-repeat2K/C2 prefix is used, omitting only trailing32K after
+the affected requests. Explicit max7/min1, same binaries and controls, no
+profiler/admin sampler/extra priming. All 32 host windows are clean; tested
+servers exit and approved drivers restore.
+
+![Every MTP pair and individual request change](mtp-confidence.png)
+
 Candidate functional coverage includes 23 HTTP requests: two concurrent
 victim/survivor orders, exact survivor/post-cancel replay, and two deep seeded
 continuations retaining/discarding interrupted assistant output. All six client
@@ -83,8 +112,8 @@ qualify process loss, cable loss, persistence or overnight operation.
 
 ## Review status
 
-Keep this follow-up a draft. Remaining work includes adaptive-MTP timing
-attribution, randomized concurrent-progress confidence, and hardware validation
+Keep this follow-up a draft. Remaining work includes unresolved per-request
+adaptive-MTP timing flags, randomized AR confidence, and hardware validation
 of this standalone published base. Per-request flags remain open; no default
 deployment, significance, universal deadlock clearance or blanket speedup is
 claimed. Existing snapshot-handoff PRs retain their own review state.

@@ -1,0 +1,11 @@
+case,repetition,index,metric,baseline_range_ms,candidate_range_ms,flagged_pairs,candidates_over_entire_baseline_range,classification
+warmup,0,0,wall_ms,"[253.77793399820803, 289.56599199955235]","[252.8136529981566, 288.6087100014265]",[5],0,Variable/overlapping or sparse; unresolved
+warmup,0,0,client_ttft_ms,"[157.6712440000847, 193.16504100061138]","[157.10365199993248, 192.53124899842078]",[5],0,Variable/overlapping or sparse; unresolved
+warmup,0,0,prefill_ms,"[149.61222600000002, 184.069523]","[149.052183, 184.38419499999998]",[5],0,Variable/overlapping or sparse; unresolved
+warmup,0,0,server_ttft_ms,"[157.177069, 192.50234]","[156.674235, 192.019855]",[5],0,Variable/overlapping or sparse; unresolved
+warmup,0,0,raw.prefill_ms,"[149.61222600000002, 184.069523]","[149.052183, 184.38419499999998]",[5],0,Variable/overlapping or sparse; unresolved
+warmup,0,0,raw.ttft_ms,"[157.177069, 192.50234]","[156.674235, 192.019855]",[5],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,decode_ms,"[3223.304894999999, 3451.1019169999995]","[3207.3831059999993, 3425.401719]",[4],0,Variable/overlapping or sparse; unresolved
+short-c2,1,0,raw.decode_ms,"[3223.304894999999, 3451.1019169999995]","[3207.3831059999993, 3425.401719]",[4],0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,decode_ms,"[2900.129140999999, 3138.2238359999997]","[2911.2960200000007, 3182.012736]","[1, 2, 7]",0,Variable/overlapping or sparse; unresolved
+short-c2,1,1,raw.decode_ms,"[2900.129140999999, 3138.2238359999997]","[2911.2960200000007, 3182.012736]","[1, 2, 7]",0,Variable/overlapping or sparse; unresolved
