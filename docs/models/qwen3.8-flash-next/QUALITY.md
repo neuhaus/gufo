@@ -1151,13 +1151,20 @@ server cancellations, exact two-row survivors/post-cancel replay and two seeded
 continuation histories reusing18,461tokens while retaining/discarding interrupted
 assistant output. Actual MTP proposals are checked. Per-request timing remains
 unqualified:22AR and25adaptive-MTP phase flags are retained, with changed
-batching/draft work. The standalone published base has five passing CPU suites
-and a separate production build, not live hardware coverage.
+batching/draft work. The standalone published base has five passing CPU suites, a separate production
+build and subsequently passing bounded AR/MTP hardware/functional checks; timing
+flags remain open.
 [Evidence and limits](../../patches/ar-snapshot-turn/README.md).
 
 The follow-up [eight-pair adaptive-MTP study](../../patches/ar-snapshot-turn/README.md)
 completes 16 starts/80 exact outputs: concurrent geometric change +1.302%,
 95% interval [−1.053,+3.511]%, balanced-order p=0.371429. No aggregate direction
 or equivalence established. All 14 new phase flags and 30 changed-work
-comparisons remain; earlier pilot flags are separate. Actual AR confidence
-and standalone published-base hardware qualification remain pending.
+comparisons remain; earlier pilot flags are separate. The separate AR confidence study is complete (below); standalone timing follow-up remains open.
+
+The AR confidence comparison completes80exact outputs with16retainedphase flags;
+its primary C2endpoint supports+5.415%throughput (95%CI[0.886,12.644]%) with a
+first-request batching tradeoff. Standalone published AR/MTP each separately pass
+23HTTPrequests, six confirmed cancellations, exact width-two survivors/replay and
+two seeded18,461token continuations. Standalone timing retains24flags/six changed-
+work comparisons; no blanket performance or error-path qualification is claimed.

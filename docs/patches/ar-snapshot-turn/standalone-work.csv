@@ -1,0 +1,7 @@
+mode,case,repetition,index,metric,baseline,candidate
+mtp,short-c2,1,0,draft_tokens,105,108
+mtp,short-c2,1,0,draft_accepted_tokens,62,53
+mtp,short-c2,1,0,raw.draft_rounds,60,42
+mtp,short-c2,1,1,draft_tokens,104,108
+mtp,short-c2,1,1,draft_accepted_tokens,65,55
+mtp,short-c2,1,1,raw.draft_rounds,58,41

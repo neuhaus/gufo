@@ -4,7 +4,7 @@
   "hardware_integration_code_commit": "e62c887e",
   "runtime_parent_SHA256": "ccdb9495527b0d69190e4303cebf30e2cd4142e9d8baaf94c5763b7f7e6adcd5",
   "runtime_fix_SHA256": "d41a20216e0a4d7da8df30285c3c9ee89bab197b7965f62f1e6c4b8557a54162",
-  "hardware_scope": "Two Ryzen AI Max+395/gfx1151 128GB nodes, Linux7.3.0-strix-test, privateROCm7.14.1, UD-Q4_K_XL FlashNext/sharedQ8_0MTP,65Kcontext/twosessions,CLI2K/backend4K,1GiBcache,124GiBHIPheaps,crossed40+20Gbps/common844Edriver. Published older base does NOT include the other HC/cooperative/cache integration work used for hardware runs; standalone published tree not hardware qualified.",
+  "hardware_scope": "Two Ryzen AI Max+395/gfx1151 128GB nodes, Linux7.3.0-strix-test, privateROCm7.14.1, UD-Q4_K_XL FlashNext/sharedQ8_0MTP,65Kcontext/twosessions,CLI2K/backend4K,1GiBcache,124GiBHIPheaps,crossed40+20Gbps/common844Edriver. Published older base does NOT include the other HC/cooperative/cache integration work used for hardware runs; Standalone bounded hardware and functional checks now reported separately; timing flags remain open.",
   "observed_starvation": {
     "mutex_wait_ms": 601.137875,
     "Advance_acquisitions_after_capture_wait_begins": 22,
@@ -340,5 +340,56 @@
     "all_flagged_C2_pairs_have_changed_work": true,
     "repeated_outside_entire_control_range": 0,
     "scope": "No established aggregate direction or equivalence. Earlier pilot flags retained separately. Standalone published tree not hardware qualified."
+  },
+  "AR_confidence": {
+    "requests": 80,
+    "pairs": 8,
+    "primary": {
+      "paired_log_ratios": [
+        0.07283225340918734,
+        0.012687167184206516,
+        0.0008331774905709426,
+        0.061955702094270156,
+        0.26699352595743897,
+        -0.0012063134059212236,
+        0.006226241022866625,
+        0.0015772130092200057
+      ],
+      "mean_log_ratio": 0.05273737084522991,
+      "wave_latency_reduction_pct": 5.137088256694322,
+      "paired_geometric_throughput_increase_pct": 5.415275751386409,
+      "bootstrap95_latency_reduction_pct": [
+        0.8784947022840495,
+        11.224748461525746
+      ],
+      "bootstrap95_throughput_increase_pct": [
+        0.8862806306718661,
+        12.644006372272642
+      ],
+      "predeclared_two_sided_signflip_p": 0.0234375,
+      "signflip_assumption": "Pairwise sign symmetry;256signpatterns, not the constrained assignment distribution.",
+      "balanced_assignment_sensitivity_p": 0.02857142857142857,
+      "balanced_assignments": 70,
+      "positive_pairs": 7,
+      "negative_pairs": 1
+    },
+    "strict_phase_flags": 16,
+    "adaptive_work_comparisons": 0,
+    "first_request_tradeoff_ms": 463.5172149974096,
+    "scope": "Integration stack only; first-request batching tradeoff and every flag retained. C1secondary exploratory, standalone published-base and MTP conclusions separate."
+  },
+  "standalone_published_base": {
+    "parent_binary_SHA256": "ac0f26eb78f815d3acfaed770bb982996290177b6db481380dccedd6e80a0fc4",
+    "candidate_binary_SHA256": "0ced6bf2afe5cb5d313c48cc965beeaead5ca0a2f631f5e0088417ba18df6e7a",
+    "mode_requests": 24,
+    "strict_phase_flags": 24,
+    "work_comparisons": 6,
+    "functional": {
+      "AR_HTTP_requests": 23,
+      "MTP_HTTP_requests": 23,
+      "server_cancellations_per_mode": 6,
+      "cached_tokens_per_deep_case": 18461
+    },
+    "scope": "Bounded outputs/functional/cleanup pass, not timing-qualified. Standalone eight-pair adaptive-MTP follow-up running; no interim aggregate."
   }
 }

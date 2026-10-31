@@ -1,0 +1,13 @@
+{
+  "80_canonical_identities_exact": true,
+  "frozen_harness_hashes_unchanged": true,
+  "rank_binary_and_serving_settings_match": true,
+  "32_transport_windows_zero_checked_errors": true,
+  "all_recorded_server_PIDs_exited": true,
+  "both_approved_drivers_restored_idle_four_rails": true,
+  "boot_flags_and_topology_unchanged": true,
+  "checked_kernel_fault_patterns_absent": true,
+  "strict_phase_flags": 16,
+  "adaptive_work_comparisons": 0,
+  "scope": "Eight balanced-order AR pairs; all per-request flags/work differences retained independently of primary endpoint. No significance, cache/error-path qualification or default adoption inferred."
+}
