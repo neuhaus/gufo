@@ -1168,3 +1168,11 @@ first-request batching tradeoff. Standalone published AR/MTP each separately pas
 23HTTPrequests, six confirmed cancellations, exact width-two survivors/replay and
 two seeded18,461token continuations. Standalone timing retains24flags/six changed-
 work comparisons; no blanket performance or error-path qualification is claimed.
+
+The standalone published-base MTPfollow-up completes16starts/80exact outputs and
+32clean host windows. Point C2change+18.365%,bootstrap95%[0.670,49.116]%,but exact
+balanced p=.142857 (5/8positive): no established direction/equivalence. All55new
+phase flags/30work changes remain. Equal-work repeated C1ranges1.991–2.556s.
+A separate diagnostic finds198actualslowCorsairNVMecommands in three cohorts,
+with IRQ→CQ≤6.75µs and observed reader runnable delay≤33.179µs. It does not explain the old long
+plateau; collector failure/partialEVOcoverage limits remain. [Evidence](../../patches/ar-snapshot-turn/README.md).

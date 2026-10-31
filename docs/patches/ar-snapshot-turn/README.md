@@ -175,16 +175,70 @@ functional checks, not matched timing controls or process/cable-loss coverage.
 [Mode results](standalone-modes.json), [validation](standalone-modes-validation.json),
 [source/build provenance](standalone-source.json) and
 [functional results/validation](standalone-functional.json) are retained.
-A separate predeclared eight-pair standalone adaptive-MTP follow-up is running
-with explicit max7/min1, same five-request prefix and no profiler/adminsampler.
-No interim aggregate analysis or transfer of private-stack performance claims.
+### Standalone adaptive-MTP follow-up: inconclusive
+
+All16predeclared starts/80canonical outputs pass,32host transport windows clean,
+server exit/approved-driver restoration/frozen/boot/topology/kernel checks pass.
+No exclusions, added starts or pooling with earlier studies. Geometric C2point
+change+18.365%,paired-bootstrap95%[+0.670,+49.116]%,but predeclared sign-symmetry
+p=.109375 and exact balanced-assignment p=.142857. Five pairs favor candidate,
+three favor parent; the16.554sparent outlier remains. The approximate bootstrap
+interval does not override the nonsignificant exact tests: no supported gain,
+slowdown or equivalence. This does not transfer the integration ARgain.
+
+All55newphase flags across12requests and30changed-work comparisons remain.
+No metric repeatedly exceeds every control by the unchanged margin; individual
+flags remain unresolved. Repeated C1has identical122proposals/66acceptances/
+31rounds in all16starts but decode1.991–2.556s. Candidate3/4/5are slower than
+paired parents, while parent6is also slow; unchanged work does not identify the
+cause. C1secondary first/repeat changes+0.190/−5.398%,balanced p=.828571/.057143
+are exploratory. No blanket performance clearance.
+
+Same five-request prefix, explicit max7/min1, no profiler/adminsampler/priming.
+Early pairs overlap documentation/git/status activity; its CPU/storage effect
+is not assumed zero. Later arms were free of repository updates; desktop/
+physical writeback was not independently controlled. No exclusions for activity.
+V1wrapper execute-permission failure before any model ran remains separate.
+
+[Every standalone pair](standalone-mtp-rates.csv), [all flags](standalone-mtp-flags.csv),
+[work](standalone-mtp-work.csv), [ranges](standalone-mtp-ranges.csv),
+[primary results](standalone-mtp-confidence.json), [C1secondary](standalone-mtp-C1.json),
+[validation](standalone-mtp-validation.json) and the shared
+[statistical calculation](mtp-confidence-statistics.py) are retained.
+
+![Every standalone MTP observation; exact tests inconclusive](standalone-mtp.png)
+
+### Separate path capture: genuine Corsair I/O tails
+
+One actual five-request candidate replay preserves exact outputs. The long C1
+slowdown does not recur, but three Corsair table waits62.285/76.995/32.377ms
+contain198NVMecommands over10ms. Setup→CPU CQconsumption maxima62.134/76.801/
+32.143ms; IRQentry→CQ≤6.75µs, observed reader runnable delay≤33.179µs and block
+completion→readreturn≤92.537µs. Command setup timestamps span0.234–0.357ms; CQconsumptions cluster
+in bursts across16–22queues. Request pointer/CID, IRQ-derivedQID, active table
+FD/read TID/bytes and completion before read return are checked. This is actual
+kernel-command completion-path latency, not just mmap/application waiting.
+
+Both ordered engine batch durations track those waits. Their171.658mssum in a
+3.834719swave would conditionally permit at most4.476%latency reduction if all
+waits were critical/removable and work unchanged. GPU overlap is unmeasured;
+actual benefit may be lower. No old16.5soutlier attribution or speedup claim.
+
+[Measured cohorts and explicit limits](standalone-io-cohorts.json) retain the
+failed collector shutdown guard, one missing EVOsetup record (0.239msread),
+and missing final transport snapshot. Peer9030commands fully link; native
+peer loss/recursion counters zero. Independent perf-link missed counters were
+not collected. Both drivers restore and model/tracer processes exit. Setup→CQ
+is not pure device service or exact doorbell/DMA/interrupt-generation timing;
+thermal/APST/HMB/IOMMU/firmware causality is unresolved. No normal-only trace
+loop or system-policy change follows from this capture.
 
 ## Review status
 
 Keep this follow-up a draft. The integration AR confidence endpoint supports
 a gain with a first-request tradeoff; individual flags remain open. Standalone
-AR/MTP functional checks pass, but affected timing follow-up remains pending,
-alongside adaptive-MTP timing uncertainty. No default deployment,
+AR/MTP functional checks pass and the bounded MTPfollow-up is complete but
+inconclusive. Equal-work tails and per-request timing flags remain unresolved. No default deployment,
 universal deadlock clearance or blanket speedup is claimed. Existing snapshot-
 handoff PRs retain their own review state.
 

@@ -245,5 +245,13 @@ C2geometric throughput +5.415%,95%CI[0.886,12.644]%,balanced p=.028571. All16pha
 flags remain; one first request takes464ms longer while the pair finishes sooner.
 This does not establish the same gain on the older published base. Its standalone
 24-output AR/MTP check retains24flags, including~0.77sMTP-C2wall slowdowns with
-changed draft work; standalone confidence follow-up is running. Independent
+changed draft work; standalone confidence follow-up is complete but inconclusive. Independent
 candidate AR/MTP cancellation and seeded18Kcache checks pass. Keep draft.
+
+The standalone published-base MTPfollow-up completes16starts/80exact outputs and
+32clean host windows. Point C2change+18.365%,bootstrap95%[0.670,49.116]%,but exact
+balanced p=.142857 (5/8positive): no established direction/equivalence. All55new
+phase flags/30work changes remain. Equal-work repeated C1ranges1.991–2.556s.
+A separate diagnostic finds198actualslowCorsairNVMecommands in three cohorts,
+with IRQ→CQ≤6.75µs and observed reader runnable delay≤33.179µs. It does not explain the old long
+plateau; collector failure/partialEVOcoverage limits remain. [Evidence](../../patches/ar-snapshot-turn/README.md).

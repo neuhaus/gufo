@@ -390,6 +390,43 @@
       "server_cancellations_per_mode": 6,
       "cached_tokens_per_deep_case": 18461
     },
-    "scope": "Bounded outputs/functional/cleanup pass, not timing-qualified. Standalone eight-pair adaptive-MTP follow-up running; no interim aggregate."
-  }
+    "scope": "Bounded mode/functional checks pass. Separate eight-pair MTPconfidence complete/inconclusive; all timing flags retained. No integration performance transfer or default promotion."
+  },
+  "standalone_adaptive_MTP_confidence": {
+    "pairs": 8,
+    "requests": 80,
+    "primary": {
+      "paired_log_ratios": [
+        0.01490189077725202,
+        0.3137606597144458,
+        -0.0571139282757867,
+        -0.004784545635439341,
+        0.8989570278668737,
+        0.11322398584396587,
+        -0.01800185336464093,
+        0.08785144990520202
+      ],
+      "mean_log_ratio": 0.16859933585398404,
+      "wave_latency_reduction_pct": 15.515266438108434,
+      "paired_geometric_throughput_increase_pct": 18.364579947147845,
+      "bootstrap95_latency_reduction_pct": [
+        0.6656497886195378,
+        32.93826001072977
+      ],
+      "bootstrap95_throughput_increase_pct": [
+        0.6701103769270703,
+        49.116321789443326
+      ],
+      "predeclared_two_sided_signflip_p": 0.109375,
+      "signflip_assumption": "Pairwise sign symmetry;256signpatterns, not the constrained assignment distribution.",
+      "balanced_assignment_sensitivity_p": 0.14285714285714285,
+      "balanced_assignments": 70,
+      "positive_pairs": 5,
+      "negative_pairs": 3
+    },
+    "strict_phase_flags": 55,
+    "work_comparisons": 30,
+    "scope": "Inconclusive exact tests despite approximate bootstrap interval; no standalone gain/equivalence or clearance of earlier flags. Equal-work C1tails remain."
+  },
+  "standalone_IO_diagnostic": "See standalone-io-cohorts.json;198actualslowCorsaircommands, no longC1plateau, controllerfailure/oneEVOsetupmiss/missingtransportaftergate retained."
 }
