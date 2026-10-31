@@ -1140,3 +1140,17 @@ prepares every session with one output token before the measured cohort; all
 51 measured completion sets match their fresh one-user AR controls. These
 checks do not establish unquantized-model accuracy. Commands, preparation
 records, hashes, samples and draft counts remain in the artifacts.
+
+## Draft TP recursive snapshot turns (October 31, 2026)
+
+This host scheduling change preserves model arithmetic and collective order.
+The integration-stack AR/MTP pilots match48canonical outputs; a supported
+fixed-depth1 diagnostic matches12more with identical recorded draft work.
+Candidate functional checks cover23HTTPrequests with six request-ID-matched
+server cancellations, exact two-row survivors/post-cancel replay and two seeded
+continuation histories reusing18,461tokens while retaining/discarding interrupted
+assistant output. Actual MTP proposals are checked. Per-request timing remains
+unqualified:22AR and25adaptive-MTP phase flags are retained, with changed
+batching/draft work. The standalone published base has five passing CPU suites
+and a separate production build, not live hardware coverage.
+[Evidence and limits](../../patches/ar-snapshot-turn/README.md).

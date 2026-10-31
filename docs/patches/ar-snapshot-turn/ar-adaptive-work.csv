@@ -1,0 +1,5 @@
+control,candidate,case,repetition,index,metric,baseline,candidate_value
+before-baseline,first-candidate,short-c2,1,0,physical_execution_width,1,2
+before-baseline,first-candidate,short-c2,1,1,physical_execution_width,1,2
+before-baseline,second-candidate,short-c2,1,0,physical_execution_width,1,2
+before-baseline,second-candidate,short-c2,1,1,physical_execution_width,1,2

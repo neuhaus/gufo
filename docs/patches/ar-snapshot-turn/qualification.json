@@ -1,0 +1,299 @@
+{
+  "publication_base": "b6d4cbaacb609424a52ca70dd60e97fc4d8ca57e",
+  "publication_code_commit": "92bf7cb65e9e86b8e6408e39ca0498e8b52b31f8",
+  "hardware_integration_code_commit": "e62c887e",
+  "runtime_parent_SHA256": "ccdb9495527b0d69190e4303cebf30e2cd4142e9d8baaf94c5763b7f7e6adcd5",
+  "runtime_fix_SHA256": "d41a20216e0a4d7da8df30285c3c9ee89bab197b7965f62f1e6c4b8557a54162",
+  "hardware_scope": "Two Ryzen AI Max+395/gfx1151 128GB nodes, Linux7.3.0-strix-test, privateROCm7.14.1, UD-Q4_K_XL FlashNext/sharedQ8_0MTP,65Kcontext/twosessions,CLI2K/backend4K,1GiBcache,124GiBHIPheaps,crossed40+20Gbps/common844Edriver. Published older base does NOT include the other HC/cooperative/cache integration work used for hardware runs; standalone published tree not hardware qualified.",
+  "observed_starvation": {
+    "mutex_wait_ms": 601.137875,
+    "Advance_acquisitions_after_capture_wait_begins": 22,
+    "capture_after_acquisition_ms": 3.874954
+  },
+  "AR_pilot": {
+    "requests": 24,
+    "rates": {
+      "before-baseline": {
+        "first_2K_ms": 1097.994703,
+        "repeat_2K_ms": 1086.925635,
+        "pp32768_ms": 15376.228482999999,
+        "pp32768_tps": 2131.081756246559,
+        "C1_tps": 37.52348257311957,
+        "C1_repeat_tps": 37.47916204195642,
+        "C2_wave_tps": 36.74956898862988,
+        "C2_TTFT_ms": [
+          275.061794,
+          334.690326
+        ],
+        "C2_max_gap_ms": [
+          97.097129,
+          3342.218603
+        ],
+        "C2_draft_rounds": [
+          0,
+          0
+        ]
+      },
+      "first-candidate": {
+        "first_2K_ms": 1076.892775,
+        "repeat_2K_ms": 1094.470739,
+        "pp32768_ms": 15420.213387000002,
+        "pp32768_tps": 2125.0030189352005,
+        "C1_tps": 37.64559679005069,
+        "C1_repeat_tps": 37.535195540438195,
+        "C2_wave_tps": 56.41009617596594,
+        "C2_TTFT_ms": [
+          276.923168,
+          339.298568
+        ],
+        "C2_max_gap_ms": [
+          99.522077,
+          83.385151
+        ],
+        "C2_draft_rounds": [
+          0,
+          0
+        ]
+      },
+      "second-candidate": {
+        "first_2K_ms": 1111.341493,
+        "repeat_2K_ms": 1091.144818,
+        "pp32768_ms": 15408.159379,
+        "pp32768_tps": 2126.6654370579768,
+        "C1_tps": 37.55817892787901,
+        "C1_repeat_tps": 37.517138447211444,
+        "C2_wave_tps": 56.52290644846816,
+        "C2_TTFT_ms": [
+          277.837781,
+          341.875351
+        ],
+        "C2_max_gap_ms": [
+          101.435479,
+          84.086009
+        ],
+        "C2_draft_rounds": [
+          0,
+          0
+        ]
+      },
+      "after-baseline": {
+        "first_2K_ms": 1079.123239,
+        "repeat_2K_ms": 1092.5684959999999,
+        "pp32768_ms": 15457.495418000002,
+        "pp32768_tps": 2119.8777107086958,
+        "C1_tps": 37.58395135529262,
+        "C1_repeat_tps": 37.4008338074369,
+        "C2_wave_tps": 53.118000627704596,
+        "C2_TTFT_ms": [
+          279.20396,
+          341.748405
+        ],
+        "C2_max_gap_ms": [
+          100.300803,
+          423.62555
+        ],
+        "C2_draft_rounds": [
+          0,
+          0
+        ]
+      }
+    },
+    "strict_phase_flags": 22,
+    "adaptive_work_comparisons": 4
+  },
+  "adaptive_MTP_pilot": {
+    "requests": 24,
+    "rates": {
+      "before-baseline": {
+        "first_2K_ms": 1111.6025849999999,
+        "repeat_2K_ms": 1132.183528,
+        "pp32768_ms": 16069.410493000001,
+        "pp32768_tps": 2039.153832947019,
+        "C1_tps": 56.54103759817082,
+        "C1_repeat_tps": 56.58065348660936,
+        "C2_wave_tps": 64.87970127438845,
+        "C2_TTFT_ms": [
+          277.065684,
+          336.876341
+        ],
+        "C2_max_gap_ms": [
+          136.473668,
+          136.472828
+        ],
+        "C2_draft_rounds": [
+          48,
+          47
+        ]
+      },
+      "first-candidate": {
+        "first_2K_ms": 1117.390542,
+        "repeat_2K_ms": 1130.697873,
+        "pp32768_ms": 16071.687195,
+        "pp32768_tps": 2038.8649680908625,
+        "C1_tps": 56.68451720135543,
+        "C1_repeat_tps": 56.33744537172927,
+        "C2_wave_tps": 57.27131151715378,
+        "C2_TTFT_ms": [
+          278.974267,
+          338.948769
+        ],
+        "C2_max_gap_ms": [
+          133.832078,
+          133.832168
+        ],
+        "C2_draft_rounds": [
+          51,
+          47
+        ]
+      },
+      "second-candidate": {
+        "first_2K_ms": 1121.393022,
+        "repeat_2K_ms": 1132.755521,
+        "pp32768_ms": 16116.526701,
+        "pp32768_tps": 2033.1924246411484,
+        "C1_tps": 56.576695283260946,
+        "C1_repeat_tps": 56.576648034285846,
+        "C2_wave_tps": 68.98661052943444,
+        "C2_TTFT_ms": [
+          281.603088,
+          341.952438
+        ],
+        "C2_max_gap_ms": [
+          135.676822,
+          135.675582
+        ],
+        "C2_draft_rounds": [
+          63,
+          62
+        ]
+      },
+      "after-baseline": {
+        "first_2K_ms": 1116.381382,
+        "repeat_2K_ms": 1130.0911409999999,
+        "pp32768_ms": 16108.676839999998,
+        "pp32768_tps": 2034.1832122817607,
+        "C1_tps": 56.333885005917715,
+        "C1_repeat_tps": 56.391663268894305,
+        "C2_wave_tps": 63.30593824000278,
+        "C2_TTFT_ms": [
+          280.348405,
+          340.762644
+        ],
+        "C2_max_gap_ms": [
+          121.188836,
+          133.037072
+        ],
+        "C2_draft_rounds": [
+          54,
+          53
+        ]
+      }
+    },
+    "strict_phase_flags": 25,
+    "adaptive_work_comparisons": 23
+  },
+  "fixed1_diagnostic": {
+    "requests": 12,
+    "rates": {
+      "before-baseline": {
+        "first_2K_ms": 1119.161542,
+        "repeat_2K_ms": 1131.7090950000002,
+        "pp32768_ms": 16090.352346,
+        "pp32768_tps": 2036.4998413565506,
+        "C1_tps": 53.72532139247971,
+        "C1_repeat_tps": 53.45001384953714,
+        "C2_wave_tps": 70.99918360005724,
+        "C2_TTFT_ms": [
+          275.520868,
+          335.601119
+        ],
+        "C2_max_gap_ms": [
+          105.052794,
+          104.645346
+        ],
+        "C2_draft_rounds": [
+          69,
+          68
+        ]
+      },
+      "first-candidate": {
+        "first_2K_ms": 1118.955379,
+        "repeat_2K_ms": 1134.5554399999999,
+        "pp32768_ms": 16113.521972,
+        "pp32768_tps": 2033.571559150135,
+        "C1_tps": 53.758802635231774,
+        "C1_repeat_tps": 53.48991160291289,
+        "C2_wave_tps": 71.04432072696633,
+        "C2_TTFT_ms": [
+          277.685383,
+          337.206361
+        ],
+        "C2_max_gap_ms": [
+          104.154411,
+          102.908078
+        ],
+        "C2_draft_rounds": [
+          69,
+          68
+        ]
+      }
+    },
+    "strict_phase_flags": 0,
+    "adaptive_work_comparisons": 0,
+    "scope": "Supported min=max1 diagnostic only; not a default recommendation or clearance of adaptive flags."
+  },
+  "functional": {
+    "functional_records": 11,
+    "client_HTTP_requests": 23,
+    "server_confirmed_cancellations": 6,
+    "cancellation_orders": [
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ]
+    ],
+    "survivor_and_replay_hashes_match": true,
+    "actual_two_row_survivors": true,
+    "deep_cases": [
+      {
+        "case": "content-preserve0-sampled1",
+        "cached": 18461,
+        "prefill": 34,
+        "accepted": 0,
+        "proposed": 1,
+        "exact": true,
+        "discard_assistant": false
+      },
+      {
+        "case": "content-preserve1-sampled1",
+        "cached": 18461,
+        "prefill": 13,
+        "accepted": 9,
+        "proposed": 9,
+        "exact": true,
+        "discard_assistant": true
+      }
+    ],
+    "checked_transport_errors_zero": true,
+    "scope": "Candidate-only MTP functional coverage; two concurrent disconnect orders plus two deep seeded cached/replay histories. No timing-control, confidence, process-loss, cable-loss, persistence or universal deadlock qualification."
+  },
+  "all_checked_transport_windows_clean": true,
+  "approved_drivers_restored": true,
+  "remaining": [
+    "Adaptive-MTP timing flags unresolved; fixed1 is a different workload.",
+    "Randomized confidence and stall frequency not established.",
+    "AR first-request batching tradeoff retained.",
+    "Published older tree has CPU/build coverage, not standalone live hardware coverage.",
+    "No default promotion; no universal deadlock/process-loss/cable-loss/overnight qualification."
+  ],
+  "publication_validation": {
+    "CPU_suites": "5/5 passed on published base",
+    "format": "692C++files checked",
+    "production_build": "295targets passed; standalone published-base binary never deployed",
+    "production_binary_SHA256": "0ced6bf2afe5cb5d313c48cc965beeaead5ca0a2f631f5e0088417ba18df6e7a"
+  }
+}

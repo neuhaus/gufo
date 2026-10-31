@@ -223,3 +223,14 @@ Q8 MTP rates vary more between server starts than between cohorts of one
 start: a second start with three cohorts per point gave mixed 90.06 (C4) and
 105.40 (C6), repetitive 115.74 (C4) and 118.65 (C6) tok/s, each cohort within
 3% of its point's rate.
+
+## Draft TP snapshot-turn measurements (October 31, 2026)
+
+A separate integration-stack pilot uses two Strix Halo nodes, matching private
+ROCm7.14.1 builds, UD-Q4_K_XL/sharedQ8_0MTP, 65K capacity, two sessions and crossed
+40+20Gb/s. AR concurrent waves measure parent36.75/53.12 versus fix56.41/56.52
+tok/s; C1 remains about37.5–37.6tok/s. This fixes a measured admission mechanism
+but includes a first-request batching tradeoff, 22 phase flags and variable
+controls; no statistical gain is established. Adaptive MTP remains unqualified.
+The published older base has separate CPU/build coverage, not standalone live
+hardware coverage. [Full scope and per-request flags](../../patches/ar-snapshot-turn/README.md).
